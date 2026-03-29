@@ -2,9 +2,11 @@ package ui
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/blakewilliams/ghq/internal/github"
+	"github.com/blakewilliams/ghq/internal/terminal"
 	"github.com/blakewilliams/ghq/internal/ui/commandbar"
 	"github.com/blakewilliams/ghq/internal/ui/prdetail"
 	"github.com/blakewilliams/ghq/internal/ui/prlist"
@@ -27,11 +29,7 @@ const (
 	viewPRDetail
 )
 
-const (
-	headerHeight    = 2 // breadcrumb + blank line
-	statusBarHeight = 1
-	chromeHeight    = headerHeight + statusBarHeight
-)
+const chromeHeight = 2
 
 type Model struct {
 	currentView view
@@ -40,6 +38,8 @@ type Model struct {
 	prDetail    prdetail.Model
 	commandBar  commandbar.Model
 	client      *github.CachedClient
+	palette     terminal.Palette
+	diffColors  styles.DiffColors
 	width       int
 	height      int
 }
@@ -54,10 +54,37 @@ func NewApp(client *github.CachedClient) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.prList.Init(), m.client.GCTickCmd())
+	return tea.Batch(m.prList.Init(), m.client.GCTickCmd(), queryPaletteCmd(), tea.RequestBackgroundColor)
+}
+
+// queryPaletteCmd sends OSC 4 queries through Bubble Tea's output buffer.
+// Uses DCS passthrough when in tmux.
+func queryPaletteCmd() tea.Cmd {
+	inTmux := os.Getenv("TMUX") != ""
+	var cmds []tea.Cmd
+	for i := 0; i < 16; i++ {
+		var seq string
+		if inTmux {
+			seq = fmt.Sprintf("\x1bPtmux;\x1b\x1b]4;%d;?\x07\x1b\\", i)
+		} else {
+			seq = fmt.Sprintf("\x1b]4;%d;?\x07", i)
+		}
+		cmds = append(cmds, tea.Raw(seq))
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Handle palette responses.
+	if cmd, handled := terminal.HandleMessage(msg, &m.palette); handled {
+		if m.palette.Complete() {
+			m.diffColors = styles.ComputeDiffColors(m.palette)
+			m.prDetail.SetDiffColors(m.diffColors)
+			m.prList.SetDiffColors(m.diffColors)
+		}
+		return m, cmd
+	}
+
 	switch msg := msg.(type) {
 	case tea.MouseClickMsg:
 		if msg.Y == 0 {
@@ -102,7 +129,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
-		// Normal mode
 		switch msg.String() {
 		case ":":
 			m.mode = modeCommand
@@ -123,7 +149,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case prlist.PRSelectedMsg:
 		m.currentView = viewPRDetail
-		m.prDetail = prdetail.New(msg.PR, m.client, m.width, m.height-chromeHeight)
+		m.prDetail = prdetail.New(msg.PR, m.client, m.width, m.height-chromeHeight, m.diffColors)
 		return m, m.prDetail.Init()
 	}
 
@@ -159,6 +185,11 @@ func (m Model) handleCommand(msg commandbar.CommandMsg) (tea.Model, tea.Cmd) {
 func (m Model) View() tea.View {
 	header := m.renderHeader()
 
+	contentHeight := m.height - chromeHeight
+	if contentHeight < 0 {
+		contentHeight = 0
+	}
+
 	var content string
 	switch m.currentView {
 	case viewPRDetail:
@@ -166,6 +197,7 @@ func (m Model) View() tea.View {
 	default:
 		content = m.prList.View()
 	}
+	content = lipgloss.NewStyle().Height(contentHeight).Render(content)
 
 	var bar string
 	if m.mode == modeCommand {
@@ -175,6 +207,7 @@ func (m Model) View() tea.View {
 	}
 
 	v := tea.NewView(header + "\n" + content + "\n" + bar)
+	v.AltScreen = true
 	v.MouseMode = tea.MouseModeCellMotion
 	return v
 }
@@ -188,6 +221,7 @@ func (m Model) renderHeader() string {
 
 	if m.currentView == viewPRDetail {
 		crumb += sep + styles.HeaderSection.Render(fmt.Sprintf("#%d %s", m.prDetail.PRNumber(), m.prDetail.PRTitle()))
+		crumb += sep + styles.HeaderSection.Render(m.prDetail.Tab())
 	}
 
 	return crumb
@@ -201,7 +235,6 @@ func (m Model) handleBreadcrumbClick(x int) (tea.Model, tea.Cmd) {
 	pullsStart := repoWidth + sepWidth
 	pullsEnd := pullsStart + pullsWidth
 
-	// Click on repo or "Pulls" navigates to the PR list
 	if m.currentView == viewPRDetail && x < pullsEnd {
 		m.currentView = viewPRList
 		return m, nil

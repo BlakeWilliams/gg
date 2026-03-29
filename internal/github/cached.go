@@ -112,6 +112,63 @@ func (c *CachedClient) GetPullRequestFiles(number int) tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
+// FileContentLoadedMsg is sent when a file's content is loaded.
+type FileContentLoadedMsg struct {
+	Filename string
+	Content  string
+	Ref      string
+}
+
+// GetFileContent returns a tea.Cmd that fetches a file's content with caching.
+func (c *CachedClient) GetFileContent(filename, ref string) tea.Cmd {
+	key := fmt.Sprintf("file-content:%s:%s", ref, filename)
+	fetchFn := func() (string, error) {
+		return c.client.GetFileContent(context.Background(), filename, ref)
+	}
+
+	data, found, _, refetchFn := cache.Query(c.cache, key, fetchFn)
+
+	var cmds []tea.Cmd
+
+	if found {
+		content := data
+		cmds = append(cmds, func() tea.Msg {
+			return FileContentLoadedMsg{Filename: filename, Content: content, Ref: ref}
+		})
+	}
+
+	if refetchFn != nil {
+		fn := refetchFn
+		cmds = append(cmds, func() tea.Msg {
+			result, err := fn()
+			if err != nil {
+				return QueryErrMsg{Err: err}
+			}
+			return FileContentLoadedMsg{Filename: filename, Content: result, Ref: ref}
+		})
+	}
+
+	return tea.Batch(cmds...)
+}
+
+// FetchFileContent synchronously fetches file content, using the cache.
+// Intended for use inside a tea.Cmd goroutine.
+func (c *CachedClient) FetchFileContent(filename, ref string) (string, error) {
+	key := fmt.Sprintf("file-content:%s:%s", ref, filename)
+	fetchFn := func() (string, error) {
+		return c.client.GetFileContent(context.Background(), filename, ref)
+	}
+
+	data, found, _, refetchFn := cache.Query(c.cache, key, fetchFn)
+	if found {
+		return data, nil
+	}
+	if refetchFn != nil {
+		return refetchFn()
+	}
+	return "", fmt.Errorf("failed to fetch %s", filename)
+}
+
 // InvalidatePR removes cached data for a specific PR.
 func (c *CachedClient) InvalidatePR(number int) {
 	c.cache.Invalidate(fmt.Sprintf("pull:%d", number))

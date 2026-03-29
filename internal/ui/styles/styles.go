@@ -1,6 +1,10 @@
 package styles
 
-import "charm.land/lipgloss/v2"
+import (
+	"image/color"
+
+	"charm.land/lipgloss/v2"
+)
 
 var (
 	TitleStyle = lipgloss.NewStyle().
@@ -10,17 +14,7 @@ var (
 	SubtitleStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.BrightBlack)
 
-	StatusOpen = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Black).
-			Background(lipgloss.Green).
-			Padding(0, 1)
-
-	StatusDraft = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Black).
-			Background(lipgloss.Yellow).
-			Padding(0, 1)
+	statusBadgeText = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Black).Inline(true)
 
 	TabActive = lipgloss.NewStyle().
 			Bold(true).
@@ -37,20 +31,34 @@ var (
 			BorderStyle(lipgloss.NormalBorder()).
 			BorderForeground(lipgloss.BrightBlack)
 
-	DiffAdd = lipgloss.NewStyle().
-		Foreground(lipgloss.Green)
+	// Diff gutter: colored bg on the marker column + line numbers.
+	DiffAddGutter = lipgloss.NewStyle().
+			Foreground(lipgloss.Black).
+			Background(lipgloss.Green)
 
-	DiffDel = lipgloss.NewStyle().
-		Foreground(lipgloss.Red)
+	DiffDelGutter = lipgloss.NewStyle().
+			Foreground(lipgloss.Black).
+			Background(lipgloss.Red)
 
-	DiffHunk = lipgloss.NewStyle().
-			Foreground(lipgloss.Cyan).
+	DiffHunkGutter = lipgloss.NewStyle().
+			Foreground(lipgloss.Black).
+			Background(lipgloss.Blue)
+
+	DiffAddMarker = lipgloss.NewStyle().
+			Foreground(lipgloss.Green).
 			Bold(true)
 
-	DiffFileHeader = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Magenta).
-			Padding(1, 0, 0, 0)
+	DiffDelMarker = lipgloss.NewStyle().
+			Foreground(lipgloss.Red).
+			Bold(true)
+
+	DiffHunk = lipgloss.NewStyle().
+			Foreground(lipgloss.BrightWhite).
+			Background(lipgloss.Blue).
+			Bold(true)
+
+	DiffLineNum = lipgloss.NewStyle().
+			Foreground(lipgloss.BrightBlack)
 
 	HeaderRepo = lipgloss.NewStyle().
 			Bold(true).
@@ -78,3 +86,31 @@ var (
 	StatusBarHint = lipgloss.NewStyle().
 			Foreground(lipgloss.BrightBlack)
 )
+
+// PRStatusBadge returns the appropriate styled badge for a PR's state,
+// rendered as a single line with nerdfont rounded caps.
+func PRStatusBadge(state string, draft, merged bool) string {
+	var label string
+	var bg color.Color
+
+	switch {
+	case merged:
+		label = "Merged"
+		bg = lipgloss.Magenta
+	case state == "closed":
+		label = "Closed"
+		bg = lipgloss.Red
+	case draft:
+		label = "Drafted"
+		bg = lipgloss.Yellow
+	default:
+		label = "Opened"
+		bg = lipgloss.Green
+	}
+
+	left := lipgloss.NewStyle().Foreground(bg).Inline(true).Render("\ue0b6")
+	mid := statusBadgeText.Background(bg).Render(label)
+	right := lipgloss.NewStyle().Foreground(bg).Inline(true).Render("\ue0b4")
+	return left + mid + right
+}
+

@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 
 	"github.com/cli/go-gh/v2/pkg/api"
@@ -64,4 +65,25 @@ func (c *Client) GetPullRequestFiles(ctx context.Context, number int) ([]PullReq
 		return nil, fmt.Errorf("getting files for PR #%d: %w", number, err)
 	}
 	return files, nil
+}
+
+// GetFileContent fetches the content of a file at a specific git ref (branch, tag, or SHA).
+func (c *Client) GetFileContent(ctx context.Context, filepath, ref string) (string, error) {
+	var result struct {
+		Content  string `json:"content"`
+		Encoding string `json:"encoding"`
+	}
+	path := fmt.Sprintf("repos/%s/%s/contents/%s?ref=%s", c.owner, c.repo, filepath, ref)
+	err := c.rest.Get(path, &result)
+	if err != nil {
+		return "", fmt.Errorf("getting file %s at %s: %w", filepath, ref, err)
+	}
+	if result.Encoding == "base64" {
+		decoded, err := base64.StdEncoding.DecodeString(result.Content)
+		if err != nil {
+			return "", fmt.Errorf("decoding file %s: %w", filepath, err)
+		}
+		return string(decoded), nil
+	}
+	return result.Content, nil
 }
