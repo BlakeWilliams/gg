@@ -194,6 +194,44 @@ func (c *CachedClient) GetReviewComments(number int) tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
+// CheckRunsLoadedMsg is sent when check runs are loaded.
+type CheckRunsLoadedMsg struct {
+	CheckRuns []CheckRun
+	Ref       string
+}
+
+// GetCheckRuns returns a tea.Cmd that fetches check runs with caching.
+func (c *CachedClient) GetCheckRuns(ref string) tea.Cmd {
+	key := fmt.Sprintf("check-runs:%s", ref)
+	fetchFn := func() ([]CheckRun, error) {
+		return c.client.GetCheckRuns(context.Background(), ref)
+	}
+
+	data, found, _, refetchFn := cache.Query(c.cache, key, fetchFn)
+
+	var cmds []tea.Cmd
+
+	if found {
+		checks := data
+		cmds = append(cmds, func() tea.Msg {
+			return CheckRunsLoadedMsg{CheckRuns: checks, Ref: ref}
+		})
+	}
+
+	if refetchFn != nil {
+		fn := refetchFn
+		cmds = append(cmds, func() tea.Msg {
+			result, err := fn()
+			if err != nil {
+				return QueryErrMsg{Err: err}
+			}
+			return CheckRunsLoadedMsg{CheckRuns: result, Ref: ref}
+		})
+	}
+
+	return tea.Batch(cmds...)
+}
+
 // GetPullRequestFiles returns a tea.Cmd that fetches PR files with caching.
 func (c *CachedClient) GetPullRequestFiles(number int) tea.Cmd {
 	key := fmt.Sprintf("pull-files:%d", number)

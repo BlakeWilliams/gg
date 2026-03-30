@@ -25,11 +25,6 @@ const (
 
 const chromeHeight = 2
 
-const (
-	iconGit     = "\U000f02a2" // 󰊢 nf-md-git
-	iconPR      = "\U000f0041" // 󰁁 nf-md-arrow_top_right
-	iconChevron = "\U000f0142" // 󰅂 nf-md-chevron_right
-)
 
 type Model struct {
 	activeView uictx.View
@@ -212,24 +207,24 @@ func (m Model) View() tea.View {
 }
 
 func (m Model) renderHeader() string {
-	repo := styles.HeaderRepo.Render(iconGit + " " + m.ctx.Client.RepoFullName())
-	sep := styles.HeaderSep.Render(" " + iconChevron + " ")
+	repo := styles.HeaderRepo.Render(m.ctx.Client.RepoFullName())
+	sep := styles.HeaderSep.Render("  ")
 
-	pulls := styles.HeaderSection.Render(iconPR + " Pulls")
-	crumb := repo + sep + pulls
+	pulls := styles.HeaderSection.Render("Pulls")
+	crumb := " " + repo + sep + pulls
 
 	if detail, ok := m.activeView.(prdetail.Model); ok {
 		crumb += sep + styles.HeaderSection.Render(fmt.Sprintf("#%d %s", detail.PRNumber(), detail.PRTitle()))
 		crumb += sep + styles.HeaderSection.Render(detail.Tab())
 	}
 
-	return crumb
+	return styles.HeaderBar.Width(m.width).Render(crumb)
 }
 
 func (m Model) handleBreadcrumbClick(x int) (tea.Model, tea.Cmd) {
-	repoWidth := lipgloss.Width(styles.HeaderRepo.Render(iconGit + " " + m.ctx.Client.RepoFullName()))
-	sepWidth := lipgloss.Width(styles.HeaderSep.Render(" " + iconChevron + " "))
-	pullsWidth := lipgloss.Width(styles.HeaderSection.Render(iconPR + " Pulls"))
+	repoWidth := lipgloss.Width(styles.HeaderRepo.Render(m.ctx.Client.RepoFullName())) + 1 // +1 for leading space
+	sepWidth := lipgloss.Width(styles.HeaderSep.Render("  "))
+	pullsWidth := lipgloss.Width(styles.HeaderSection.Render("Pulls"))
 
 	pullsStart := repoWidth + sepWidth
 	pullsEnd := pullsStart + pullsWidth

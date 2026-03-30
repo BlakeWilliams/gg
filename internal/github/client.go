@@ -97,6 +97,16 @@ func (c *Client) GetPullRequestFiles(ctx context.Context, number int) ([]PullReq
 	return files, nil
 }
 
+func (c *Client) GetCheckRuns(ctx context.Context, ref string) ([]CheckRun, error) {
+	var result CheckRunsResponse
+	path := fmt.Sprintf("repos/%s/%s/commits/%s/check-runs?per_page=100", c.owner, c.repo, ref)
+	err := c.rest.Get(path, &result)
+	if err != nil {
+		return nil, fmt.Errorf("getting check runs for %s: %w", ref, err)
+	}
+	return result.CheckRuns, nil
+}
+
 // GetFileContent fetches the content of a file at a specific git ref (branch, tag, or SHA).
 func (c *Client) GetFileContent(ctx context.Context, filepath, ref string) (string, error) {
 	var result struct {

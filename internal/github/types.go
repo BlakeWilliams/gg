@@ -71,6 +71,21 @@ type ReviewComment struct {
 	UpdatedAt           time.Time `json:"updated_at"`
 }
 
+type CheckRun struct {
+	ID          int        `json:"id"`
+	Name        string     `json:"name"`
+	Status      string     `json:"status"`      // queued, in_progress, completed
+	Conclusion  *string    `json:"conclusion"`   // success, failure, neutral, cancelled, skipped, timed_out, action_required
+	StartedAt   *time.Time `json:"started_at"`
+	CompletedAt *time.Time `json:"completed_at"`
+	HTMLURL     string     `json:"html_url"`
+}
+
+type CheckRunsResponse struct {
+	TotalCount int        `json:"total_count"`
+	CheckRuns  []CheckRun `json:"check_runs"`
+}
+
 type PullRequestFile struct {
 	Filename         string `json:"filename"`
 	Status           string `json:"status"`

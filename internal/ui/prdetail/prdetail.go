@@ -24,7 +24,7 @@ const (
 	iconComment     = "\U000f0188" // 󰆈 nf-md-comment
 	iconSlash       = "\U000f0737" // 󰜷 nf-md-cancel
 	iconClock       = "\U000f0954" // 󰥔 nf-md-clock_outline
-	iconReview      = "\U000f0e19" // 󰸙 nf-md-eye_check
+	iconReview      = "\U000f0567" // 󰕧 nf-md-shield_account
 	iconComments    = "\U000f0e1c" // 󰸜 nf-md-comment_multiple
 	iconAuthor      = "\U000f0004" // 󰀄 nf-md-account
 	iconFile        = "\U000f0214" // 󰈔 nf-md-file
@@ -45,6 +45,7 @@ const (
 	iconChevron     = "\U000f0142" // 󰅂 nf-md-chevron_right
 	iconArrowRight  = "\U000f0054" // 󰁔 nf-md-arrow_right
 	iconPointer     = "\U000f0142" // 󰅂 nf-md-chevron_right (cursor)
+	iconChecks      = "\U000f0134" // 󰄴 nf-md-check
 )
 
 type prTab int
@@ -52,6 +53,14 @@ type prTab int
 const (
 	tabOverview prTab = iota
 	tabCode
+)
+
+type overviewSection int
+
+const (
+	sectionComments overviewSection = iota
+	sectionReviews
+	sectionChecks
 )
 
 type descRenderedMsg struct {
@@ -76,12 +85,14 @@ type Model struct {
 	tab    prTab
 
 	// Overview tab
-	overviewVP    viewport.Model
-	overviewReady bool
-	descContent   string
-	reviews        []github.Review
-	comments       []github.IssueComment
-	reviewComments []github.ReviewComment
+	overviewVP      viewport.Model
+	overviewReady   bool
+	descContent     string
+	reviews         []github.Review
+	comments        []github.IssueComment
+	reviewComments  []github.ReviewComment
+	checkRuns       []github.CheckRun
+	overviewSection overviewSection
 
 	// Code tab
 	codeVP         viewport.Model
@@ -138,6 +149,9 @@ func (m Model) StatusHints() (left, right []string) {
 			right = append(right, fmt.Sprintf(iconFile+" %d/%d", m.currentFileIdx+1, len(m.files)))
 		}
 	case tabOverview:
+		left = append(left, "1 comments")
+		left = append(left, "2 reviews")
+		left = append(left, "3 checks")
 		left = append(left, "tab code")
 	}
 	left = append(left, "esc back")
@@ -164,6 +178,7 @@ func (m Model) Init() tea.Cmd {
 		m.ctx.Client.GetReviews(m.pr.Number),
 		m.ctx.Client.GetIssueComments(m.pr.Number),
 		m.ctx.Client.GetReviewComments(m.pr.Number),
+		m.ctx.Client.GetCheckRuns(m.pr.Head.SHA),
 	)
 }
 
@@ -199,6 +214,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 					m.treeCursor = idx
 					m.currentFileIdx = e.FileIndex
 					m.rebuildCode()
+					m.codeVP.GotoTop()
 				}
 			}
 			return m, nil
@@ -247,6 +263,13 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 				m.renderedFiles = make([]string, len(m.files))
 				return m, m.renderFileCmd(0)
 			}
+		}
+		return m, nil
+
+	case github.CheckRunsLoadedMsg:
+		if msg.Ref == m.pr.Head.SHA {
+			m.checkRuns = msg.CheckRuns
+			m.rebuildOverview()
 		}
 		return m, nil
 
@@ -360,6 +383,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			if !e.IsDir && e.FileIndex >= 0 {
 				m.currentFileIdx = e.FileIndex
 				m.rebuildCode()
+				m.codeVP.GotoTop()
 			}
 			return m, nil, true
 		}
@@ -367,12 +391,32 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		if m.tab == tabCode && !m.showTree && m.currentFileIdx > 0 {
 			m.currentFileIdx--
 			m.rebuildCode()
+			m.codeVP.GotoTop()
 			return m, nil, true
 		}
 	case "n", "l", "right":
 		if m.tab == tabCode && !m.showTree && m.currentFileIdx < len(m.files)-1 {
 			m.currentFileIdx++
 			m.rebuildCode()
+			m.codeVP.GotoTop()
+			return m, nil, true
+		}
+	case "1":
+		if m.tab == tabOverview {
+			m.overviewSection = sectionComments
+			m.rebuildOverview()
+			return m, nil, true
+		}
+	case "2":
+		if m.tab == tabOverview {
+			m.overviewSection = sectionReviews
+			m.rebuildOverview()
+			return m, nil, true
+		}
+	case "3":
+		if m.tab == tabOverview {
+			m.overviewSection = sectionChecks
+			m.rebuildOverview()
 			return m, nil, true
 		}
 	case "G":
@@ -481,14 +525,8 @@ func (m *Model) rebuildOverview() {
 	}
 	content.WriteString("\n" + indent(descBody, overviewPad))
 
-	// Reviews section.
-	if m.hasReviewContent() {
-		content.WriteString("\n" + m.renderReviews())
-	}
-
-	if len(m.comments) > 0 {
-		content.WriteString("\n" + m.renderComments())
-	}
+	// Reviews/Comments bordered section.
+	content.WriteString("\n\n" + m.renderReviewsComments())
 
 	if !m.overviewReady {
 		m.overviewVP = viewport.New()
@@ -671,46 +709,7 @@ func coloredAuthor(login string) string {
 		Render("@" + login)
 }
 
-func (m Model) renderComments() string {
-	innerW := m.width - 4 // border + padding
-
-	var lines []string
-	for _, c := range m.comments {
-		author := coloredAuthor(c.User.Login)
-		if c.User.Login == m.pr.User.Login {
-			author += " " + authorBadge.Render(" "+iconAuthor+" Author ")
-		}
-		age := dimStyle.Render(relativeTime(c.CreatedAt))
-
-		line := author + " " + age
-		if c.Body != "" {
-			body := renderMarkdown(c.Body, innerW)
-			line += "\n" + body
-		}
-		lines = append(lines, line)
-	}
-
-	// Top border with count embedded.
-	label := fmt.Sprintf("%d comment", len(m.comments))
-	if len(m.comments) != 1 {
-		label += "s"
-	}
-	title := " " + lipgloss.NewStyle().Bold(true).Render(iconComments+" "+label) + " "
-	titleW := lipgloss.Width(title)
-	fillW := m.width - 2 - titleW - 1
-	if fillW < 0 {
-		fillW = 0
-	}
-	topBorder := borderColor.Render("╭─") + title + borderColor.Render(strings.Repeat("─", fillW)+"╮")
-
-	sep := dimStyle.Render(strings.Repeat("─", innerW))
-	body := strings.Join(lines, "\n"+sep+"\n")
-
-	bottom := commentBodyStyle.Width(m.width).Render(body)
-	return topBorder + "\n" + bottom
-}
-
-// --- Reviews ---
+// --- Reviews / Comments ---
 
 func (m Model) hasReviewContent() bool {
 	return len(m.reviews) > 0 || len(m.pr.RequestedReviewers) > 0
@@ -721,11 +720,6 @@ var (
 	reviewChanges   = lipgloss.NewStyle().Foreground(lipgloss.Red).Bold(true)
 	reviewCommented = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
 	reviewPending   = lipgloss.NewStyle().Foreground(lipgloss.Yellow)
-
-	reviewBorder = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.BrightBlack).
-			Padding(0, 1)
 )
 
 func reviewStateIcon(state string) string {
@@ -743,9 +737,71 @@ func reviewStateIcon(state string) string {
 	}
 }
 
-func (m Model) renderReviews() string {
-	var b strings.Builder
+// renderReviewsComments renders a single bordered box with two labels in the
+// top border. The active section is bold, the inactive one is dimmed. Press
+// 1/2 to swap.
+func (m Model) renderReviewsComments() string {
+	innerW := m.width - 4 // border + padding
 
+	// Build the top border with all three labels.
+	commentLabel := iconComments + " Comments"
+	if len(m.comments) > 0 {
+		commentLabel += fmt.Sprintf(" (%d)", len(m.comments))
+	}
+	reviewLabel := iconReview + " Reviews"
+	checksLabel := iconChecks + " Checks"
+	if len(m.checkRuns) > 0 {
+		checksLabel += fmt.Sprintf(" (%d)", len(m.checkRuns))
+	}
+
+	renderLabel := func(label string, section overviewSection) string {
+		if m.overviewSection == section {
+			return " " + lipgloss.NewStyle().Bold(true).Render(label) + " "
+		}
+		return " " + dimStyle.Render(label) + " "
+	}
+
+	div := borderColor.Render("│")
+	labels := renderLabel(commentLabel, sectionComments) + div +
+		renderLabel(reviewLabel, sectionReviews) + div +
+		renderLabel(checksLabel, sectionChecks)
+	labelsW := lipgloss.Width(labels)
+	fillW := m.width - 2 - labelsW - 1 // ╭─ + labels + ─fill─ + ╮
+	if fillW < 0 {
+		fillW = 0
+	}
+	topBorder := borderColor.Render("╭─") + labels +
+		borderColor.Render(strings.Repeat("─", fillW) + "╮")
+
+	// Build body based on active section.
+	var lines []string
+	switch m.overviewSection {
+	case sectionComments:
+		lines = m.buildCommentLines(innerW)
+		if len(lines) == 0 {
+			lines = []string{dimStyle.Render("No comments yet.")}
+		}
+	case sectionReviews:
+		lines = m.buildReviewLines(innerW)
+		if len(lines) == 0 {
+			lines = []string{dimStyle.Render("No reviews yet.")}
+		}
+	case sectionChecks:
+		lines = m.buildCheckLines()
+		if len(lines) == 0 {
+			lines = []string{dimStyle.Render("No checks yet.")}
+		}
+	}
+
+	sep := dimStyle.Render(strings.Repeat("─", innerW))
+	body := strings.Join(lines, "\n"+sep+"\n")
+
+	bottom := commentBodyStyle.Width(m.width).Render(body)
+	return topBorder + "\n" + bottom
+}
+
+// buildReviewLines builds the content lines for the reviews section.
+func (m Model) buildReviewLines(innerW int) []string {
 	// Deduplicate reviews — keep only the latest per user.
 	latestByUser := make(map[string]github.Review)
 	for _, r := range m.reviews {
@@ -758,19 +814,18 @@ func (m Model) renderReviews() string {
 		}
 	}
 
-	// Build review lines.
 	var lines []string
 	for _, r := range m.reviews {
 		latest, ok := latestByUser[r.User.Login]
 		if !ok || latest.ID != r.ID {
 			continue
 		}
-		delete(latestByUser, r.User.Login) // only render once
+		delete(latestByUser, r.User.Login)
 
 		author := coloredAuthor(r.User.Login)
 		line := author + " " + reviewStateIcon(r.State)
 		if r.Body != "" {
-			body := renderMarkdown(r.Body, m.width-6) // border + padding
+			body := renderMarkdown(r.Body, innerW)
 			line += "\n" + body
 		}
 		lines = append(lines, line)
@@ -781,7 +836,6 @@ func (m Model) renderReviews() string {
 		if _, reviewed := latestByUser[u.Login]; reviewed {
 			continue
 		}
-		// Check they haven't already been rendered.
 		alreadyRendered := false
 		for _, r := range m.reviews {
 			if r.User.Login == u.Login {
@@ -796,28 +850,60 @@ func (m Model) renderReviews() string {
 		lines = append(lines, author+" "+reviewPending.Render(iconClock+" awaiting review"))
 	}
 
-	if len(lines) == 0 {
-		return ""
+	return lines
+}
+
+// buildCommentLines builds the content lines for the comments section.
+func (m Model) buildCommentLines(innerW int) []string {
+	var lines []string
+	for _, c := range m.comments {
+		author := coloredAuthor(c.User.Login)
+		if c.User.Login == m.pr.User.Login {
+			author += " " + authorBadge.Render(" "+iconAuthor+" Author ")
+		}
+		age := dimStyle.Render(relativeTime(c.CreatedAt))
+
+		line := author + " " + age
+		if c.Body != "" {
+			body := renderMarkdown(c.Body, innerW)
+			line += "\n" + body
+		}
+		lines = append(lines, line)
 	}
+	return lines
+}
 
-	// Top border with "Reviews" embedded.
-	title := " " + lipgloss.NewStyle().Bold(true).Render(iconReview+" Reviews") + " "
-	titleW := lipgloss.Width(title)
-	fillW := m.width - 2 - titleW - 1
-	if fillW < 0 {
-		fillW = 0
+// buildCheckLines builds the content lines for the checks section.
+func (m Model) buildCheckLines() []string {
+	var lines []string
+	for _, c := range m.checkRuns {
+		var icon string
+		switch {
+		case c.Status != "completed":
+			icon = reviewPending.Render(iconClock + " in progress")
+		case c.Conclusion != nil:
+			switch *c.Conclusion {
+			case "success":
+				icon = reviewApproved.Render(iconCheckCircle + " passed")
+			case "failure":
+				icon = reviewChanges.Render(iconXCircle + " failed")
+			case "cancelled":
+				icon = dimStyle.Render(iconSlash + " cancelled")
+			case "skipped":
+				icon = dimStyle.Render(iconSlash + " skipped")
+			case "neutral":
+				icon = dimStyle.Render(iconCheckCircle + " neutral")
+			default:
+				icon = reviewPending.Render(iconClock + " " + *c.Conclusion)
+			}
+		default:
+			icon = reviewPending.Render(iconClock + " pending")
+		}
+
+		name := lipgloss.NewStyle().Bold(true).Render(c.Name)
+		lines = append(lines, name+" "+icon)
 	}
-	topBorder := borderColor.Render("╭─") + title + borderColor.Render(strings.Repeat("─", fillW)+"╮")
-
-	// Join lines with dimmed separator.
-	innerW := m.width - 4 // border + padding
-	sep := dimStyle.Render(strings.Repeat("─", innerW))
-	body := strings.Join(lines, "\n"+sep+"\n")
-
-	bottom := commentBodyStyle.Width(m.width).Render(body)
-	b.WriteString("\n" + topBorder + "\n" + bottom)
-
-	return b.String()
+	return lines
 }
 
 // --- File Tree ---
