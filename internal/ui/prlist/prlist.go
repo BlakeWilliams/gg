@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/blakewilliams/ghq/internal/github"
-	"github.com/blakewilliams/ghq/internal/ui/styles"
+	"github.com/blakewilliams/ghq/internal/ui/uictx"
 	"charm.land/bubbles/v2/list"
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
@@ -33,6 +33,14 @@ func (i prItem) Description() string {
 func (i prItem) FilterValue() string {
 	return i.pr.Title
 }
+
+const (
+	iconMerge      = "\U000f0261" // 󰉡 nf-md-source_merge
+	iconClose      = "\U000f0156" // 󰅖 nf-md-close
+	iconDraft      = "\U000f0613" // 󰘓 nf-md-pencil
+	iconOpen       = "\U000f0130" // 󰄰 nf-md-checkbox_blank_circle_outline
+	iconArrowRight = "\U000f0054" // 󰁔 nf-md-arrow_right
+)
 
 var (
 	labelStyle = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
@@ -69,13 +77,13 @@ func prVerb(pr github.PullRequest, bg color.Color) string {
 	}
 	switch {
 	case pr.Merged:
-		return base.Foreground(lipgloss.Magenta).Render("merged")
+		return base.Foreground(lipgloss.Magenta).Render(iconMerge + " merged")
 	case pr.State == "closed":
-		return base.Foreground(lipgloss.Red).Render("closed")
+		return base.Foreground(lipgloss.Red).Render(iconClose + " closed")
 	case pr.Draft:
-		return base.Foreground(lipgloss.Yellow).Render("drafted")
+		return base.Foreground(lipgloss.Yellow).Render(iconDraft + " drafted")
 	default:
-		return base.Foreground(lipgloss.Green).Render("opened")
+		return base.Foreground(lipgloss.Green).Render(iconOpen + " opened")
 	}
 }
 
@@ -109,14 +117,14 @@ func renderLabels(labels []github.Label, s rowStyles) string {
 }
 
 type Model struct {
-	list     list.Model
-	client   *github.CachedClient
-	width    int
-	err      error
-	selectBg color.Color // computed selection bg color, nil if palette not ready
+	list   list.Model
+	ctx    *uictx.Context
+	width  int
+	height int
+	err    error
 }
 
-func New(client *github.CachedClient) Model {
+func New(ctx *uictx.Context) Model {
 	delegate := list.NewDefaultDelegate()
 	delegate.Styles.NormalTitle = lipgloss.NewStyle()
 	delegate.Styles.NormalDesc = lipgloss.NewStyle()
@@ -135,23 +143,20 @@ func New(client *github.CachedClient) Model {
 	l.Styles.Spinner = lipgloss.NewStyle().Foreground(lipgloss.Magenta)
 
 	return Model{
-		list:   l,
-		client: client,
+		list: l,
+		ctx:  ctx,
 	}
 }
 
-func (m *Model) SetDiffColors(c styles.DiffColors) {
-	m.selectBg = c.SelectColor
-}
-
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.list.StartSpinner(), m.client.ListPullRequests())
+	return tea.Batch(m.list.StartSpinner(), m.ctx.Client.ListPullRequests())
 }
 
-func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
+func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
+		m.height = msg.Height
 		m.list.SetSize(msg.Width, msg.Height-1)
 
 	case github.PRsLoadedMsg:
@@ -168,14 +173,11 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		m.list.StopSpinner()
 
 	case tea.KeyPressMsg:
-		if msg.String() == "enter" && !m.list.SettingFilter() {
-			if item := m.list.SelectedItem(); item != nil {
-				if pi, ok := item.(prItem); ok {
-					return m, func() tea.Msg {
-						return PRSelectedMsg{PR: pi.pr}
-					}
-				}
-			}
+		var cmd tea.Cmd
+		var handled bool
+		m, cmd, handled = m.handleKey(msg)
+		if handled {
+			return m, cmd
 		}
 	}
 
@@ -184,23 +186,65 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m Model) HandleKey(msg tea.KeyPressMsg) (uictx.View, tea.Cmd, bool) {
+	return m.handleKey(msg)
+}
+
+func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
+	switch msg.String() {
+	case "enter":
+		if !m.list.SettingFilter() {
+			if item := m.list.SelectedItem(); item != nil {
+				if pi, ok := item.(prItem); ok {
+					return m, func() tea.Msg {
+						return PRSelectedMsg{PR: pi.pr}
+					}, true
+				}
+			}
+		}
+	}
+	return m, nil, false
+}
+
 func (m Model) View() string {
 	if m.err != nil {
 		return fmt.Sprintf("Error: %v\n\nPress q to quit.", m.err)
 	}
 
 	normalStyles := makeRowStyles(nil)
-	selectedStyles := makeRowStyles(m.selectBg)
+	selectedStyles := makeRowStyles(m.ctx.DiffColors.SelectColor)
 
-	items := m.list.Items()
+	items := m.list.VisibleItems()
 	selected := m.list.Index()
 	w := m.width
 	if w < 20 {
 		w = 80
 	}
 
+	// Compute visible window. Each item is 3 lines (2 content + 1 separator),
+	// except the last visible which is 2. Reserve 1 line for the status footer.
+	const linesPerItem = 3
+	maxVisible := (m.height - 1) / linesPerItem
+	if maxVisible < 1 {
+		maxVisible = 1
+	}
+
+	start := 0
+	if selected >= maxVisible {
+		start = selected - maxVisible + 1
+	}
+	end := start + maxVisible
+	if end > len(items) {
+		end = len(items)
+		start = end - maxVisible
+		if start < 0 {
+			start = 0
+		}
+	}
+
 	var b strings.Builder
-	for i, item := range items {
+	for i := start; i < end; i++ {
+		item := items[i]
 		pi := item.(prItem)
 		pr := pi.pr
 		isSelected := i == selected
@@ -210,7 +254,7 @@ func (m Model) View() string {
 			s = selectedStyles
 		}
 
-		verb := prVerb(pr, m.selectBg)
+		verb := prVerb(pr, m.ctx.DiffColors.SelectColor)
 		if !isSelected {
 			verb = prVerb(pr, nil)
 		}
@@ -235,7 +279,7 @@ func (m Model) View() string {
 			UnderlineStyle(lipgloss.UnderlineDotted).
 			Hyperlink(fmt.Sprintf("https://github.com/%s", pr.User.Login)).
 			Render(pr.User.Login)
-		branch := s.dim.Render(pr.Head.Ref + " → " + pr.Base.Ref)
+		branch := s.dim.Render(pr.Head.Ref + " " + iconArrowRight + " " + pr.Base.Ref)
 		line2 := " " + user + " " + verb + s.dim.Render(" · ") + branch
 		if labels := renderLabels(pr.Labels, s); labels != "" {
 			line2 += s.dim.Render(" · ") + labels
@@ -249,13 +293,13 @@ func (m Model) View() string {
 			b.WriteString(line2 + "\n")
 		}
 
-		if i < len(items)-1 {
+		if i < end-1 {
 			b.WriteString("\n")
 		}
 	}
 
-	total := len(items)
-	visible := len(m.list.VisibleItems())
+	total := len(m.list.Items())
+	visible := len(items)
 	status := fmt.Sprintf(" %d pull requests", total)
 	if visible != total {
 		status = fmt.Sprintf(" %d of %d pull requests", visible, total)

@@ -11,6 +11,7 @@ import (
 	"github.com/blakewilliams/ghq/internal/ui/prdetail"
 	"github.com/blakewilliams/ghq/internal/ui/prlist"
 	"github.com/blakewilliams/ghq/internal/ui/styles"
+	"github.com/blakewilliams/ghq/internal/ui/uictx"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 )
@@ -22,39 +23,38 @@ const (
 	modeCommand
 )
 
-type view int
-
-const (
-	viewPRList view = iota
-	viewPRDetail
-)
-
 const chromeHeight = 2
 
+const (
+	iconGit     = "\U000f02a2" // 󰊢 nf-md-git
+	iconPR      = "\U000f0041" // 󰁁 nf-md-arrow_top_right
+	iconChevron = "\U000f0142" // 󰅂 nf-md-chevron_right
+)
+
 type Model struct {
-	currentView view
-	mode        inputMode
-	prList      prlist.Model
-	prDetail    prdetail.Model
-	commandBar  commandbar.Model
-	client      *github.CachedClient
-	palette     terminal.Palette
-	diffColors  styles.DiffColors
-	width       int
-	height      int
+	activeView uictx.View
+	prList     prlist.Model // retained so we can restore it on back-navigation
+	mode       inputMode
+	commandBar commandbar.Model
+	ctx        *uictx.Context
+	palette    terminal.Palette
+	width      int
+	height     int
 }
 
 func NewApp(client *github.CachedClient) Model {
+	ctx := &uictx.Context{Client: client}
+	pl := prlist.New(ctx)
 	return Model{
-		currentView: viewPRList,
-		prList:      prlist.New(client),
-		commandBar:  commandbar.New(),
-		client:      client,
+		activeView: pl,
+		prList:     pl,
+		commandBar: commandbar.New(),
+		ctx:        ctx,
 	}
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.prList.Init(), m.client.GCTickCmd(), queryPaletteCmd(), tea.RequestBackgroundColor)
+	return tea.Batch(m.activeView.Init(), m.ctx.Client.GCTickCmd(), queryPaletteCmd(), tea.RequestBackgroundColor)
 }
 
 // queryPaletteCmd sends OSC 4 queries through Bubble Tea's output buffer.
@@ -78,9 +78,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Handle palette responses.
 	if cmd, handled := terminal.HandleMessage(msg, &m.palette); handled {
 		if m.palette.Complete() {
-			m.diffColors = styles.ComputeDiffColors(m.palette)
-			m.prDetail.SetDiffColors(m.diffColors)
-			m.prList.SetDiffColors(m.diffColors)
+			m.ctx.DiffColors = styles.ComputeDiffColors(m.palette)
 		}
 		return m, cmd
 	}
@@ -92,22 +90,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case github.GCTickMsg:
-		m.client.GC()
-		return m, m.client.GCTickCmd()
+		m.ctx.Client.GC()
+		return m, m.ctx.Client.GCTickCmd()
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		contentMsg := tea.WindowSizeMsg{Width: msg.Width, Height: msg.Height - chromeHeight}
 		m.commandBar.SetWidth(msg.Width)
-
+		contentMsg := tea.WindowSizeMsg{Width: msg.Width, Height: msg.Height - chromeHeight}
 		var cmd tea.Cmd
-		switch m.currentView {
-		case viewPRList:
-			m.prList, cmd = m.prList.Update(contentMsg)
-		case viewPRDetail:
-			m.prDetail, cmd = m.prDetail.Update(contentMsg)
-		}
+		m.activeView, cmd = m.activeView.Update(contentMsg)
 		return m, cmd
 
 	case commandbar.CommandMsg:
@@ -119,24 +111,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyPressMsg:
+		// Hard globals — always handled regardless of view/mode.
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
 
+		// Command mode owns all input.
 		if m.mode == modeCommand {
 			var cmd tea.Cmd
 			m.commandBar, cmd = m.commandBar.Update(msg)
 			return m, cmd
 		}
 
+		// Delegate to active view first.
+		view, cmd, handled := m.activeView.HandleKey(msg)
+		if handled {
+			m.activeView = view
+			return m, cmd
+		}
+
+		// Global shortcuts (view didn't claim the key).
 		switch msg.String() {
 		case ":":
 			m.mode = modeCommand
 			return m, m.commandBar.Focus()
 		case "esc":
-			if m.currentView == viewPRDetail {
-				m.currentView = viewPRList
-				return m, nil
+			if _, ok := m.activeView.(prdetail.Model); ok {
+				return m.navigateToList()
 			}
 		}
 
@@ -148,19 +149,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case prlist.PRSelectedMsg:
-		m.currentView = viewPRDetail
-		m.prDetail = prdetail.New(msg.PR, m.client, m.width, m.height-chromeHeight, m.diffColors)
-		return m, m.prDetail.Init()
+		// Save prList state before switching away.
+		if pl, ok := m.activeView.(prlist.Model); ok {
+			m.prList = pl
+		}
+		m.activeView = prdetail.New(msg.PR, m.ctx, m.width, m.height-chromeHeight)
+		return m, m.activeView.Init()
 	}
 
+	// Forward non-key messages to active view.
 	var cmd tea.Cmd
-	switch m.currentView {
-	case viewPRList:
-		m.prList, cmd = m.prList.Update(msg)
-	case viewPRDetail:
-		m.prDetail, cmd = m.prDetail.Update(msg)
-	}
+	m.activeView, cmd = m.activeView.Update(msg)
 	return m, cmd
+}
+
+func (m Model) navigateToList() (tea.Model, tea.Cmd) {
+	m.activeView = m.prList
+	// Re-send the current window size so the list adjusts if the terminal was resized.
+	resize := tea.WindowSizeMsg{Width: m.width, Height: m.height - chromeHeight}
+	m.activeView, _ = m.activeView.Update(resize)
+	return m, nil
 }
 
 func (m Model) handleCommand(msg commandbar.CommandMsg) (tea.Model, tea.Cmd) {
@@ -168,15 +176,13 @@ func (m Model) handleCommand(msg commandbar.CommandMsg) (tea.Model, tea.Cmd) {
 	case "q", "quit":
 		return m, tea.Quit
 	case "refresh":
-		switch m.currentView {
-		case viewPRList:
-			m.client.InvalidateAll()
-			return m, m.client.ListPullRequests()
+		if _, ok := m.activeView.(prlist.Model); ok {
+			m.ctx.Client.InvalidateAll()
+			return m, m.ctx.Client.ListPullRequests()
 		}
 	case "back":
-		if m.currentView == viewPRDetail {
-			m.currentView = viewPRList
-			return m, nil
+		if _, ok := m.activeView.(prdetail.Model); ok {
+			return m.navigateToList()
 		}
 	}
 	return m, nil
@@ -190,14 +196,7 @@ func (m Model) View() tea.View {
 		contentHeight = 0
 	}
 
-	var content string
-	switch m.currentView {
-	case viewPRDetail:
-		content = m.prDetail.View()
-	default:
-		content = m.prList.View()
-	}
-	content = lipgloss.NewStyle().Height(contentHeight).Render(content)
+	content := lipgloss.NewStyle().Height(contentHeight).Render(m.activeView.View())
 
 	var bar string
 	if m.mode == modeCommand {
@@ -213,62 +212,70 @@ func (m Model) View() tea.View {
 }
 
 func (m Model) renderHeader() string {
-	repo := styles.HeaderRepo.Render(m.client.RepoFullName())
-	sep := styles.HeaderSep.Render(" > ")
+	repo := styles.HeaderRepo.Render(iconGit + " " + m.ctx.Client.RepoFullName())
+	sep := styles.HeaderSep.Render(" " + iconChevron + " ")
 
-	pulls := styles.HeaderSection.Render("Pulls")
+	pulls := styles.HeaderSection.Render(iconPR + " Pulls")
 	crumb := repo + sep + pulls
 
-	if m.currentView == viewPRDetail {
-		crumb += sep + styles.HeaderSection.Render(fmt.Sprintf("#%d %s", m.prDetail.PRNumber(), m.prDetail.PRTitle()))
-		crumb += sep + styles.HeaderSection.Render(m.prDetail.Tab())
+	if detail, ok := m.activeView.(prdetail.Model); ok {
+		crumb += sep + styles.HeaderSection.Render(fmt.Sprintf("#%d %s", detail.PRNumber(), detail.PRTitle()))
+		crumb += sep + styles.HeaderSection.Render(detail.Tab())
 	}
 
 	return crumb
 }
 
 func (m Model) handleBreadcrumbClick(x int) (tea.Model, tea.Cmd) {
-	repoWidth := lipgloss.Width(styles.HeaderRepo.Render(m.client.RepoFullName()))
-	sepWidth := lipgloss.Width(styles.HeaderSep.Render(" > "))
-	pullsWidth := lipgloss.Width(styles.HeaderSection.Render("Pulls"))
+	repoWidth := lipgloss.Width(styles.HeaderRepo.Render(iconGit + " " + m.ctx.Client.RepoFullName()))
+	sepWidth := lipgloss.Width(styles.HeaderSep.Render(" " + iconChevron + " "))
+	pullsWidth := lipgloss.Width(styles.HeaderSection.Render(iconPR + " Pulls"))
 
 	pullsStart := repoWidth + sepWidth
 	pullsEnd := pullsStart + pullsWidth
 
-	if m.currentView == viewPRDetail && x < pullsEnd {
-		m.currentView = viewPRList
-		return m, nil
+	if _, ok := m.activeView.(prdetail.Model); ok && x < pullsEnd {
+		return m.navigateToList()
 	}
 
 	return m, nil
 }
 
 func (m Model) renderStatusBar() string {
-	mode := styles.StatusBarMode.Render("NORMAL ")
+	var leftHints, rightHints []string
 
-	var hints []string
-	switch m.currentView {
-	case viewPRList:
-		hints = []string{
-			hint(":", "command"),
-			hint("/", "filter"),
-			hint("enter", "open"),
-		}
-	case viewPRDetail:
-		hints = []string{
-			hint(":", "command"),
-			hint("tab", "switch tab"),
-			hint("esc", "back"),
-		}
+	switch v := m.activeView.(type) {
+	case prlist.Model:
+		leftHints = []string{":  cmd", "/  filter", "enter  open"}
+	case prdetail.Model:
+		leftHints, rightHints = v.StatusHints()
 	}
 
-	right := strings.Join(hints, styles.StatusBarHint.Render("  "))
-	gap := m.width - lipgloss.Width(mode) - lipgloss.Width(right) - 2
+	left := formatHints(leftHints)
+	right := formatHints(rightHints)
+
+	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 0 {
 		gap = 0
 	}
 
-	return fmt.Sprintf("%s%s%s", mode, strings.Repeat(" ", gap), right)
+	return left + strings.Repeat(" ", gap) + right
+}
+
+func formatHints(hints []string) string {
+	var parts []string
+	for _, h := range hints {
+		// Split on first space: "key desc"
+		idx := strings.IndexByte(h, ' ')
+		if idx > 0 {
+			key := h[:idx]
+			desc := h[idx+1:]
+			parts = append(parts, styles.StatusBarKey.Render(key)+" "+styles.StatusBarHint.Render(desc))
+		} else {
+			parts = append(parts, styles.StatusBarHint.Render(h))
+		}
+	}
+	return strings.Join(parts, styles.StatusBarHint.Render("  "))
 }
 
 func hint(key, desc string) string {

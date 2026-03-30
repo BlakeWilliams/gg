@@ -80,6 +80,44 @@ func (c *CachedClient) ListPullRequests() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
+// ReviewsLoadedMsg is sent when PR reviews are loaded.
+type ReviewsLoadedMsg struct {
+	Reviews []Review
+	Number  int
+}
+
+// GetReviews returns a tea.Cmd that fetches PR reviews with caching.
+func (c *CachedClient) GetReviews(number int) tea.Cmd {
+	key := fmt.Sprintf("reviews:%d", number)
+	fetchFn := func() ([]Review, error) {
+		return c.client.GetReviews(context.Background(), number)
+	}
+
+	data, found, _, refetchFn := cache.Query(c.cache, key, fetchFn)
+
+	var cmds []tea.Cmd
+
+	if found {
+		reviews := data
+		cmds = append(cmds, func() tea.Msg {
+			return ReviewsLoadedMsg{Reviews: reviews, Number: number}
+		})
+	}
+
+	if refetchFn != nil {
+		fn := refetchFn
+		cmds = append(cmds, func() tea.Msg {
+			result, err := fn()
+			if err != nil {
+				return QueryErrMsg{Err: err}
+			}
+			return ReviewsLoadedMsg{Reviews: result, Number: number}
+		})
+	}
+
+	return tea.Batch(cmds...)
+}
+
 // CommentsLoadedMsg is sent when PR comments are loaded.
 type CommentsLoadedMsg struct {
 	Comments []IssueComment
@@ -112,6 +150,44 @@ func (c *CachedClient) GetIssueComments(number int) tea.Cmd {
 				return QueryErrMsg{Err: err}
 			}
 			return CommentsLoadedMsg{Comments: result, Number: number}
+		})
+	}
+
+	return tea.Batch(cmds...)
+}
+
+// ReviewCommentsLoadedMsg is sent when PR review comments (inline diff comments) are loaded.
+type ReviewCommentsLoadedMsg struct {
+	Comments []ReviewComment
+	Number   int
+}
+
+// GetReviewComments returns a tea.Cmd that fetches PR review comments with caching.
+func (c *CachedClient) GetReviewComments(number int) tea.Cmd {
+	key := fmt.Sprintf("review-comments:%d", number)
+	fetchFn := func() ([]ReviewComment, error) {
+		return c.client.GetReviewComments(context.Background(), number)
+	}
+
+	data, found, _, refetchFn := cache.Query(c.cache, key, fetchFn)
+
+	var cmds []tea.Cmd
+
+	if found {
+		comments := data
+		cmds = append(cmds, func() tea.Msg {
+			return ReviewCommentsLoadedMsg{Comments: comments, Number: number}
+		})
+	}
+
+	if refetchFn != nil {
+		fn := refetchFn
+		cmds = append(cmds, func() tea.Msg {
+			result, err := fn()
+			if err != nil {
+				return QueryErrMsg{Err: err}
+			}
+			return ReviewCommentsLoadedMsg{Comments: result, Number: number}
 		})
 	}
 

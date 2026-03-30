@@ -3,24 +3,25 @@ package github
 import "time"
 
 type PullRequest struct {
-	Number       int        `json:"number"`
-	Title        string     `json:"title"`
-	Body         string     `json:"body"`
-	State        string     `json:"state"`
-	Draft        bool       `json:"draft"`
-	Merged       bool       `json:"merged"`
-	MergedAt     *time.Time `json:"merged_at"`
-	MergedBy     *User      `json:"merged_by"`
-	ClosedAt     *time.Time `json:"closed_at"`
-	User         User       `json:"user"`
-	CreatedAt    time.Time  `json:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at"`
-	Head         Branch     `json:"head"`
-	Base         Branch     `json:"base"`
-	Additions    int        `json:"additions"`
-	Deletions    int        `json:"deletions"`
-	ChangedFiles int        `json:"changed_files"`
-	Labels       []Label    `json:"labels"`
+	Number             int        `json:"number"`
+	Title              string     `json:"title"`
+	Body               string     `json:"body"`
+	State              string     `json:"state"`
+	Draft              bool       `json:"draft"`
+	Merged             bool       `json:"merged"`
+	MergedAt           *time.Time `json:"merged_at"`
+	MergedBy           *User      `json:"merged_by"`
+	ClosedAt           *time.Time `json:"closed_at"`
+	User               User       `json:"user"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+	Head               Branch     `json:"head"`
+	Base               Branch     `json:"base"`
+	Additions          int        `json:"additions"`
+	Deletions          int        `json:"deletions"`
+	ChangedFiles       int        `json:"changed_files"`
+	Labels             []Label    `json:"labels"`
+	RequestedReviewers []User     `json:"requested_reviewers"`
 }
 
 type User struct {
@@ -39,12 +40,35 @@ type Label struct {
 	Color string `json:"color"`
 }
 
+type Review struct {
+	ID          int       `json:"id"`
+	User        User      `json:"user"`
+	Body        string    `json:"body"`
+	State       string    `json:"state"` // APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED, PENDING
+	SubmittedAt time.Time `json:"submitted_at"`
+}
+
 type IssueComment struct {
 	ID        int       `json:"id"`
 	Body      string    `json:"body"`
 	User      User      `json:"user"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type ReviewComment struct {
+	ID                  int       `json:"id"`
+	Body                string    `json:"body"`
+	Path                string    `json:"path"`
+	Line                *int      `json:"line"`
+	OriginalLine        *int      `json:"original_line"`
+	Side                string    `json:"side"`
+	StartLine           *int      `json:"start_line"`
+	OriginalStartLine   *int      `json:"original_start_line"`
+	InReplyToID         *int      `json:"in_reply_to_id"`
+	User                User      `json:"user"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 type PullRequestFile struct {

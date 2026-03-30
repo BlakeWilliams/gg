@@ -2,17 +2,49 @@ package prdetail
 
 import (
 	"fmt"
+	"image/color"
 	"strings"
 	"time"
 
 	"github.com/blakewilliams/ghq/internal/github"
 	"github.com/blakewilliams/ghq/internal/ui/components"
 	"github.com/blakewilliams/ghq/internal/ui/styles"
+	"github.com/blakewilliams/ghq/internal/ui/uictx"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/glamour/v2"
 	"charm.land/glamour/v2/ansi"
 	"charm.land/lipgloss/v2"
+)
+
+// Nerdfont icon constants.
+const (
+	iconCheckCircle = "\U000f05e0" // 󰗠 nf-md-check_circle
+	iconXCircle     = "\U000f0159" // 󰅙 nf-md-close_circle
+	iconComment     = "\U000f0188" // 󰆈 nf-md-comment
+	iconSlash       = "\U000f0737" // 󰜷 nf-md-cancel
+	iconClock       = "\U000f0954" // 󰥔 nf-md-clock_outline
+	iconReview      = "\U000f0e19" // 󰸙 nf-md-eye_check
+	iconComments    = "\U000f0e1c" // 󰸜 nf-md-comment_multiple
+	iconAuthor      = "\U000f0004" // 󰀄 nf-md-account
+	iconFile        = "\U000f0214" // 󰈔 nf-md-file
+	iconFileTree    = "\U000f0253" // 󰉓 nf-md-file_tree
+	iconFolder      = "\U000f024b" // 󰉋 nf-md-folder
+	iconArrowUp     = "\U000f005d" // 󰁝 nf-md-arrow_up
+	iconArrowDown   = "\U000f0045" // 󰁅 nf-md-arrow_down
+	iconLoading     = "\U000f0772" // 󰝲 nf-md-loading
+	iconGit         = "\U000f02a2" // 󰊢 nf-md-git
+	iconPR          = "\U000f0041" // 󰁁 nf-md-arrow_top_right (source-branch)
+	iconMerge       = "\U000f0261" // 󰉡 nf-md-source_merge (call_merge)
+	iconClose       = "\U000f0156" // 󰅖 nf-md-close
+	iconDraft       = "\U000f0613" // 󰘓 nf-md-pencil
+	iconOpen        = "\U000f0130" // 󰄰 nf-md-checkbox_blank_circle_outline
+	iconPlus        = "\U000f0415" // 󰐕 nf-md-plus
+	iconMinus       = "\U000f0374" // 󰍴 nf-md-minus
+	iconRename      = "\U000f0453" // 󰑓 nf-md-rename_box
+	iconChevron     = "\U000f0142" // 󰅂 nf-md-chevron_right
+	iconArrowRight  = "\U000f0054" // 󰁔 nf-md-arrow_right
+	iconPointer     = "\U000f0142" // 󰅂 nf-md-chevron_right (cursor)
 )
 
 type prTab int
@@ -38,7 +70,7 @@ type prefetchDoneMsg struct{}
 
 type Model struct {
 	pr     github.PullRequest
-	client *github.CachedClient
+	ctx    *uictx.Context
 	width  int
 	height int
 	tab    prTab
@@ -47,7 +79,9 @@ type Model struct {
 	overviewVP    viewport.Model
 	overviewReady bool
 	descContent   string
-	comments      []github.IssueComment
+	reviews        []github.Review
+	comments       []github.IssueComment
+	reviewComments []github.ReviewComment
 
 	// Code tab
 	codeVP         viewport.Model
@@ -58,17 +92,21 @@ type Model struct {
 	filesLoading   bool
 	currentFileIdx int
 
+	// File tree
+	showTree      bool
+	treeEntries   []components.FileTreeEntry
+	treeCursor    int
+	treeWidth     int
+
 	// Shared
 	filesListLoaded bool
-	diffColors      styles.DiffColors
 	waitingG        bool
 }
 
-func New(pr github.PullRequest, client *github.CachedClient, width, height int, diffColors styles.DiffColors) Model {
+func New(pr github.PullRequest, ctx *uictx.Context, width, height int) Model {
 	return Model{
-		pr:         pr,
-		client:     client,
-		diffColors: diffColors,
+		pr:     pr,
+		ctx:    ctx,
 		width:  width,
 		height: height,
 		tab:    tabOverview,
@@ -83,15 +121,27 @@ func (m Model) PRTitle() string {
 	return m.pr.Title
 }
 
-func (m *Model) SetDiffColors(c styles.DiffColors) {
-	m.diffColors = c
-}
-
 func (m *Model) activeViewport() *viewport.Model {
 	if m.tab == tabCode {
 		return &m.codeVP
 	}
 	return &m.overviewVP
+}
+
+// StatusHints returns left and right hint groups for the status bar.
+func (m Model) StatusHints() (left, right []string) {
+	switch m.tab {
+	case tabCode:
+		left = append(left, "f "+iconFileTree+" tree")
+		left = append(left, "tab overview")
+		if len(m.files) > 0 {
+			right = append(right, fmt.Sprintf(iconFile+" %d/%d", m.currentFileIdx+1, len(m.files)))
+		}
+	case tabOverview:
+		left = append(left, "tab code")
+	}
+	left = append(left, "esc back")
+	return
 }
 
 func (m Model) Tab() string {
@@ -103,19 +153,21 @@ func (m Model) Tab() string {
 
 func (m Model) Init() tea.Cmd {
 	body := m.pr.Body
-	width := m.width - 4 // border (2) + padding (2)
+	width := m.descWidth()
 	prNumber := m.pr.Number
 	return tea.Batch(
 		func() tea.Msg {
 			rendered := renderMarkdown(body, width)
 			return descRenderedMsg{content: rendered, prNumber: prNumber}
 		},
-		m.client.GetPullRequestFiles(m.pr.Number),
-		m.client.GetIssueComments(m.pr.Number),
+		m.ctx.Client.GetPullRequestFiles(m.pr.Number),
+		m.ctx.Client.GetReviews(m.pr.Number),
+		m.ctx.Client.GetIssueComments(m.pr.Number),
+		m.ctx.Client.GetReviewComments(m.pr.Number),
 	)
 }
 
-func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
+func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -125,68 +177,51 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		m.codeVP.SetWidth(m.width)
 		m.codeVP.SetHeight(m.height)
 		body := m.pr.Body
-		width := m.width - 4 // border + padding
+		width := m.descWidth()
 		prNumber := m.pr.Number
-		return m, func() tea.Msg {
+		cmds := []tea.Cmd{func() tea.Msg {
 			rendered := renderMarkdown(body, width)
 			return descRenderedMsg{content: rendered, prNumber: prNumber}
+		}}
+		// Re-render diff files at the new width.
+		if m.filesListLoaded {
+			m.filesRendered = 0
+			m.renderedFiles = make([]string, len(m.files))
+			cmds = append(cmds, m.renderFileCmd(0))
+		}
+		return m, tea.Batch(cmds...)
+
+	case tea.MouseClickMsg:
+		if m.tab == tabCode && m.showTree && msg.X < m.treeWidth {
+			if idx, ok := m.treeEntryIndexAtY(msg.Y); ok {
+				e := m.treeEntries[idx]
+				if !e.IsDir && e.FileIndex >= 0 {
+					m.treeCursor = idx
+					m.currentFileIdx = e.FileIndex
+					m.rebuildCode()
+				}
+			}
+			return m, nil
 		}
 
 	case tea.KeyPressMsg:
-		switch msg.String() {
-		case "tab":
-			if m.tab == tabOverview {
-				m.tab = tabCode
-				if m.filesListLoaded && !m.codeReady {
-					return m, m.startFileRendering()
-				}
-				m.rebuildCode()
-			} else {
-				m.tab = tabOverview
-			}
-			return m, nil
-		case "shift+tab":
-			if m.tab == tabCode {
-				m.tab = tabOverview
-			} else {
-				m.tab = tabCode
-				if m.filesListLoaded && !m.codeReady {
-					return m, m.startFileRendering()
-				}
-				m.rebuildCode()
-			}
-			return m, nil
-		case "p", "h", "left":
-			if m.tab == tabCode && m.currentFileIdx > 0 {
-				m.currentFileIdx--
-				m.rebuildCode()
-				return m, nil
-			}
-		case "n", "l", "right":
-			if m.tab == tabCode && m.currentFileIdx < len(m.files)-1 {
-				m.currentFileIdx++
-				m.rebuildCode()
-				return m, nil
-			}
-		case "G":
-			m.waitingG = false
-			m.activeViewport().GotoBottom()
-			return m, nil
-		case "g":
-			if m.waitingG {
-				m.waitingG = false
-				m.activeViewport().GotoTop()
-				return m, nil
-			}
-			m.waitingG = true
-			return m, nil
-		default:
-			m.waitingG = false
+		var cmd tea.Cmd
+		var handled bool
+		m, cmd, handled = m.handleKey(msg)
+		if handled {
+			return m, cmd
 		}
 
 	case descRenderedMsg:
 		if msg.prNumber == m.pr.Number {
 			m.descContent = msg.content
+			m.rebuildOverview()
+		}
+		return m, nil
+
+	case github.ReviewsLoadedMsg:
+		if msg.Number == m.pr.Number {
+			m.reviews = msg.Reviews
 			m.rebuildOverview()
 		}
 		return m, nil
@@ -203,10 +238,24 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case github.ReviewCommentsLoadedMsg:
+		if msg.Number == m.pr.Number {
+			m.reviewComments = msg.Comments
+			// Re-render all already-rendered files to include comments.
+			if m.filesRendered > 0 {
+				m.filesRendered = 0
+				m.renderedFiles = make([]string, len(m.files))
+				return m, m.renderFileCmd(0)
+			}
+		}
+		return m, nil
+
 	case github.PRFilesLoadedMsg:
 		m.files = msg.Files
 		m.renderedFiles = make([]string, len(msg.Files))
 		m.filesListLoaded = true
+		m.treeEntries = components.BuildFileTree(m.files)
+		m.syncTreeCursor()
 		// Rebuild overview to show file summary.
 		m.rebuildOverview()
 		// Prefetch first 3 files into cache.
@@ -255,14 +304,105 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m Model) HandleKey(msg tea.KeyPressMsg) (uictx.View, tea.Cmd, bool) {
+	return m.handleKey(msg)
+}
+
+func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
+	switch msg.String() {
+	case "tab":
+		if m.tab == tabOverview {
+			m.tab = tabCode
+			if m.filesListLoaded && !m.codeReady {
+				return m, m.startFileRendering(), true
+			}
+			m.rebuildCode()
+		} else {
+			m.tab = tabOverview
+		}
+		return m, nil, true
+	case "shift+tab":
+		if m.tab == tabCode {
+			m.tab = tabOverview
+		} else {
+			m.tab = tabCode
+			if m.filesListLoaded && !m.codeReady {
+				return m, m.startFileRendering(), true
+			}
+			m.rebuildCode()
+		}
+		return m, nil, true
+	case "f":
+		if m.tab == tabCode && m.filesListLoaded {
+			m.showTree = !m.showTree
+			if m.showTree {
+				if m.treeWidth == 0 {
+					m.treeWidth = 35
+				}
+				m.syncTreeCursor()
+			}
+			m.rebuildCode()
+			return m, nil, true
+		}
+	case "j", "down":
+		if m.tab == tabCode && m.showTree {
+			m.treeMoveCursor(1)
+			return m, nil, true
+		}
+	case "k", "up":
+		if m.tab == tabCode && m.showTree {
+			m.treeMoveCursor(-1)
+			return m, nil, true
+		}
+	case "enter":
+		if m.tab == tabCode && m.showTree {
+			e := m.treeEntries[m.treeCursor]
+			if !e.IsDir && e.FileIndex >= 0 {
+				m.currentFileIdx = e.FileIndex
+				m.rebuildCode()
+			}
+			return m, nil, true
+		}
+	case "p", "h", "left":
+		if m.tab == tabCode && !m.showTree && m.currentFileIdx > 0 {
+			m.currentFileIdx--
+			m.rebuildCode()
+			return m, nil, true
+		}
+	case "n", "l", "right":
+		if m.tab == tabCode && !m.showTree && m.currentFileIdx < len(m.files)-1 {
+			m.currentFileIdx++
+			m.rebuildCode()
+			return m, nil, true
+		}
+	case "G":
+		m.waitingG = false
+		m.activeViewport().GotoBottom()
+		return m, nil, true
+	case "g":
+		if m.waitingG {
+			m.waitingG = false
+			m.activeViewport().GotoTop()
+			return m, nil, true
+		}
+		m.waitingG = true
+		return m, nil, true
+	default:
+		m.waitingG = false
+	}
+	return m, nil, false
+}
+
 var (
-	userStyle      = lipgloss.NewStyle().UnderlineStyle(lipgloss.UnderlineDotted)
 	dimStyle       = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
 	separatorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 )
 
 func (m Model) View() string {
 	if m.tab == tabCode && m.codeReady {
+		if m.showTree {
+			return m.renderCodeWithTree()
+		}
 		return m.codeVP.View()
 	}
 	if m.overviewReady {
@@ -271,50 +411,83 @@ func (m Model) View() string {
 	return ""
 }
 
+func (m Model) renderCodeWithTree() string {
+	treeW := m.treeWidth
+	divider := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack).Render("│")
+
+	treeLines := components.RenderFileTree(m.treeEntries, m.files, m.treeCursor, m.currentFileIdx, treeW, m.height)
+	diffLines := strings.Split(m.codeVP.View(), "\n")
+
+	var b strings.Builder
+	for i := 0; i < m.height; i++ {
+		tl := ""
+		if i < len(treeLines) {
+			tl = treeLines[i]
+		}
+		dl := ""
+		if i < len(diffLines) {
+			dl = diffLines[i]
+		}
+		b.WriteString(tl + divider + dl)
+		if i < m.height-1 {
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
 // --- Overview tab ---
+
+// overviewPad is the left margin for overview content.
+const overviewPad = 2
+
+// indent prefixes every line of s with n spaces.
+func indent(s string, n int) string {
+	prefix := strings.Repeat(" ", n)
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		if l != "" {
+			lines[i] = prefix + l
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// descWidth returns the available width for description/body markdown.
+func (m Model) descWidth() int {
+	return m.width - overviewPad*2
+}
 
 func (m *Model) rebuildOverview() {
 	var content strings.Builder
 
-	// Description card with metadata in the top border.
-	meta := " " + styles.PRStatusBadge(m.pr.State, m.pr.Draft, m.pr.Merged) +
-		" " + m.renderMeta() + " "
+	// Status + metadata line.
+	meta := styles.PRStatusBadge(m.pr.State, m.pr.Draft, m.pr.Merged) +
+		" " + m.renderMeta()
+	content.WriteString("\n" + indent(meta, overviewPad) + "\n")
 
-	metaWidth := lipgloss.Width(meta)
-	fillWidth := m.width - 2 - metaWidth - 1
-	if fillWidth < 0 {
-		fillWidth = 0
-	}
-	topBorder := borderColor.Render("╭─") + meta + borderColor.Render(strings.Repeat("─", fillWidth)+"╮")
-
-	// Title + description inside the card.
-	prURL := fmt.Sprintf("https://github.com/%s/pull/%d", m.client.RepoFullName(), m.pr.Number)
+	// Title.
+	prURL := fmt.Sprintf("https://github.com/%s/pull/%d", m.ctx.Client.RepoFullName(), m.pr.Number)
 	title := lipgloss.NewStyle().Bold(true).
 		UnderlineStyle(lipgloss.UnderlineDotted).
 		Hyperlink(prURL).
 		Render(fmt.Sprintf("#%d %s", m.pr.Number, m.pr.Title))
+	content.WriteString("\n" + indent(title, overviewPad) + "\n")
 
-	descBody := m.descContent
+	// Description body.
+	descBody := strings.TrimSpace(m.descContent)
 	if descBody == "" {
 		descBody = dimStyle.Render("No description provided.")
 	}
-	cardContent := title + "\n\n" + descBody
-	bottom := commentBodyStyle.Width(m.width).Render(cardContent)
+	content.WriteString("\n" + indent(descBody, overviewPad))
 
-	content.WriteString("\n" + topBorder + "\n" + bottom)
+	// Reviews section.
+	if m.hasReviewContent() {
+		content.WriteString("\n" + m.renderReviews())
+	}
 
 	if len(m.comments) > 0 {
-		label := fmt.Sprintf("%d comment", len(m.comments))
-		if len(m.comments) != 1 {
-			label += "s"
-		}
-		content.WriteString("\n\n")
-		content.WriteString("  " + lipgloss.NewStyle().Bold(true).Render(label))
-		content.WriteString("\n")
-
-		for _, c := range m.comments {
-			content.WriteString(m.renderComment(c))
-		}
+		content.WriteString("\n" + m.renderComments())
 	}
 
 	if !m.overviewReady {
@@ -341,8 +514,9 @@ func (m Model) renderFileCmd(index int) tea.Cmd {
 	ref := m.pr.Head.SHA
 	prNumber := m.pr.Number
 	width := m.width
-	client := m.client
-	colors := m.diffColors
+	client := m.ctx.Client
+	colors := m.ctx.DiffColors
+	fileComments := m.commentsForFile(f.Filename)
 
 	return func() tea.Msg {
 		var fileContent string
@@ -351,46 +525,60 @@ func (m Model) renderFileCmd(index int) tea.Cmd {
 				fileContent = content
 			}
 		}
-		rendered := components.RenderDiffFile(f, fileContent, width, colors)
+		rendered := components.RenderDiffFile(f, fileContent, width, colors, fileComments)
 		return fileRenderedMsg{content: rendered, index: index, prNumber: prNumber}
 	}
 }
 
+// commentsForFile returns review comments that belong to the given file.
+func (m Model) commentsForFile(filename string) []github.ReviewComment {
+	var result []github.ReviewComment
+	for _, c := range m.reviewComments {
+		if c.Path == filename {
+			result = append(result, c)
+		}
+	}
+	return result
+}
+
+func (m Model) codeWidth() int {
+	if m.showTree {
+		return m.width - m.treeWidth - 1 // -1 for divider
+	}
+	return m.width
+}
+
 func (m *Model) rebuildCode() {
+	w := m.codeWidth()
 	var content strings.Builder
 
-	// File position indicator.
-	if len(m.files) > 0 {
-		pos := dimStyle.Render(fmt.Sprintf("File %d of %d", m.currentFileIdx+1, len(m.files)))
-		nav := dimStyle.Render("← p  n →")
-		gap := m.width - lipgloss.Width(pos) - lipgloss.Width(nav)
-		if gap < 1 {
-			gap = 1
-		}
-		content.WriteString(pos + strings.Repeat(" ", gap) + nav)
+	idx := m.currentFileIdx
+
+	// Previous file hint above.
+	if idx > 0 {
+		prev := m.files[idx-1]
+		content.WriteString(dimStyle.Render("  " + iconArrowUp + " " + prev.Filename))
 		content.WriteString("\n\n")
 	}
 
-	idx := m.currentFileIdx
 	if idx < m.filesRendered {
 		content.WriteString(m.renderedFiles[idx])
 	} else {
-		content.WriteString(dimStyle.Render("  Loading..."))
+		content.WriteString(dimStyle.Render("  " + iconLoading + " Loading..."))
 	}
 
-	// Next file hint below the current file.
+	// Next file hint below.
 	if idx < len(m.files)-1 {
 		next := m.files[idx+1]
 		content.WriteString("\n\n")
-		hint := dimStyle.Render("n → ") + dimStyle.Render(next.Filename)
-		content.WriteString(hint)
+		content.WriteString(dimStyle.Render("  " + iconArrowDown + " " + next.Filename))
 	}
 
 	if !m.codeReady {
 		m.codeVP = viewport.New()
 		m.codeReady = true
 	}
-	m.codeVP.SetWidth(m.width)
+	m.codeVP.SetWidth(w)
 	m.codeVP.SetHeight(m.height)
 	m.codeVP.SetContent(content.String())
 }
@@ -407,7 +595,7 @@ func (m Model) prefetchFiles(n int) []tea.Cmd {
 	}
 
 	ref := m.pr.Head.SHA
-	client := m.client
+	client := m.ctx.Client
 	var cmds []tea.Cmd
 	for i := 0; i < limit; i++ {
 		f := m.files[i]
@@ -429,49 +617,268 @@ var (
 	commentBodyStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
 				BorderTop(false).
-				BorderForeground(lipgloss.BrightBlack).
+				BorderForeground(lipgloss.Color("245")).
 				Padding(0, 1)
 
-	commentAuthor = lipgloss.NewStyle().Bold(true)
-	authorBadge   = lipgloss.NewStyle().
+	authorBadge = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Black).
 			Background(lipgloss.Yellow)
 
-	borderColor = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
+	borderColor = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 )
 
-func (m Model) renderComment(c github.IssueComment) string {
-	name := userStyle.
-		Hyperlink(fmt.Sprintf("https://github.com/%s", c.User.Login)).
-		Render("@" + c.User.Login)
-	author := commentAuthor.Render(name)
+// nickColors is the palette used for weechat-style username coloring.
+// These are chosen to be distinct and readable on dark backgrounds.
+var nickColors = []color.Color{
+	lipgloss.Color("1"),   // red
+	lipgloss.Color("2"),   // green
+	lipgloss.Color("3"),   // yellow
+	lipgloss.Color("4"),   // blue
+	lipgloss.Color("5"),   // magenta
+	lipgloss.Color("6"),   // cyan
+	lipgloss.Color("9"),   // bright red
+	lipgloss.Color("10"),  // bright green
+	lipgloss.Color("11"),  // bright yellow
+	lipgloss.Color("12"),  // bright blue
+	lipgloss.Color("13"),  // bright magenta
+	lipgloss.Color("14"),  // bright cyan
+	lipgloss.Color("208"), // orange
+	lipgloss.Color("172"), // dark orange
+	lipgloss.Color("141"), // purple
+	lipgloss.Color("167"), // salmon
+	lipgloss.Color("109"), // steel blue
+	lipgloss.Color("150"), // sage
+}
 
-	if c.User.Login == m.pr.User.Login {
-		author += " " + authorBadge.Render(" Author ")
+// nickColor returns a consistent color for a given username using
+// a djb2-style hash, similar to weechat's nick coloring algorithm.
+func nickColor(name string) color.Color {
+	var hash uint32 = 5381
+	for _, c := range name {
+		hash = hash*33 + uint32(c)
+	}
+	return nickColors[hash%uint32(len(nickColors))]
+}
+
+// coloredAuthor renders a username with a consistent hash-based color.
+func coloredAuthor(login string) string {
+	return lipgloss.NewStyle().
+		Bold(true).
+		Foreground(nickColor(login)).
+		UnderlineStyle(lipgloss.UnderlineDotted).
+		Hyperlink(fmt.Sprintf("https://github.com/%s", login)).
+		Render("@" + login)
+}
+
+func (m Model) renderComments() string {
+	innerW := m.width - 4 // border + padding
+
+	var lines []string
+	for _, c := range m.comments {
+		author := coloredAuthor(c.User.Login)
+		if c.User.Login == m.pr.User.Login {
+			author += " " + authorBadge.Render(" "+iconAuthor+" Author ")
+		}
+		age := dimStyle.Render(relativeTime(c.CreatedAt))
+
+		line := author + " " + age
+		if c.Body != "" {
+			body := renderMarkdown(c.Body, innerW)
+			line += "\n" + body
+		}
+		lines = append(lines, line)
 	}
 
-	age := dimStyle.Render(relativeTime(c.CreatedAt))
-	title := " " + author + " " + age + " "
-
-	// Build top border with title embedded: ╭─ @author 2d ───╮
-	// Chrome: ╭─ (2) + title + ─...─╮ (fill+1) = width
-	titleWidth := lipgloss.Width(title)
-	fillWidth := m.width - 2 - titleWidth - 1
-	if fillWidth < 0 {
-		fillWidth = 0
+	// Top border with count embedded.
+	label := fmt.Sprintf("%d comment", len(m.comments))
+	if len(m.comments) != 1 {
+		label += "s"
 	}
-	topBorder := borderColor.Render("╭─") + title + borderColor.Render(strings.Repeat("─", fillWidth)+"╮")
-
-	// Render body inside bottom border (no top border).
-	bodyWidth := m.width - 4 // border + padding
-	if bodyWidth < 20 {
-		bodyWidth = 20
+	title := " " + lipgloss.NewStyle().Bold(true).Render(iconComments+" "+label) + " "
+	titleW := lipgloss.Width(title)
+	fillW := m.width - 2 - titleW - 1
+	if fillW < 0 {
+		fillW = 0
 	}
-	body := renderMarkdown(c.Body, bodyWidth)
+	topBorder := borderColor.Render("╭─") + title + borderColor.Render(strings.Repeat("─", fillW)+"╮")
+
+	sep := dimStyle.Render(strings.Repeat("─", innerW))
+	body := strings.Join(lines, "\n"+sep+"\n")
+
 	bottom := commentBodyStyle.Width(m.width).Render(body)
+	return topBorder + "\n" + bottom
+}
 
-	return "\n" + topBorder + "\n" + bottom
+// --- Reviews ---
+
+func (m Model) hasReviewContent() bool {
+	return len(m.reviews) > 0 || len(m.pr.RequestedReviewers) > 0
+}
+
+var (
+	reviewApproved  = lipgloss.NewStyle().Foreground(lipgloss.Green).Bold(true)
+	reviewChanges   = lipgloss.NewStyle().Foreground(lipgloss.Red).Bold(true)
+	reviewCommented = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
+	reviewPending   = lipgloss.NewStyle().Foreground(lipgloss.Yellow)
+
+	reviewBorder = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.BrightBlack).
+			Padding(0, 1)
+)
+
+func reviewStateIcon(state string) string {
+	switch state {
+	case "APPROVED":
+		return reviewApproved.Render(iconCheckCircle + " approved")
+	case "CHANGES_REQUESTED":
+		return reviewChanges.Render(iconXCircle + " changes requested")
+	case "COMMENTED":
+		return reviewCommented.Render(iconComment + " commented")
+	case "DISMISSED":
+		return reviewCommented.Render(iconSlash + " dismissed")
+	default:
+		return reviewPending.Render(iconClock + " pending")
+	}
+}
+
+func (m Model) renderReviews() string {
+	var b strings.Builder
+
+	// Deduplicate reviews — keep only the latest per user.
+	latestByUser := make(map[string]github.Review)
+	for _, r := range m.reviews {
+		if r.State == "PENDING" {
+			continue
+		}
+		existing, ok := latestByUser[r.User.Login]
+		if !ok || r.SubmittedAt.After(existing.SubmittedAt) {
+			latestByUser[r.User.Login] = r
+		}
+	}
+
+	// Build review lines.
+	var lines []string
+	for _, r := range m.reviews {
+		latest, ok := latestByUser[r.User.Login]
+		if !ok || latest.ID != r.ID {
+			continue
+		}
+		delete(latestByUser, r.User.Login) // only render once
+
+		author := coloredAuthor(r.User.Login)
+		line := author + " " + reviewStateIcon(r.State)
+		if r.Body != "" {
+			body := renderMarkdown(r.Body, m.width-6) // border + padding
+			line += "\n" + body
+		}
+		lines = append(lines, line)
+	}
+
+	// Requested reviewers (haven't reviewed yet).
+	for _, u := range m.pr.RequestedReviewers {
+		if _, reviewed := latestByUser[u.Login]; reviewed {
+			continue
+		}
+		// Check they haven't already been rendered.
+		alreadyRendered := false
+		for _, r := range m.reviews {
+			if r.User.Login == u.Login {
+				alreadyRendered = true
+				break
+			}
+		}
+		if alreadyRendered {
+			continue
+		}
+		author := coloredAuthor(u.Login)
+		lines = append(lines, author+" "+reviewPending.Render(iconClock+" awaiting review"))
+	}
+
+	if len(lines) == 0 {
+		return ""
+	}
+
+	// Top border with "Reviews" embedded.
+	title := " " + lipgloss.NewStyle().Bold(true).Render(iconReview+" Reviews") + " "
+	titleW := lipgloss.Width(title)
+	fillW := m.width - 2 - titleW - 1
+	if fillW < 0 {
+		fillW = 0
+	}
+	topBorder := borderColor.Render("╭─") + title + borderColor.Render(strings.Repeat("─", fillW)+"╮")
+
+	// Join lines with dimmed separator.
+	innerW := m.width - 4 // border + padding
+	sep := dimStyle.Render(strings.Repeat("─", innerW))
+	body := strings.Join(lines, "\n"+sep+"\n")
+
+	bottom := commentBodyStyle.Width(m.width).Render(body)
+	b.WriteString("\n" + topBorder + "\n" + bottom)
+
+	return b.String()
+}
+
+// --- File Tree ---
+
+func (m *Model) treeMoveCursor(delta int) {
+	if len(m.treeEntries) == 0 {
+		return
+	}
+	// Skip directory entries.
+	for {
+		m.treeCursor += delta
+		if m.treeCursor < 0 {
+			m.treeCursor = 0
+			return
+		}
+		if m.treeCursor >= len(m.treeEntries) {
+			m.treeCursor = len(m.treeEntries) - 1
+			return
+		}
+		if !m.treeEntries[m.treeCursor].IsDir {
+			return
+		}
+	}
+}
+
+// treeScrollStart returns the first visible entry index, matching RenderFileTree's scroll logic.
+func (m Model) treeScrollStart() int {
+	start := 0
+	if m.treeCursor > m.height-2 {
+		start = m.treeCursor - m.height/2
+		if start < 0 {
+			start = 0
+		}
+	}
+	end := start + m.height
+	if end > len(m.treeEntries) {
+		end = len(m.treeEntries)
+		start = end - m.height
+		if start < 0 {
+			start = 0
+		}
+	}
+	return start
+}
+
+// treeEntryIndexAtY maps a screen Y coordinate to a tree entry index.
+func (m Model) treeEntryIndexAtY(y int) (int, bool) {
+	idx := m.treeScrollStart() + y
+	if idx < 0 || idx >= len(m.treeEntries) {
+		return 0, false
+	}
+	return idx, true
+}
+
+func (m *Model) syncTreeCursor() {
+	for i, e := range m.treeEntries {
+		if !e.IsDir && e.FileIndex == m.currentFileIdx {
+			m.treeCursor = i
+			return
+		}
+	}
 }
 
 // --- Separator ---
@@ -516,39 +923,21 @@ func (m Model) renderFileSeparator() string {
 
 func (m Model) renderMeta() string {
 	pr := m.pr
-	author := formatUser(pr.User)
+	author := coloredAuthor(pr.User.Login)
 
 	if pr.Merged && pr.MergedBy != nil {
 		if pr.MergedBy.Login == pr.User.Login {
-			return dimStyle.Render(fmt.Sprintf(
-				"%s by %s",
-				relativeTime(*pr.MergedAt), author,
-			))
+			return dimStyle.Render(relativeTime(*pr.MergedAt)+" by ") + author
 		}
-		merger := formatUser(*pr.MergedBy)
-		return dimStyle.Render(fmt.Sprintf(
-			"%s by %s",
-			relativeTime(*pr.MergedAt), merger,
-		))
+		merger := coloredAuthor(pr.MergedBy.Login)
+		return dimStyle.Render(relativeTime(*pr.MergedAt)+" by ") + merger
 	}
 
 	if pr.State == "closed" && pr.ClosedAt != nil {
-		return dimStyle.Render(fmt.Sprintf(
-			"%s by %s",
-			relativeTime(*pr.ClosedAt), author,
-		))
+		return dimStyle.Render(relativeTime(*pr.ClosedAt)+" by ") + author
 	}
 
-	return dimStyle.Render(fmt.Sprintf(
-		"%s by %s",
-		relativeTime(pr.CreatedAt), author,
-	))
-}
-
-func formatUser(u github.User) string {
-	return userStyle.
-		Hyperlink(fmt.Sprintf("https://github.com/%s", u.Login)).
-		Render("@" + u.Login)
+	return dimStyle.Render(relativeTime(pr.CreatedAt)+" by ") + author
 }
 
 func relativeTime(t time.Time) string {
@@ -597,7 +986,9 @@ var markdownStyle = ansi.StyleConfig{
 	},
 	Heading: ansi.StyleBlock{
 		StylePrimitive: ansi.StylePrimitive{
-			Bold: boolPtr(true),
+			BlockSuffix: "\n",
+			Color:       stringPtr("5"), // magenta
+			Bold:        boolPtr(true),
 		},
 	},
 	H1: ansi.StyleBlock{
@@ -627,6 +1018,7 @@ var markdownStyle = ansi.StyleConfig{
 		CrossedOut: boolPtr(true),
 	},
 	HorizontalRule: ansi.StylePrimitive{
+		Color:  stringPtr("8"), // bright black
 		Format: "\n────────\n",
 	},
 	Item: ansi.StylePrimitive{
@@ -636,24 +1028,37 @@ var markdownStyle = ansi.StyleConfig{
 		BlockPrefix: ". ",
 	},
 	Task: ansi.StyleTask{
-		Ticked:   "[x] ",
+		Ticked:   "[✓] ",
 		Unticked: "[ ] ",
 	},
 	Link: ansi.StylePrimitive{
+		Color:     stringPtr("6"), // cyan
 		Underline: boolPtr(true),
+	},
+	LinkText: ansi.StylePrimitive{
+		Color: stringPtr("4"), // blue
+		Bold:  boolPtr(true),
 	},
 	Code: ansi.StyleBlock{
 		StylePrimitive: ansi.StylePrimitive{
+			Color:  stringPtr("3"), // yellow
 			Prefix: "`",
 			Suffix: "`",
 		},
 	},
 	CodeBlock: ansi.StyleCodeBlock{
 		StyleBlock: ansi.StyleBlock{
+			StylePrimitive: ansi.StylePrimitive{
+				Color: stringPtr("8"), // bright black
+			},
 			Margin: uintPtr(2),
 		},
 	},
 	BlockQuote: ansi.StyleBlock{
+		StylePrimitive: ansi.StylePrimitive{
+			Color:  stringPtr("8"), // bright black
+			Italic: boolPtr(true),
+		},
 		Indent:      uintPtr(1),
 		IndentToken: stringPtr("│ "),
 	},

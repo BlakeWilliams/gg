@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/alecthomas/chroma/v2"
 	"github.com/alecthomas/chroma/v2/formatters"
@@ -43,7 +44,7 @@ var (
 )
 
 // RenderDiffFile renders a single file's diff with full-width colored backgrounds.
-func RenderDiffFile(f github.PullRequestFile, fileContent string, width int, colors styles.DiffColors) string {
+func RenderDiffFile(f github.PullRequestFile, fileContent string, width int, colors styles.DiffColors, comments []github.ReviewComment) string {
 	name := f.Filename
 	if f.Status == "renamed" && f.PreviousFilename != "" {
 		name = f.PreviousFilename + " → " + f.Filename
@@ -65,11 +66,22 @@ func RenderDiffFile(f github.PullRequestFile, fileContent string, width int, col
 		gap = 1
 	}
 
-	header := fileNameStyle.Render(name) + strings.Repeat(" ", gap) + adds + " " + dels
-	rule := borderStyle.Render(strings.Repeat("─", width))
+	// Embed title + stats in the top border: ── filename ── +N -N ──
+	title := " " + fileNameStyle.Render(name) + " "
+	stats := " " + adds + " " + dels + " "
+	titleW := lipgloss.Width(title)
+	statsW := lipgloss.Width(stats)
+	leadW := 2 // "──"
+	fillW := width - leadW - titleW - statsW
+	if fillW < 0 {
+		fillW = 0
+	}
+	topBorder := borderStyle.Render("──") + title + borderStyle.Render(strings.Repeat("─", fillW)) + stats
+	// Trim or pad to exact width if stats pushed it over
+	bottomBorder := borderStyle.Render(strings.Repeat("─", width))
 
 	if f.Patch == "" {
-		return header + "\n" + rule + "\n" + styles.SubtitleStyle.Render("(binary or empty)") + "\n" + rule
+		return topBorder + "\n" + styles.SubtitleStyle.Render("(binary or empty)") + "\n" + bottomBorder
 	}
 
 	diffLines := parsePatchLines(f.Patch)
@@ -81,16 +93,28 @@ func RenderDiffFile(f github.PullRequestFile, fileContent string, width int, col
 		renderDiffLinesFallback(diffLines, f.Filename, width, colors)
 	}
 
+	// Index comments by the line they attach to (new-side line number).
+	commentsByLine := buildCommentThreads(comments)
+
 	var b strings.Builder
-	b.WriteString(header)
-	b.WriteString("\n")
-	b.WriteString(rule)
+	b.WriteString(topBorder)
 	b.WriteString("\n")
 	for _, dl := range diffLines {
 		b.WriteString(dl.Rendered)
 		b.WriteString("\n")
+
+		// Check if there are comments on this line.
+		lineNo := dl.NewLineNo
+		if dl.Type == LineDel {
+			lineNo = dl.OldLineNo
+		}
+		if lineNo > 0 {
+			if threads, ok := commentsByLine[lineNo]; ok {
+				b.WriteString(renderCommentThread(threads, width, dl.Type, colors))
+			}
+		}
 	}
-	b.WriteString(rule)
+	b.WriteString(bottomBorder)
 	return b.String()
 }
 
@@ -339,6 +363,251 @@ func truncateLine(s string, width int) string {
 		return s
 	}
 	return ansi.Truncate(s, width, "")
+}
+
+// buildCommentThreads groups comments by the line they're attached to,
+// threading replies under their parent.
+func buildCommentThreads(comments []github.ReviewComment) map[int][]github.ReviewComment {
+	if len(comments) == 0 {
+		return nil
+	}
+
+	// First, collect root comments (no InReplyToID) keyed by their line.
+	// Then append replies after their root.
+	byID := make(map[int]*github.ReviewComment, len(comments))
+	for i := range comments {
+		byID[comments[i].ID] = &comments[i]
+	}
+
+	result := make(map[int][]github.ReviewComment)
+	// Add root comments first.
+	for _, c := range comments {
+		if c.InReplyToID != nil {
+			continue
+		}
+		line := 0
+		if c.Line != nil {
+			line = *c.Line
+		} else if c.OriginalLine != nil {
+			line = *c.OriginalLine
+		}
+		if line > 0 {
+			result[line] = append(result[line], c)
+		}
+	}
+	// Add replies after their root.
+	for _, c := range comments {
+		if c.InReplyToID == nil {
+			continue
+		}
+		// Find the root of the thread to get the line.
+		root := byID[*c.InReplyToID]
+		if root == nil {
+			continue
+		}
+		// Walk up to the actual root.
+		for root.InReplyToID != nil {
+			if parent, ok := byID[*root.InReplyToID]; ok {
+				root = parent
+			} else {
+				break
+			}
+		}
+		line := 0
+		if root.Line != nil {
+			line = *root.Line
+		} else if root.OriginalLine != nil {
+			line = *root.OriginalLine
+		}
+		if line > 0 {
+			result[line] = append(result[line], c)
+		}
+	}
+	return result
+}
+
+// dimCode is the raw ANSI escape for BrightBlack foreground (used for comment borders).
+const dimCode = "\033[90m"
+
+// bgForLineType returns the raw ANSI bg code for the given diff line type.
+func bgForLineType(lt LineType, colors styles.DiffColors) string {
+	switch lt {
+	case LineAdd:
+		return colors.AddBg
+	case LineDel:
+		return colors.DelBg
+	default:
+		return ""
+	}
+}
+
+// fgForLineType returns the raw ANSI fg code for the gutter on the given line type.
+func fgForLineType(lt LineType, colors styles.DiffColors) string {
+	switch lt {
+	case LineAdd:
+		return colors.AddFg
+	case LineDel:
+		return colors.DelFg
+	default:
+		return ""
+	}
+}
+
+// commentGutterWidth is the visible width of the gutter area in diff lines.
+// padNum(4) + padNum(4) + " " + marker(1) = 10 visible chars.
+const commentGutterWidth = gutterWidth*2 + 2
+
+// commentGutter renders an empty gutter matching the diff line style.
+func commentGutter(bg string) string {
+	return bg + strings.Repeat(" ", commentGutterWidth)
+}
+
+// emptyLine renders a full-width blank line with the given bg.
+func emptyLine(bg string, width int) string {
+	return padWithBg(bg, width, bg) + "\n"
+}
+
+// renderCommentThread renders a thread of review comments as a block below a diff line.
+// It inherits the background color from the line type (add/del/context) and uses
+// the line's fg color for borders to make the comment box stand out.
+func renderCommentThread(comments []github.ReviewComment, width int, lt LineType, colors styles.DiffColors) string {
+	bg := bgForLineType(lt, colors)
+	fg := fgForLineType(lt, colors)
+	gutterStr := commentGutter(bg)
+	// Content area is everything after the gutter.
+	contentW := width - commentGutterWidth
+	if contentW < 20 {
+		contentW = 20
+	}
+
+	var b strings.Builder
+
+	// Blank line above.
+	b.WriteString(emptyLine(bg, width))
+
+	for i, c := range comments {
+		author := " \033[1m@" + c.User.Login + "\033[0m" + bg + " "
+		ageStr := relativeTime(c.CreatedAt)
+		age := dimCode + ageStr + "\033[0m" + bg + " "
+		authorW := 1 + 1 + len(c.User.Login) + 1 // " @user "
+		ageW := len(ageStr) + 1
+
+		var left, right string
+		if i == 0 {
+			left = "╭"
+			right = "╮"
+		} else {
+			left = "├"
+			right = "┤"
+		}
+
+		// ╭ + author + age + ─fill─ + ╮ = contentW
+		fillW := contentW - 1 - authorW - ageW - 1
+		if fillW < 0 {
+			fillW = 0
+		}
+		topLine := gutterStr + fg + left + "\033[0m" + bg +
+			author + age +
+			fg + strings.Repeat("─", fillW) + right + "\033[0m"
+		b.WriteString(padWithBg(topLine, width, bg))
+		b.WriteString("\n")
+
+		// Body lines: │ text                      │
+		innerW := contentW - 4 // "│ " + " │"
+		if innerW < 10 {
+			innerW = 10
+		}
+		bodyLines := wrapText(c.Body, innerW)
+		for _, line := range bodyLines {
+			visW := lipgloss.Width(line)
+			pad := innerW - visW
+			if pad < 0 {
+				pad = 0
+			}
+			content := gutterStr + fg + "│" + "\033[0m" + bg +
+				" " + line + strings.Repeat(" ", pad) + " " +
+				fg + "│" + "\033[0m"
+			b.WriteString(padWithBg(content, width, bg))
+			b.WriteString("\n")
+		}
+	}
+
+	// Bottom border: ╰──────╯
+	fillW := contentW - 2
+	if fillW < 0 {
+		fillW = 0
+	}
+	bottomLine := gutterStr + fg + "╰" + strings.Repeat("─", fillW) + "╯" + "\033[0m"
+	b.WriteString(padWithBg(bottomLine, width, bg))
+	b.WriteString("\n")
+
+	// Blank line below.
+	b.WriteString(emptyLine(bg, width))
+
+	return b.String()
+}
+
+// wrapText wraps text to the given width, splitting on whitespace.
+func wrapText(text string, width int) []string {
+	if width <= 0 {
+		return []string{text}
+	}
+	var lines []string
+	for _, paragraph := range strings.Split(text, "\n") {
+		if paragraph == "" {
+			lines = append(lines, "")
+			continue
+		}
+		words := strings.Fields(paragraph)
+		if len(words) == 0 {
+			lines = append(lines, "")
+			continue
+		}
+		current := words[0]
+		for _, w := range words[1:] {
+			if len(current)+1+len(w) > width {
+				lines = append(lines, current)
+				current = w
+			} else {
+				current += " " + w
+			}
+		}
+		lines = append(lines, current)
+	}
+	return lines
+}
+
+// relativeTime formats a time as a human-readable relative string.
+func relativeTime(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		m := int(d.Minutes())
+		if m == 1 {
+			return "1m ago"
+		}
+		return fmt.Sprintf("%dm ago", m)
+	case d < 24*time.Hour:
+		h := int(d.Hours())
+		if h == 1 {
+			return "1h ago"
+		}
+		return fmt.Sprintf("%dh ago", h)
+	case d < 30*24*time.Hour:
+		days := int(d.Hours() / 24)
+		if days == 1 {
+			return "1d ago"
+		}
+		return fmt.Sprintf("%dd ago", days)
+	default:
+		months := int(d.Hours() / 24 / 30)
+		if months <= 1 {
+			return "1mo ago"
+		}
+		return fmt.Sprintf("%dmo ago", months)
+	}
 }
 
 func highlightBlock(code, filename string, chromaStyle *chroma.Style) string {

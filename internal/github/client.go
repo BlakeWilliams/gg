@@ -57,12 +57,32 @@ func (c *Client) GetPullRequest(ctx context.Context, number int) (PullRequest, e
 	return pr, nil
 }
 
+func (c *Client) GetReviews(ctx context.Context, number int) ([]Review, error) {
+	var reviews []Review
+	path := fmt.Sprintf("repos/%s/%s/pulls/%d/reviews?per_page=100", c.owner, c.repo, number)
+	err := c.rest.Get(path, &reviews)
+	if err != nil {
+		return nil, fmt.Errorf("getting reviews for PR #%d: %w", number, err)
+	}
+	return reviews, nil
+}
+
 func (c *Client) GetIssueComments(ctx context.Context, number int) ([]IssueComment, error) {
 	var comments []IssueComment
 	path := fmt.Sprintf("repos/%s/%s/issues/%d/comments?per_page=100", c.owner, c.repo, number)
 	err := c.rest.Get(path, &comments)
 	if err != nil {
 		return nil, fmt.Errorf("getting comments for PR #%d: %w", number, err)
+	}
+	return comments, nil
+}
+
+func (c *Client) GetReviewComments(ctx context.Context, number int) ([]ReviewComment, error) {
+	var comments []ReviewComment
+	path := fmt.Sprintf("repos/%s/%s/pulls/%d/comments?per_page=100", c.owner, c.repo, number)
+	err := c.rest.Get(path, &comments)
+	if err != nil {
+		return nil, fmt.Errorf("getting review comments for PR #%d: %w", number, err)
 	}
 	return comments, nil
 }
