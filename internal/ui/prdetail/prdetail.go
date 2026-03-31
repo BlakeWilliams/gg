@@ -558,22 +558,34 @@ func (m Model) lastNonHunkLine(fileIdx int) int {
 	return len(lines) - 1
 }
 
+const scrollMargin = 5
+
 func (m *Model) scrollToDiffCursor() {
 	idx := m.currentFileIdx
-	if idx < len(m.fileLineOffsets) && idx < len(m.fileDiffOffsets) {
-		fileStart := m.fileLineOffsets[idx]
-		cursorInFile := m.diffCursor + 1 // +1 for top border (fallback)
-		if m.diffCursor < len(m.fileDiffOffsets[idx]) {
-			cursorInFile = m.fileDiffOffsets[idx][m.diffCursor]
-		}
-		offset := fileStart + cursorInFile
-		// Center the cursor in the viewport.
-		target := offset - m.height/2
+	if idx >= len(m.fileLineOffsets) || idx >= len(m.fileDiffOffsets) {
+		return
+	}
+	fileStart := m.fileLineOffsets[idx]
+	cursorInFile := m.diffCursor + 1
+	if m.diffCursor < len(m.fileDiffOffsets[idx]) {
+		cursorInFile = m.fileDiffOffsets[idx][m.diffCursor]
+	}
+	absLine := fileStart + cursorInFile
+	top := m.vp.YOffset()
+	bottom := top + m.height - 1
+
+	if absLine < top+scrollMargin {
+		// Cursor near top edge — scroll up.
+		target := absLine - scrollMargin
 		if target < 0 {
 			target = 0
 		}
 		m.vp.SetYOffset(target)
+	} else if absLine > bottom-scrollMargin {
+		// Cursor near bottom edge — scroll down.
+		m.vp.SetYOffset(absLine - m.height + scrollMargin + 1)
 	}
+	// Otherwise cursor is comfortably visible — don't scroll.
 }
 
 // editorFinishedMsg is sent when $EDITOR exits.
