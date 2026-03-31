@@ -29,6 +29,8 @@ const chromeHeight = 2
 type Model struct {
 	activeView uictx.View
 	prList     prlist.Model // retained so we can restore it on back-navigation
+	history    []uictx.View // back stack (views we navigated away from)
+	forward    []uictx.View // forward stack (views we went back from)
 	mode       inputMode
 	commandBar commandbar.Model
 	ctx        *uictx.Context
@@ -79,11 +81,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
-	case tea.MouseClickMsg:
-		if msg.Y == 0 {
-			return m.handleBreadcrumbClick(msg.X)
-		}
-
 	case github.GCTickMsg:
 		m.ctx.Client.GC()
 		return m, m.ctx.Client.GCTickCmd()
@@ -130,9 +127,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case ":":
 			m.mode = modeCommand
 			return m, m.commandBar.Focus()
-		case "esc":
-			if _, ok := m.activeView.(prdetail.Model); ok {
-				return m.navigateToList()
+		case "esc", "<":
+			if len(m.history) > 0 {
+				return m.navigateBack()
+			}
+		case ">":
+			if len(m.forward) > 0 {
+				return m.navigateForward()
 			}
 		}
 
@@ -148,6 +149,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if pl, ok := m.activeView.(prlist.Model); ok {
 			m.prList = pl
 		}
+		m.history = append(m.history, m.activeView)
+		m.forward = nil // clear forward stack on new navigation
 		m.activeView = prdetail.New(msg.PR, m.ctx, m.width, m.height-chromeHeight)
 		return m, m.activeView.Init()
 	}
@@ -158,9 +161,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m Model) navigateToList() (tea.Model, tea.Cmd) {
-	m.activeView = m.prList
-	// Re-send the current window size so the list adjusts if the terminal was resized.
+func (m Model) navigateBack() (tea.Model, tea.Cmd) {
+	prev := m.history[len(m.history)-1]
+	m.history = m.history[:len(m.history)-1]
+	m.forward = append(m.forward, m.activeView)
+	m.activeView = prev
+	// Restore prList reference if we're going back to the list.
+	if pl, ok := prev.(prlist.Model); ok {
+		m.prList = pl
+	}
+	resize := tea.WindowSizeMsg{Width: m.width, Height: m.height - chromeHeight}
+	m.activeView, _ = m.activeView.Update(resize)
+	return m, nil
+}
+
+func (m Model) navigateForward() (tea.Model, tea.Cmd) {
+	next := m.forward[len(m.forward)-1]
+	m.forward = m.forward[:len(m.forward)-1]
+	m.history = append(m.history, m.activeView)
+	m.activeView = next
+	if pl, ok := m.activeView.(prlist.Model); ok {
+		m.prList = pl
+	}
 	resize := tea.WindowSizeMsg{Width: m.width, Height: m.height - chromeHeight}
 	m.activeView, _ = m.activeView.Update(resize)
 	return m, nil
@@ -176,8 +198,8 @@ func (m Model) handleCommand(msg commandbar.CommandMsg) (tea.Model, tea.Cmd) {
 			return m, m.ctx.Client.ListPullRequests()
 		}
 	case "back":
-		if _, ok := m.activeView.(prdetail.Model); ok {
-			return m.navigateToList()
+		if len(m.history) > 0 {
+			return m.navigateBack()
 		}
 	}
 	return m, nil
@@ -215,39 +237,23 @@ func (m Model) renderHeader() string {
 
 	if detail, ok := m.activeView.(prdetail.Model); ok {
 		crumb += sep + styles.HeaderSection.Render(fmt.Sprintf("#%d %s", detail.PRNumber(), detail.PRTitle()))
-		crumb += sep + styles.HeaderSection.Render(detail.Tab())
 	}
 
 	return styles.HeaderBar.Width(m.width).Render(crumb)
 }
 
-func (m Model) handleBreadcrumbClick(x int) (tea.Model, tea.Cmd) {
-	repoWidth := lipgloss.Width(styles.HeaderRepo.Render(m.ctx.Client.RepoFullName())) + 1 // +1 for leading space
-	sepWidth := lipgloss.Width(styles.HeaderSep.Render("  "))
-	pullsWidth := lipgloss.Width(styles.HeaderSection.Render("Pulls"))
-
-	pullsStart := repoWidth + sepWidth
-	pullsEnd := pullsStart + pullsWidth
-
-	if _, ok := m.activeView.(prdetail.Model); ok && x < pullsEnd {
-		return m.navigateToList()
-	}
-
-	return m, nil
-}
-
 func (m Model) renderStatusBar() string {
-	var leftHints, rightHints []string
+	var left, right string
+	sep := styles.StatusBarHint.Render("  ")
 
 	switch v := m.activeView.(type) {
 	case prlist.Model:
-		leftHints = []string{":  cmd", "/  filter", "enter  open"}
+		left = formatHints([]string{":  cmd", "/  filter", "enter  open"})
 	case prdetail.Model:
-		leftHints, rightHints = v.StatusHints()
+		leftHints, rightHints := v.StatusHints()
+		left = strings.Join(leftHints, sep)
+		right = strings.Join(rightHints, sep)
 	}
-
-	left := formatHints(leftHints)
-	right := formatHints(rightHints)
 
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 0 {

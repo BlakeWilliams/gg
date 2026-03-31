@@ -2,7 +2,9 @@ package prdetail
 
 import (
 	"fmt"
-	"image/color"
+	"os"
+	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
@@ -10,8 +12,10 @@ import (
 	"github.com/blakewilliams/ghq/internal/ui/components"
 	"github.com/blakewilliams/ghq/internal/ui/styles"
 	"github.com/blakewilliams/ghq/internal/ui/uictx"
+	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
+	xansi "github.com/charmbracelet/x/ansi"
 	"charm.land/glamour/v2"
 	"charm.land/glamour/v2/ansi"
 	"charm.land/lipgloss/v2"
@@ -48,19 +52,12 @@ const (
 	iconChecks      = "\U000f0134" // 󰄴 nf-md-check
 )
 
-type prTab int
+type sidebarType int
 
 const (
-	tabOverview prTab = iota
-	tabCode
-)
-
-type overviewSection int
-
-const (
-	sectionComments overviewSection = iota
-	sectionReviews
-	sectionChecks
+	sidebarComments sidebarType = iota
+	sidebarReviews
+	sidebarChecks
 )
 
 type descRenderedMsg struct {
@@ -68,10 +65,10 @@ type descRenderedMsg struct {
 	prNumber int
 }
 
-type fileRenderedMsg struct {
-	content  string
-	index    int
-	prNumber int
+type fileHighlightedMsg struct {
+	highlight components.HighlightedDiff
+	index     int
+	prNumber  int
 }
 
 // prefetchDoneMsg signals that background prefetch of file contents completed.
@@ -82,36 +79,54 @@ type Model struct {
 	ctx    *uictx.Context
 	width  int
 	height int
-	tab    prTab
 
-	// Overview tab
-	overviewVP      viewport.Model
-	overviewReady   bool
-	descContent     string
-	reviews         []github.Review
-	comments        []github.IssueComment
-	reviewComments  []github.ReviewComment
-	checkRuns       []github.CheckRun
-	overviewSection overviewSection
+	// Main viewport
+	vp      viewport.Model
+	vpReady bool
 
-	// Code tab
-	codeVP         viewport.Model
-	codeReady      bool
-	files          []github.PullRequestFile
-	renderedFiles  []string
-	filesRendered  int
-	filesLoading   bool
-	currentFileIdx int
+	// Content data
+	descContent    string
+	reviews        []github.Review
+	comments       []github.IssueComment
+	reviewComments []github.ReviewComment
+	checkRuns      []github.CheckRun
 
-	// File tree
-	showTree      bool
-	treeEntries   []components.FileTreeEntry
-	treeCursor    int
-	treeWidth     int
+	// Files
+	files            []github.PullRequestFile
+	highlightedFiles []components.HighlightedDiff // cached syntax highlights (width-independent)
+	renderedFiles    []string                     // width-formatted output
+	filesHighlighted int                          // count of highlighted files
+	filesLoading     bool
+	currentFileIdx   int
+
+	// File tree (left sidebar)
+	showTree    bool
+	treeEntries []components.FileTreeEntry
+	treeCursor  int
+	treeWidth   int
+
+	// Right sidebar
+	showSidebar bool
+	sidebarType sidebarType
+	sidebarVP   viewport.Model
+
+	// Line cursor
+	diffCursor      int                          // cursor index within current file's diff lines
+	fileDiffs       [][]components.DiffLine       // parsed diff lines per file
+	fileDiffOffsets [][]int                       // rendered line offsets per file (from DiffRenderResult)
+
+	// Comment composing
+	composing    bool
+	commentInput textarea.Model
+	commentFile  string // file path for the comment
+	commentLine  int    // line number for the comment
+	commentSide  string // "LEFT" or "RIGHT"
+	replyToID    *int   // non-nil if replying to an existing thread
 
 	// Shared
-	filesListLoaded bool
-	waitingG        bool
+	filesListLoaded  bool
+	waitingG         bool
+	fileLineOffsets  []int // line offset of each file in the viewport content
 }
 
 func New(pr github.PullRequest, ctx *uictx.Context, width, height int) Model {
@@ -120,7 +135,6 @@ func New(pr github.PullRequest, ctx *uictx.Context, width, height int) Model {
 		ctx:    ctx,
 		width:  width,
 		height: height,
-		tab:    tabOverview,
 	}
 }
 
@@ -133,37 +147,33 @@ func (m Model) PRTitle() string {
 }
 
 func (m *Model) activeViewport() *viewport.Model {
-	if m.tab == tabCode {
-		return &m.codeVP
+	if m.showSidebar {
+		return &m.sidebarVP
 	}
-	return &m.overviewVP
+	return &m.vp
 }
 
 // StatusHints returns left and right hint groups for the status bar.
+// Entries are pre-rendered.
 func (m Model) StatusHints() (left, right []string) {
-	switch m.tab {
-	case tabCode:
-		left = append(left, "f "+iconFileTree+" tree")
-		left = append(left, "tab overview")
-		if len(m.files) > 0 {
-			right = append(right, fmt.Sprintf(iconFile+" %d/%d", m.currentFileIdx+1, len(m.files)))
-		}
-	case tabOverview:
-		left = append(left, "1 comments")
-		left = append(left, "2 reviews")
-		left = append(left, "3 checks")
-		left = append(left, "tab code")
-	}
-	left = append(left, "esc back")
+	left = append(left, highlightHint("files", "f"))
+	right = append(right, highlightHint("comments", "c"))
+	right = append(right, highlightHint("reviews", "r"))
+	right = append(right, highlightHint("checks", "s"))
 	return
 }
 
-func (m Model) Tab() string {
-	if m.tab == tabCode {
-		return "Code"
+// highlightHint renders a word with a single letter highlighted in magenta.
+func highlightHint(word, key string) string {
+	i := strings.Index(word, key)
+	if i < 0 {
+		return styles.StatusBarHint.Render(word)
 	}
-	return "Overview"
+	return styles.StatusBarHint.Render(word[:i]) +
+		styles.StatusBarKey.Render(string(word[i])) +
+		styles.StatusBarHint.Render(word[i+1:])
 }
+
 
 func (m Model) Init() tea.Cmd {
 	body := m.pr.Body
@@ -187,10 +197,8 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.overviewVP.SetWidth(m.width)
-		m.overviewVP.SetHeight(m.height)
-		m.codeVP.SetWidth(m.width)
-		m.codeVP.SetHeight(m.height)
+		m.vp.SetWidth(m.width)
+		m.vp.SetHeight(m.height)
 		body := m.pr.Body
 		width := m.descWidth()
 		prNumber := m.pr.Number
@@ -198,23 +206,22 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 			rendered := renderMarkdown(body, width)
 			return descRenderedMsg{content: rendered, prNumber: prNumber}
 		}}
-		// Re-render diff files at the new width.
-		if m.filesListLoaded {
-			m.filesRendered = 0
-			m.renderedFiles = make([]string, len(m.files))
-			cmds = append(cmds, m.renderFileCmd(0))
+		// Re-format diff files at the new width (cheap, no Chroma re-run).
+		if m.filesListLoaded && m.filesHighlighted > 0 {
+			m.reformatAllFiles()
+			m.rebuildContent()
 		}
 		return m, tea.Batch(cmds...)
 
 	case tea.MouseClickMsg:
-		if m.tab == tabCode && m.showTree && msg.X < m.treeWidth {
+		if m.showTree && msg.X < m.treeWidth {
 			if idx, ok := m.treeEntryIndexAtY(msg.Y); ok {
 				e := m.treeEntries[idx]
 				if !e.IsDir && e.FileIndex >= 0 {
 					m.treeCursor = idx
 					m.currentFileIdx = e.FileIndex
-					m.rebuildCode()
-					m.codeVP.GotoTop()
+					m.rebuildContent()
+					m.vp.GotoTop()
 				}
 			}
 			return m, nil
@@ -231,14 +238,14 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	case descRenderedMsg:
 		if msg.prNumber == m.pr.Number {
 			m.descContent = msg.content
-			m.rebuildOverview()
+			m.rebuildContent()
 		}
 		return m, nil
 
 	case github.ReviewsLoadedMsg:
 		if msg.Number == m.pr.Number {
 			m.reviews = msg.Reviews
-			m.rebuildOverview()
+			m.rebuildSidebar()
 		}
 		return m, nil
 
@@ -250,18 +257,17 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 				comments[i], comments[j] = comments[j], comments[i]
 			}
 			m.comments = comments
-			m.rebuildOverview()
+			m.rebuildSidebar()
 		}
 		return m, nil
 
 	case github.ReviewCommentsLoadedMsg:
 		if msg.Number == m.pr.Number {
 			m.reviewComments = msg.Comments
-			// Re-render all already-rendered files to include comments.
-			if m.filesRendered > 0 {
-				m.filesRendered = 0
-				m.renderedFiles = make([]string, len(m.files))
-				return m, m.renderFileCmd(0)
+			// Re-format files to include comments (cheap, highlights cached).
+			if m.filesHighlighted > 0 {
+				m.reformatAllFiles()
+				m.rebuildContent()
 			}
 		}
 		return m, nil
@@ -269,24 +275,27 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	case github.CheckRunsLoadedMsg:
 		if msg.Ref == m.pr.Head.SHA {
 			m.checkRuns = msg.CheckRuns
-			m.rebuildOverview()
+			m.rebuildSidebar()
 		}
 		return m, nil
 
 	case github.PRFilesLoadedMsg:
 		m.files = msg.Files
+		m.highlightedFiles = make([]components.HighlightedDiff, len(msg.Files))
 		m.renderedFiles = make([]string, len(msg.Files))
 		m.filesListLoaded = true
+		// Parse diff lines for each file (for cursor navigation).
+		m.fileDiffs = make([][]components.DiffLine, len(msg.Files))
+		m.fileDiffOffsets = make([][]int, len(msg.Files))
+		for i, f := range msg.Files {
+			m.fileDiffs[i] = components.ParsePatchLines(f.Patch)
+		}
 		m.treeEntries = components.BuildFileTree(m.files)
 		m.syncTreeCursor()
-		// Rebuild overview to show file summary.
-		m.rebuildOverview()
-		// Prefetch first 3 files into cache.
+		m.rebuildContent()
+		// Prefetch first 3 files into cache, then start rendering.
 		cmds := m.prefetchFiles(3)
-		// If already on Code tab, start rendering.
-		if m.tab == tabCode {
-			cmds = append(cmds, m.startFileRendering())
-		}
+		cmds = append(cmds, m.startFileRendering())
 		if len(cmds) > 0 {
 			return m, tea.Batch(cmds...)
 		}
@@ -295,33 +304,64 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	case prefetchDoneMsg:
 		return m, nil
 
-	case fileRenderedMsg:
-		if msg.prNumber != m.pr.Number || msg.index >= len(m.renderedFiles) {
+	case fileHighlightedMsg:
+		if msg.prNumber != m.pr.Number || msg.index >= len(m.highlightedFiles) {
 			return m, nil
 		}
-		m.renderedFiles[msg.index] = msg.content
-		m.filesRendered = msg.index + 1
-		if m.filesRendered >= len(m.files) {
+		m.highlightedFiles[msg.index] = msg.highlight
+		m.filesHighlighted = msg.index + 1
+		// Format at current width (cheap).
+		m.formatFile(msg.index)
+		if m.filesHighlighted >= len(m.files) {
 			m.filesLoading = false
 		}
-		m.rebuildCode()
-		if m.filesRendered < len(m.files) {
-			return m, m.renderFileCmd(m.filesRendered)
+		m.rebuildContent()
+		if m.filesHighlighted < len(m.files) {
+			return m, m.highlightFileCmd(m.filesHighlighted)
 		}
+		return m, nil
+
+	case github.CommentCreatedMsg:
+		if msg.Number == m.pr.Number {
+			m.composing = false
+			m.reviewComments = append(m.reviewComments, msg.Comment)
+			// Re-format to include the new comment (cheap).
+			m.reformatAllFiles()
+			m.rebuildContent()
+		}
+		return m, nil
+
+	case github.CommentErrorMsg:
+		// TODO: show error to user
 		return m, nil
 
 	case github.QueryErrMsg:
 		return m, nil
+
+	case editorFinishedMsg:
+		if msg.err == nil && msg.content != "" {
+			m.commentInput.SetValue(msg.content)
+		}
+		m.rebuildContent()
+		return m, nil
 	}
 
-	if m.tab == tabOverview && m.overviewReady {
+	// When composing a comment, delegate all input to the textarea.
+	if m.composing {
 		var cmd tea.Cmd
-		m.overviewVP, cmd = m.overviewVP.Update(msg)
+		m.commentInput, cmd = m.commentInput.Update(msg)
 		return m, cmd
 	}
-	if m.tab == tabCode && m.codeReady {
+
+	if m.vpReady {
+		vp := m.activeViewport()
+		prevOffset := vp.YOffset()
 		var cmd tea.Cmd
-		m.codeVP, cmd = m.codeVP.Update(msg)
+		*vp, cmd = vp.Update(msg)
+		// If the main viewport scrolled, sync the cursor (highlight applied at View time).
+		if vp == &m.vp && m.vp.YOffset() != prevOffset && m.filesListLoaded {
+			m.syncCursorToViewport()
+		}
 		return m, cmd
 	}
 	return m, nil
@@ -332,31 +372,27 @@ func (m Model) HandleKey(msg tea.KeyPressMsg) (uictx.View, tea.Cmd, bool) {
 }
 
 func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
+	// When composing a comment, handle textarea keys.
+	if m.composing {
+		return m.handleCommentKey(msg)
+	}
+
+	// Close sidebar or tree on esc.
+	if msg.String() == "esc" {
+		if m.showSidebar {
+			m.showSidebar = false
+			return m, nil, true
+		}
+		if m.showTree {
+			m.showTree = false
+			m.rebuildContent()
+			return m, nil, true
+		}
+	}
+
 	switch msg.String() {
-	case "tab":
-		if m.tab == tabOverview {
-			m.tab = tabCode
-			if m.filesListLoaded && !m.codeReady {
-				return m, m.startFileRendering(), true
-			}
-			m.rebuildCode()
-		} else {
-			m.tab = tabOverview
-		}
-		return m, nil, true
-	case "shift+tab":
-		if m.tab == tabCode {
-			m.tab = tabOverview
-		} else {
-			m.tab = tabCode
-			if m.filesListLoaded && !m.codeReady {
-				return m, m.startFileRendering(), true
-			}
-			m.rebuildCode()
-		}
-		return m, nil, true
 	case "f":
-		if m.tab == tabCode && m.filesListLoaded {
+		if m.filesListLoaded {
 			m.showTree = !m.showTree
 			if m.showTree {
 				if m.treeWidth == 0 {
@@ -364,69 +400,100 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 				}
 				m.syncTreeCursor()
 			}
-			m.rebuildCode()
+			m.rebuildContent()
 			return m, nil, true
 		}
+	case "c":
+		m.toggleSidebar(sidebarComments)
+		return m, nil, true
+	case "r":
+		m.toggleSidebar(sidebarReviews)
+		return m, nil, true
+	case "s":
+		m.toggleSidebar(sidebarChecks)
+		return m, nil, true
 	case "j", "down":
-		if m.tab == tabCode && m.showTree {
+		if m.showSidebar {
+			return m, nil, false // let viewport handle scroll
+		}
+		if m.showTree {
 			m.treeMoveCursor(1)
 			return m, nil, true
 		}
+		if m.filesListLoaded && m.hasDiffLines() {
+			m.moveDiffCursor(1)
+			return m, nil, true
+		}
 	case "k", "up":
-		if m.tab == tabCode && m.showTree {
+		if m.showSidebar {
+			return m, nil, false // let viewport handle scroll
+		}
+		if m.showTree {
 			m.treeMoveCursor(-1)
 			return m, nil, true
 		}
-	case "enter":
-		if m.tab == tabCode && m.showTree {
+		if m.filesListLoaded && m.hasDiffLines() {
+			m.moveDiffCursor(-1)
+			return m, nil, true
+		}
+	case "enter", "a":
+		if m.showTree {
 			e := m.treeEntries[m.treeCursor]
 			if !e.IsDir && e.FileIndex >= 0 {
 				m.currentFileIdx = e.FileIndex
-				m.rebuildCode()
-				m.codeVP.GotoTop()
+				m.diffCursor = m.firstNonHunkLine(e.FileIndex)
+				m.scrollToFile(e.FileIndex)
 			}
 			return m, nil, true
 		}
+		if !m.showSidebar && m.filesListLoaded && m.hasDiffLines() {
+			return m.openCommentInput()
+		}
 	case "p", "h", "left":
-		if m.tab == tabCode && !m.showTree && m.currentFileIdx > 0 {
+		if m.showTree {
+			if m.treeWidth > 20 {
+				m.treeWidth -= 5
+				m.rebuildContent()
+			}
+			return m, nil, true
+		}
+		if m.filesListLoaded && m.currentFileIdx > 0 {
 			m.currentFileIdx--
-			m.rebuildCode()
-			m.codeVP.GotoTop()
+			m.diffCursor = m.firstNonHunkLine(m.currentFileIdx)
+			m.syncTreeCursor()
+			m.scrollToFile(m.currentFileIdx)
 			return m, nil, true
 		}
 	case "n", "l", "right":
-		if m.tab == tabCode && !m.showTree && m.currentFileIdx < len(m.files)-1 {
+		if m.showTree {
+			maxW := m.width / 2
+			if m.treeWidth < maxW {
+				m.treeWidth += 5
+				m.rebuildContent()
+			}
+			return m, nil, true
+		}
+		if m.filesListLoaded && m.currentFileIdx < len(m.files)-1 {
 			m.currentFileIdx++
-			m.rebuildCode()
-			m.codeVP.GotoTop()
-			return m, nil, true
-		}
-	case "1":
-		if m.tab == tabOverview {
-			m.overviewSection = sectionComments
-			m.rebuildOverview()
-			return m, nil, true
-		}
-	case "2":
-		if m.tab == tabOverview {
-			m.overviewSection = sectionReviews
-			m.rebuildOverview()
-			return m, nil, true
-		}
-	case "3":
-		if m.tab == tabOverview {
-			m.overviewSection = sectionChecks
-			m.rebuildOverview()
+			m.diffCursor = m.firstNonHunkLine(m.currentFileIdx)
+			m.syncTreeCursor()
+			m.scrollToFile(m.currentFileIdx)
 			return m, nil, true
 		}
 	case "G":
 		m.waitingG = false
 		m.activeViewport().GotoBottom()
+		if m.filesListLoaded {
+			m.syncCursorToViewport()
+		}
 		return m, nil, true
 	case "g":
 		if m.waitingG {
 			m.waitingG = false
 			m.activeViewport().GotoTop()
+			if m.filesListLoaded {
+				m.syncCursorToViewport()
+			}
 			return m, nil, true
 		}
 		m.waitingG = true
@@ -437,30 +504,458 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 	return m, nil, false
 }
 
-var (
-	dimStyle       = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
-	separatorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-)
-
-func (m Model) View() string {
-	if m.tab == tabCode && m.codeReady {
-		if m.showTree {
-			return m.renderCodeWithTree()
-		}
-		return m.codeVP.View()
-	}
-	if m.overviewReady {
-		return m.overviewVP.View()
-	}
-	return ""
+func (m Model) hasDiffLines() bool {
+	idx := m.currentFileIdx
+	return idx >= 0 && idx < len(m.fileDiffs) && len(m.fileDiffs[idx]) > 0
 }
 
-func (m Model) renderCodeWithTree() string {
+func (m *Model) moveDiffCursor(delta int) {
+	lines := m.fileDiffs[m.currentFileIdx]
+	newPos := m.diffCursor + delta
+
+	// Skip hunk lines.
+	for newPos >= 0 && newPos < len(lines) && lines[newPos].Type == components.LineHunk {
+		newPos += delta
+	}
+
+	if newPos < 0 {
+		// Move to previous file's last non-hunk line.
+		if m.currentFileIdx > 0 {
+			m.currentFileIdx--
+			m.diffCursor = m.lastNonHunkLine(m.currentFileIdx)
+			m.syncTreeCursor()
+		}
+	} else if newPos >= len(lines) {
+		// Move to next file's first non-hunk line.
+		if m.currentFileIdx < len(m.files)-1 {
+			m.currentFileIdx++
+			m.diffCursor = m.firstNonHunkLine(m.currentFileIdx)
+			m.syncTreeCursor()
+		}
+	} else {
+		m.diffCursor = newPos
+	}
+	// No rebuildContent — cursor highlight is applied at View() time.
+	m.scrollToDiffCursor()
+}
+
+func (m Model) firstNonHunkLine(fileIdx int) int {
+	for i, dl := range m.fileDiffs[fileIdx] {
+		if dl.Type != components.LineHunk {
+			return i
+		}
+	}
+	return 0
+}
+
+func (m Model) lastNonHunkLine(fileIdx int) int {
+	lines := m.fileDiffs[fileIdx]
+	for i := len(lines) - 1; i >= 0; i-- {
+		if lines[i].Type != components.LineHunk {
+			return i
+		}
+	}
+	return len(lines) - 1
+}
+
+func (m *Model) scrollToDiffCursor() {
+	idx := m.currentFileIdx
+	if idx < len(m.fileLineOffsets) && idx < len(m.fileDiffOffsets) {
+		fileStart := m.fileLineOffsets[idx]
+		cursorInFile := m.diffCursor + 1 // +1 for top border (fallback)
+		if m.diffCursor < len(m.fileDiffOffsets[idx]) {
+			cursorInFile = m.fileDiffOffsets[idx][m.diffCursor]
+		}
+		offset := fileStart + cursorInFile
+		// Center the cursor in the viewport.
+		target := offset - m.height/2
+		if target < 0 {
+			target = 0
+		}
+		m.vp.SetYOffset(target)
+	}
+}
+
+// editorFinishedMsg is sent when $EDITOR exits.
+type editorFinishedMsg struct {
+	content string
+	err     error
+}
+
+func (m Model) handleCommentKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
+	switch msg.String() {
+	case "esc":
+		m.composing = false
+		m.rebuildContent()
+		return m, nil, true
+	case "alt+enter":
+		// Submit comment.
+		body := strings.TrimSpace(m.commentInput.Value())
+		if body == "" {
+			m.composing = false
+			m.rebuildContent()
+			return m, nil, true
+		}
+		m.composing = false
+		var cmd tea.Cmd
+		if m.replyToID != nil {
+			cmd = m.ctx.Client.ReplyToReviewComment(m.pr.Number, *m.replyToID, body)
+		} else {
+			cmd = m.ctx.Client.CreateReviewComment(
+				m.pr.Number, body, m.pr.Head.SHA,
+				m.commentFile, m.commentLine, m.commentSide,
+			)
+		}
+		m.rebuildContent()
+		return m, cmd, true
+	case "ctrl+g":
+		return m.openEditorForComment()
+	}
+	// Delegate to textarea.
+	var cmd tea.Cmd
+	m.commentInput, cmd = m.commentInput.Update(msg)
+	m.rebuildContent()
+	return m, cmd, true
+}
+
+func (m Model) openEditorForComment() (Model, tea.Cmd, bool) {
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "vi"
+	}
+
+	tmpFile, err := os.CreateTemp("", "ghq-comment-*.md")
+	if err != nil {
+		return m, nil, true
+	}
+
+	// Seed with current textarea content.
+	if v := m.commentInput.Value(); v != "" {
+		tmpFile.WriteString(v)
+	}
+	tmpFile.Close()
+	path := tmpFile.Name()
+
+	c := exec.Command(editor, path)
+	return m, tea.ExecProcess(c, func(err error) tea.Msg {
+		if err != nil {
+			os.Remove(path)
+			return editorFinishedMsg{err: err}
+		}
+		content, readErr := os.ReadFile(path)
+		os.Remove(path)
+		return editorFinishedMsg{content: string(content), err: readErr}
+	}), true
+}
+
+func (m Model) openCommentInput() (Model, tea.Cmd, bool) {
+	idx := m.currentFileIdx
+	if idx >= len(m.fileDiffs) {
+		return m, nil, false
+	}
+	lines := m.fileDiffs[idx]
+	if m.diffCursor >= len(lines) {
+		return m, nil, false
+	}
+	dl := lines[m.diffCursor]
+
+	// Skip hunk headers — can't comment on those.
+	if dl.Type == components.LineHunk {
+		return m, nil, false
+	}
+
+	m.commentFile = m.files[idx].Filename
+	if dl.Type == components.LineDel {
+		m.commentLine = dl.OldLineNo
+		m.commentSide = "LEFT"
+	} else {
+		m.commentLine = dl.NewLineNo
+		m.commentSide = "RIGHT"
+	}
+
+	// Check if there's an existing comment thread on this line to reply to.
+	m.replyToID = m.findThreadRootOnLine(m.commentFile, m.commentLine)
+
+	// Create textarea.
+	ta := textarea.New()
+	ta.SetWidth(m.contentWidth() - 10 - 6) // gutter + border + padding
+	ta.SetHeight(5)
+	ta.ShowLineNumbers = false
+	ta.Prompt = ""
+	ta.Focus()
+	if m.replyToID != nil {
+		ta.Placeholder = "Reply to thread..."
+	} else {
+		ta.Placeholder = "Add a comment..."
+	}
+	m.commentInput = ta
+	m.composing = true
+	m.rebuildContent()
+	return m, ta.Focus(), true
+}
+
+// findThreadRootOnLine returns the ID of the root comment on a given line, if any.
+func (m Model) findThreadRootOnLine(path string, line int) *int {
+	for _, c := range m.reviewComments {
+		if c.Path != path || c.InReplyToID != nil {
+			continue
+		}
+		cLine := 0
+		if c.Line != nil {
+			cLine = *c.Line
+		} else if c.OriginalLine != nil {
+			cLine = *c.OriginalLine
+		}
+		if cLine == line {
+			return &c.ID
+		}
+	}
+	return nil
+}
+
+// insertCommentBox inserts the comment input textarea into the rendered file
+// content at the cursor position. Only called when composing.
+func (m Model) insertCommentBox(rendered string, fileIdx int) string {
+	lines := strings.Split(rendered, "\n")
+	cursorRenderedLine := -1
+	if fileIdx < len(m.fileDiffOffsets) && m.diffCursor < len(m.fileDiffOffsets[fileIdx]) {
+		cursorRenderedLine = m.fileDiffOffsets[fileIdx][m.diffCursor]
+	}
+	if cursorRenderedLine >= 0 && cursorRenderedLine < len(lines) {
+		inputBox := m.renderCommentBox()
+		inputLines := strings.Split(inputBox, "\n")
+		after := make([]string, len(lines)-cursorRenderedLine-1)
+		copy(after, lines[cursorRenderedLine+1:])
+		lines = append(lines[:cursorRenderedLine+1], inputLines...)
+		lines = append(lines, after...)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// applyCursorHighlight applies the cursor highlight to a single visible line.
+// Called at View() time on only the one line that needs it.
+func (m Model) applyCursorHighlight(line string) string {
+	fileIdx := m.currentFileIdx
+	if fileIdx >= len(m.fileDiffs) || m.diffCursor >= len(m.fileDiffs[fileIdx]) {
+		return line
+	}
+	dl := m.fileDiffs[fileIdx][m.diffCursor]
+	if dl.Type == components.LineHunk {
+		return line
+	}
+
+	// Split out the │ border prefix/suffix: \033[90m│\033[m (11 bytes each).
+	const borderLen = 11
+	prefix := ""
+	suffix := ""
+	inner := line
+	if len(line) >= borderLen*2 {
+		prefix = line[:borderLen]
+		suffix = line[len(line)-borderLen:]
+		inner = line[borderLen : len(line)-borderLen]
+	}
+
+	// Replace the bold +/- gutter marker with >.
+	inner = strings.Replace(inner, "\033[1m+\033[0m", "\033[1m>\033[0m", 1)
+	inner = strings.Replace(inner, "\033[1m-\033[0m", "\033[1m>\033[0m", 1)
+
+	// Pick the right selection bg based on line type.
+	colors := m.ctx.DiffColors
+	var selBg string
+	switch dl.Type {
+	case components.LineAdd:
+		selBg = colors.SelectedAddBg
+	case components.LineDel:
+		selBg = colors.SelectedDelBg
+	default:
+		selBg = colors.SelectedCtxBg
+	}
+
+	if selBg != "" {
+		if colors.AddBg != "" {
+			inner = strings.ReplaceAll(inner, colors.AddBg, selBg)
+		}
+		if colors.DelBg != "" {
+			inner = strings.ReplaceAll(inner, colors.DelBg, selBg)
+		}
+		inner = strings.ReplaceAll(inner, "\033[0m", "\033[0m"+selBg)
+		inner = strings.ReplaceAll(inner, "\033[m", "\033[m"+selBg)
+		inner = selBg + inner + "\033[0m"
+	}
+
+	return prefix + inner + suffix
+}
+
+// renderCommentBox renders the inline comment textarea with a rounded border
+// and hint line below, indented past the diff gutter.
+func (m Model) renderCommentBox() string {
+	const gutter = 10 // commentGutterWidth: padNum(4)*2 + 2
+	indent := strings.Repeat(" ", gutter)
+	boxW := m.contentWidth() - gutter - 2
+
+	taView := m.commentInput.View()
+
+	// Draw top/bottom borders manually.
+	bc := m.borderStyle()
+	topRule := bc.Render("╭" + strings.Repeat("─", boxW) + "╮")
+	bottomRule := bc.Render("╰" + strings.Repeat("─", boxW) + "╯")
+	side := bc.Render("│")
+
+	var boxLines []string
+	boxLines = append(boxLines, indent+topRule)
+	for _, line := range strings.Split(taView, "\n") {
+		visW := lipgloss.Width(line)
+		padW := boxW - 2 - visW // -2 for " " padding each side
+		if padW < 0 {
+			padW = 0
+		}
+		boxLines = append(boxLines, indent+side+" "+line+strings.Repeat(" ", padW)+" "+side)
+	}
+	boxLines = append(boxLines, indent+bottomRule)
+
+	left := dimStyle.Render("esc cancel · ctrl+g $EDITOR")
+	right := dimStyle.Render("alt+enter submit")
+	hintGap := boxW - lipgloss.Width(left) - lipgloss.Width(right)
+	if hintGap < 1 {
+		hintGap = 1
+	}
+	boxLines = append(boxLines, indent+left+strings.Repeat(" ", hintGap)+right)
+
+	return strings.Join(boxLines, "\n")
+}
+
+// syncCursorToViewport updates diffCursor and currentFileIdx to match
+// the viewport's current scroll position (e.g. after ctrl+d/f/u/b).
+func (m *Model) syncCursorToViewport() {
+	if len(m.fileLineOffsets) == 0 {
+		return
+	}
+	// Target: the line at the center of the viewport.
+	center := m.vp.YOffset() + m.height/2
+
+	// Find which file the center falls in.
+	fileIdx := 0
+	for i := 1; i < len(m.fileLineOffsets); i++ {
+		if m.fileLineOffsets[i] <= center {
+			fileIdx = i
+		} else {
+			break
+		}
+	}
+	m.currentFileIdx = fileIdx
+	m.syncTreeCursor()
+
+	// Find the closest non-hunk diff line within that file.
+	if fileIdx < len(m.fileDiffOffsets) && len(m.fileDiffOffsets[fileIdx]) > 0 {
+		offsets := m.fileDiffOffsets[fileIdx]
+		diffs := m.fileDiffs[fileIdx]
+		fileStart := m.fileLineOffsets[fileIdx]
+		best := -1
+		bestDist := 0
+		for i := 0; i < len(offsets); i++ {
+			if i < len(diffs) && diffs[i].Type == components.LineHunk {
+				continue
+			}
+			dist := abs(fileStart + offsets[i] - center)
+			if best == -1 || dist < bestDist {
+				best = i
+				bestDist = dist
+			}
+		}
+		if best >= 0 {
+			m.diffCursor = best
+		} else {
+			m.diffCursor = m.firstNonHunkLine(fileIdx)
+		}
+	} else {
+		m.diffCursor = 0
+	}
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+func (m *Model) scrollToFile(idx int) {
+	if idx >= 0 && idx < len(m.fileLineOffsets) {
+		m.vp.SetYOffset(m.fileLineOffsets[idx])
+	}
+}
+
+func (m *Model) toggleSidebar(st sidebarType) {
+	if m.showSidebar && m.sidebarType == st {
+		m.showSidebar = false
+	} else {
+		m.showSidebar = true
+		m.sidebarType = st
+		m.rebuildSidebar()
+	}
+}
+
+var dimStyle = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
+
+func (m Model) View() string {
+	if !m.vpReady {
+		return ""
+	}
+	// Get the viewport output and apply cursor highlight on the visible line.
+	view := m.vp.View()
+	view = m.overlayDiffCursor(view)
+
+	if m.showTree {
+		view = m.renderWithLeftSidebarFrom(view)
+	}
+	if m.showSidebar {
+		view = m.renderModal(view)
+	}
+	return view
+}
+
+// cursorViewportLine returns the line index within the visible viewport
+// that corresponds to the current diff cursor, or -1 if not visible.
+func (m Model) cursorViewportLine() int {
+	fileIdx := m.currentFileIdx
+	if fileIdx >= len(m.fileLineOffsets) || fileIdx >= len(m.fileDiffOffsets) {
+		return -1
+	}
+	if m.diffCursor >= len(m.fileDiffOffsets[fileIdx]) {
+		return -1
+	}
+	// Absolute line in content.
+	absLine := m.fileLineOffsets[fileIdx] + m.fileDiffOffsets[fileIdx][m.diffCursor]
+	// Relative to viewport.
+	rel := absLine - m.vp.YOffset()
+	if rel < 0 || rel >= m.height {
+		return -1
+	}
+	return rel
+}
+
+// overlayDiffCursor applies the cursor highlight to the one visible line.
+func (m Model) overlayDiffCursor(view string) string {
+	if !m.filesListLoaded || !m.hasDiffLines() {
+		return view
+	}
+	vLine := m.cursorViewportLine()
+	if vLine < 0 {
+		return view
+	}
+	lines := strings.Split(view, "\n")
+	if vLine < len(lines) {
+		lines[vLine] = m.applyCursorHighlight(lines[vLine])
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderWithLeftSidebarFrom(view string) string {
 	treeW := m.treeWidth
 	divider := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack).Render("│")
 
 	treeLines := components.RenderFileTree(m.treeEntries, m.files, m.treeCursor, m.currentFileIdx, treeW, m.height)
-	diffLines := strings.Split(m.codeVP.View(), "\n")
+	mainLines := strings.Split(view, "\n")
 
 	var b strings.Builder
 	for i := 0; i < m.height; i++ {
@@ -468,16 +963,134 @@ func (m Model) renderCodeWithTree() string {
 		if i < len(treeLines) {
 			tl = treeLines[i]
 		}
-		dl := ""
-		if i < len(diffLines) {
-			dl = diffLines[i]
+		ml := ""
+		if i < len(mainLines) {
+			ml = mainLines[i]
 		}
-		b.WriteString(tl + divider + dl)
+		b.WriteString(tl + divider + ml)
 		if i < m.height-1 {
 			b.WriteString("\n")
 		}
 	}
 	return b.String()
+}
+
+// renderModal overlays the sidebar content as a centered modal window on top
+// of the dimmed background. The modal has a fixed rounded border frame; the
+// viewport scrolls inside it.
+func (m Model) renderModal(view string) string {
+	const pad = 4
+	modalW := m.width - pad*2
+	modalH := m.height - pad*2
+	if modalW < 20 {
+		modalW = 20
+	}
+	if modalH < 5 {
+		modalH = 5
+	}
+	contentPad := 2      // padding inside the │ borders
+	innerW := modalW - 2 - contentPad*2 // usable content width
+
+	// Build the modal title for the top border.
+	var title string
+	switch m.sidebarType {
+	case sidebarComments:
+		title = iconComments + " Comments"
+		if len(m.comments) > 0 {
+			title += fmt.Sprintf(" (%d)", len(m.comments))
+		}
+	case sidebarReviews:
+		title = iconReview + " Reviews"
+	case sidebarChecks:
+		title = iconChecks + " Checks"
+		if len(m.checkRuns) > 0 {
+			title += fmt.Sprintf(" (%d)", len(m.checkRuns))
+		}
+	}
+
+	titleStr := " " + lipgloss.NewStyle().Bold(true).Render(title) + " "
+	titleW := lipgloss.Width(titleStr)
+	fillW := modalW - 3 - titleW // ╭─ + title + fill + ╮
+	if fillW < 0 {
+		fillW = 0
+	}
+	bc := m.borderStyle()
+	topBorder := bc.Render("╭─") + titleStr + bc.Render(strings.Repeat("─", fillW)+"╮")
+	bw := modalW - 2
+	if bw < 0 {
+		bw = 0
+	}
+	bottomBorder := bc.Render("╰" + strings.Repeat("─", bw) + "╯")
+	sideBorder := bc.Render("│")
+
+	// The viewport content lines (scrolled).
+	vpLines := strings.Split(m.sidebarVP.View(), "\n")
+
+	bgLines := strings.Split(view, "\n")
+
+	// 1-cell black bg margin around the modal.
+	shadow := "\033[40m" // black bg
+	shadowReset := "\033[0m"
+	shadowW := modalW + 2 // modal + 1 cell each side
+	shadowBlank := shadow + strings.Repeat(" ", shadowW) + shadowReset
+	shadowL := shadow + " " + shadowReset
+	shadowR := shadow + " " + shadowReset
+	spliceOffset := pad - 1 // 1 cell left of modal
+
+	var b strings.Builder
+	for i := 0; i < m.height; i++ {
+		bg := ""
+		if i < len(bgLines) {
+			bg = bgLines[i]
+		}
+
+		if i == pad-1 || i == pad+modalH {
+			// Shadow row above/below the modal.
+			b.WriteString(spliceModal(bg, shadowBlank, spliceOffset, shadowW, m.width))
+		} else if i == pad {
+			b.WriteString(spliceModal(bg, shadowL+topBorder+shadowR, spliceOffset, shadowW, m.width))
+		} else if i == pad+modalH-1 {
+			b.WriteString(spliceModal(bg, shadowL+bottomBorder+shadowR, spliceOffset, shadowW, m.width))
+		} else if i > pad && i < pad+modalH-1 {
+			vpIdx := i - pad - 1
+			cl := ""
+			if vpIdx >= 0 && vpIdx < len(vpLines) {
+				cl = vpLines[vpIdx]
+			}
+			clW := lipgloss.Width(cl)
+			if clW < innerW {
+				cl += strings.Repeat(" ", innerW-clW)
+			}
+			iPad := strings.Repeat(" ", contentPad)
+			modalLine := shadowL + sideBorder + iPad + cl + iPad + sideBorder + shadowR
+			b.WriteString(spliceModal(bg, modalLine, spliceOffset, shadowW, m.width))
+		} else {
+			b.WriteString(bg)
+		}
+		if i < m.height-1 {
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+// spliceModal replaces the middle portion of a background line with modal content,
+// preserving the original background on the left and right.
+func spliceModal(bg, modal string, leftOffset, modalW, totalW int) string {
+	left := xansi.Truncate(bg, leftOffset, "")
+	leftW := lipgloss.Width(left)
+	if leftW < leftOffset {
+		left += strings.Repeat(" ", leftOffset-leftW)
+	}
+
+	rightStart := leftOffset + modalW
+	bgW := lipgloss.Width(bg)
+	right := ""
+	if bgW > rightStart {
+		right = xansi.Cut(bg, rightStart, bgW)
+	}
+
+	return left + "\033[0m" + modal + "\033[0m" + right
 }
 
 // --- Overview tab ---
@@ -499,10 +1112,11 @@ func indent(s string, n int) string {
 
 // descWidth returns the available width for description/body markdown.
 func (m Model) descWidth() int {
-	return m.width - overviewPad*2
+	return m.contentWidth() - overviewPad*2
 }
 
-func (m *Model) rebuildOverview() {
+func (m *Model) rebuildContent() {
+	w := m.contentWidth()
 	var content strings.Builder
 
 	// Status + metadata line.
@@ -525,36 +1139,65 @@ func (m *Model) rebuildOverview() {
 	}
 	content.WriteString("\n" + indent(descBody, overviewPad))
 
-	// Reviews/Comments bordered section.
-	content.WriteString("\n\n" + m.renderReviewsComments())
-
-	if !m.overviewReady {
-		m.overviewVP = viewport.New()
-		m.overviewReady = true
+	// All file diffs.
+	m.fileLineOffsets = nil
+	if m.filesListLoaded && len(m.files) > 0 {
+		content.WriteString("\n")
+		for i := range m.files {
+			content.WriteString("\n")
+			// Track the line offset where this file starts.
+			lineCount := strings.Count(content.String(), "\n")
+			m.fileLineOffsets = append(m.fileLineOffsets, lineCount)
+			if m.renderedFiles[i] != "" {
+				rendered := m.renderedFiles[i]
+				// If composing, insert the comment input box into the content.
+				if m.composing && i == m.currentFileIdx && m.hasDiffLines() {
+					rendered = m.insertCommentBox(rendered, i)
+				}
+				content.WriteString(rendered)
+			} else {
+				content.WriteString(dimStyle.Render("  " + iconLoading + " Loading " + m.files[i].Filename + "..."))
+			}
+			content.WriteString("\n")
+		}
+		// Trailing padding so the last file's bottom content is scrollable into view.
+		content.WriteString(strings.Repeat("\n", m.height/2))
 	}
-	m.overviewVP.SetWidth(m.width)
-	m.overviewVP.SetHeight(m.height)
-	m.overviewVP.SetContent(content.String())
+
+	if !m.vpReady {
+		m.vp = viewport.New()
+		m.vpReady = true
+	}
+	m.vp.SetWidth(w)
+	m.vp.SetHeight(m.height)
+	m.vp.SetContent(content.String())
+}
+
+func (m Model) contentWidth() int {
+	if m.showTree {
+		return m.width - m.treeWidth - 1
+	}
+	return m.width
 }
 
 // --- Code tab ---
 
-func (m Model) startFileRendering() tea.Cmd {
-	if len(m.files) == 0 || m.filesRendered > 0 {
+func (m *Model) startFileRendering() tea.Cmd {
+	if len(m.files) == 0 || m.filesHighlighted > 0 {
 		return nil
 	}
 	m.filesLoading = true
-	return m.renderFileCmd(0)
+	return m.highlightFileCmd(0)
 }
 
-func (m Model) renderFileCmd(index int) tea.Cmd {
+// highlightFileCmd returns a tea.Cmd that fetches file content and runs
+// syntax highlighting (expensive). Width-dependent formatting happens later.
+func (m Model) highlightFileCmd(index int) tea.Cmd {
 	f := m.files[index]
 	ref := m.pr.Head.SHA
 	prNumber := m.pr.Number
-	width := m.width
 	client := m.ctx.Client
-	colors := m.ctx.DiffColors
-	fileComments := m.commentsForFile(f.Filename)
+	chromaStyle := m.ctx.DiffColors.ChromaStyle
 
 	return func() tea.Msg {
 		var fileContent string
@@ -563,8 +1206,32 @@ func (m Model) renderFileCmd(index int) tea.Cmd {
 				fileContent = content
 			}
 		}
-		rendered := components.RenderDiffFile(f, fileContent, width, colors, fileComments)
-		return fileRenderedMsg{content: rendered, index: index, prNumber: prNumber}
+		hl := components.HighlightDiffFile(f, fileContent, chromaStyle)
+		return fileHighlightedMsg{highlight: hl, index: index, prNumber: prNumber}
+	}
+}
+
+// formatFile runs the cheap width-dependent formatting on a cached highlight.
+func (m Model) formatFile(index int) {
+	if index >= len(m.highlightedFiles) {
+		return
+	}
+	hl := m.highlightedFiles[index]
+	width := m.contentWidth()
+	colors := m.ctx.DiffColors
+	fileComments := m.commentsForFile(m.files[index].Filename)
+	result := components.FormatDiffFile(hl, width, colors, fileComments)
+	m.renderedFiles[index] = result.Content
+	if index < len(m.fileDiffOffsets) {
+		m.fileDiffOffsets[index] = result.DiffLineOffsets
+	}
+}
+
+// reformatAllFiles re-formats all highlighted files at the current width.
+// This is cheap (no Chroma) and used on resize.
+func (m *Model) reformatAllFiles() {
+	for i := 0; i < m.filesHighlighted; i++ {
+		m.formatFile(i)
 	}
 }
 
@@ -579,47 +1246,6 @@ func (m Model) commentsForFile(filename string) []github.ReviewComment {
 	return result
 }
 
-func (m Model) codeWidth() int {
-	if m.showTree {
-		return m.width - m.treeWidth - 1 // -1 for divider
-	}
-	return m.width
-}
-
-func (m *Model) rebuildCode() {
-	w := m.codeWidth()
-	var content strings.Builder
-
-	idx := m.currentFileIdx
-
-	// Previous file hint above.
-	if idx > 0 {
-		prev := m.files[idx-1]
-		content.WriteString(dimStyle.Render("  " + iconArrowUp + " " + prev.Filename))
-		content.WriteString("\n\n")
-	}
-
-	if idx < m.filesRendered {
-		content.WriteString(m.renderedFiles[idx])
-	} else {
-		content.WriteString(dimStyle.Render("  " + iconLoading + " Loading..."))
-	}
-
-	// Next file hint below.
-	if idx < len(m.files)-1 {
-		next := m.files[idx+1]
-		content.WriteString("\n\n")
-		content.WriteString(dimStyle.Render("  " + iconArrowDown + " " + next.Filename))
-	}
-
-	if !m.codeReady {
-		m.codeVP = viewport.New()
-		m.codeReady = true
-	}
-	m.codeVP.SetWidth(w)
-	m.codeVP.SetHeight(m.height)
-	m.codeVP.SetContent(content.String())
-}
 
 // prefetchFiles kicks off background fetches for the first n files' content,
 // warming the cache so Code tab renders are fast.
@@ -651,63 +1277,24 @@ func (m Model) prefetchFiles(n int) []tea.Cmd {
 
 // --- Comments ---
 
-var (
-	commentBodyStyle = lipgloss.NewStyle().
-				Border(lipgloss.RoundedBorder()).
-				BorderTop(false).
-				BorderForeground(lipgloss.Color("245")).
-				Padding(0, 1)
+var authorBadge = lipgloss.NewStyle().
+	Bold(true).
+	Foreground(lipgloss.Black).
+	Background(lipgloss.Yellow)
 
-	authorBadge = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Black).
-			Background(lipgloss.Yellow)
-
-	borderColor = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-)
-
-// nickColors is the palette used for weechat-style username coloring.
-// These are chosen to be distinct and readable on dark backgrounds.
-var nickColors = []color.Color{
-	lipgloss.Color("1"),   // red
-	lipgloss.Color("2"),   // green
-	lipgloss.Color("3"),   // yellow
-	lipgloss.Color("4"),   // blue
-	lipgloss.Color("5"),   // magenta
-	lipgloss.Color("6"),   // cyan
-	lipgloss.Color("9"),   // bright red
-	lipgloss.Color("10"),  // bright green
-	lipgloss.Color("11"),  // bright yellow
-	lipgloss.Color("12"),  // bright blue
-	lipgloss.Color("13"),  // bright magenta
-	lipgloss.Color("14"),  // bright cyan
-	lipgloss.Color("208"), // orange
-	lipgloss.Color("172"), // dark orange
-	lipgloss.Color("141"), // purple
-	lipgloss.Color("167"), // salmon
-	lipgloss.Color("109"), // steel blue
-	lipgloss.Color("150"), // sage
+func (m Model) borderStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(m.ctx.DiffColors.BorderColor)
 }
 
-// nickColor returns a consistent color for a given username using
-// a djb2-style hash, similar to weechat's nick coloring algorithm.
-func nickColor(name string) color.Color {
-	var hash uint32 = 5381
-	for _, c := range name {
-		hash = hash*33 + uint32(c)
-	}
-	return nickColors[hash%uint32(len(nickColors))]
-}
-
-// coloredAuthor renders a username with a consistent hash-based color.
-func coloredAuthor(login string) string {
+func (m Model) roundedBorderStyle() lipgloss.Style {
 	return lipgloss.NewStyle().
-		Bold(true).
-		Foreground(nickColor(login)).
-		UnderlineStyle(lipgloss.UnderlineDotted).
-		Hyperlink(fmt.Sprintf("https://github.com/%s", login)).
-		Render("@" + login)
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(m.ctx.DiffColors.BorderColor).
+		Padding(0, 1)
 }
+
+// coloredAuthor is a convenience alias for the shared component.
+var coloredAuthor = components.ColoredAuthor
 
 // --- Reviews / Comments ---
 
@@ -737,67 +1324,50 @@ func reviewStateIcon(state string) string {
 	}
 }
 
-// renderReviewsComments renders a single bordered box with two labels in the
-// top border. The active section is bold, the inactive one is dimmed. Press
-// 1/2 to swap.
-func (m Model) renderReviewsComments() string {
-	innerW := m.width - 4 // border + padding
-
-	// Build the top border with all three labels.
-	commentLabel := iconComments + " Comments"
-	if len(m.comments) > 0 {
-		commentLabel += fmt.Sprintf(" (%d)", len(m.comments))
+// rebuildSidebar rebuilds the right sidebar viewport content.
+func (m *Model) rebuildSidebar() {
+	if !m.showSidebar {
+		return
 	}
-	reviewLabel := iconReview + " Reviews"
-	checksLabel := iconChecks + " Checks"
-	if len(m.checkRuns) > 0 {
-		checksLabel += fmt.Sprintf(" (%d)", len(m.checkRuns))
+	const pad = 4
+	modalW := m.width - pad*2
+	modalH := m.height - pad*2
+	if modalW < 20 {
+		modalW = 20
 	}
-
-	renderLabel := func(label string, section overviewSection) string {
-		if m.overviewSection == section {
-			return " " + lipgloss.NewStyle().Bold(true).Render(label) + " "
-		}
-		return " " + dimStyle.Render(label) + " "
+	if modalH < 5 {
+		modalH = 5
 	}
+	contentPad := 2
+	innerW := modalW - 2 - contentPad*2 // inside borders + padding
+	contentH := modalH - 2              // inside top/bottom borders
 
-	div := borderColor.Render("│")
-	labels := renderLabel(commentLabel, sectionComments) + div +
-		renderLabel(reviewLabel, sectionReviews) + div +
-		renderLabel(checksLabel, sectionChecks)
-	labelsW := lipgloss.Width(labels)
-	fillW := m.width - 2 - labelsW - 1 // ╭─ + labels + ─fill─ + ╮
-	if fillW < 0 {
-		fillW = 0
-	}
-	topBorder := borderColor.Render("╭─") + labels +
-		borderColor.Render(strings.Repeat("─", fillW) + "╮")
-
-	// Build body based on active section.
 	var lines []string
-	switch m.overviewSection {
-	case sectionComments:
+	switch m.sidebarType {
+	case sidebarComments:
 		lines = m.buildCommentLines(innerW)
 		if len(lines) == 0 {
 			lines = []string{dimStyle.Render("No comments yet.")}
 		}
-	case sectionReviews:
+	case sidebarReviews:
 		lines = m.buildReviewLines(innerW)
 		if len(lines) == 0 {
 			lines = []string{dimStyle.Render("No reviews yet.")}
 		}
-	case sectionChecks:
+	case sidebarChecks:
 		lines = m.buildCheckLines()
 		if len(lines) == 0 {
 			lines = []string{dimStyle.Render("No checks yet.")}
 		}
 	}
 
-	sep := dimStyle.Render(strings.Repeat("─", innerW))
-	body := strings.Join(lines, "\n"+sep+"\n")
+	sep := m.borderStyle().Render(strings.Repeat("─", innerW))
+	content := strings.Join(lines, "\n"+sep+"\n")
 
-	bottom := commentBodyStyle.Width(m.width).Render(body)
-	return topBorder + "\n" + bottom
+	m.sidebarVP = viewport.New()
+	m.sidebarVP.SetWidth(innerW)
+	m.sidebarVP.SetHeight(contentH)
+	m.sidebarVP.SetContent(content)
 }
 
 // buildReviewLines builds the content lines for the reviews section.
@@ -967,43 +1537,6 @@ func (m *Model) syncTreeCursor() {
 	}
 }
 
-// --- Separator ---
-
-func (m Model) renderFileSeparator() string {
-	w := m.width
-	if w < 10 {
-		w = 10
-	}
-
-	fileCount := len(m.files)
-	var totalAdd, totalDel int
-	for _, f := range m.files {
-		totalAdd += f.Additions
-		totalDel += f.Deletions
-	}
-
-	left := fmt.Sprintf("%d File", fileCount)
-	if fileCount != 1 {
-		left += "s"
-	}
-
-	additions := fmt.Sprintf("+%d", totalAdd)
-	deletions := fmt.Sprintf("-%d", totalDel)
-	right := lipgloss.NewStyle().Foreground(lipgloss.Green).Render(additions) +
-		" " +
-		lipgloss.NewStyle().Foreground(lipgloss.Red).Render(deletions)
-
-	rightPlain := fmt.Sprintf("+%d -%d", totalAdd, totalDel)
-	gap := w - lipgloss.Width(left) - len(rightPlain)
-	if gap < 1 {
-		gap = 1
-	}
-
-	line := separatorStyle.Render(left) + strings.Repeat(" ", gap) + right
-	separator := separatorStyle.Render(strings.Repeat("─", w))
-
-	return "\n" + separator + "\n" + line + "\n"
-}
 
 // --- Meta / User ---
 
@@ -1114,16 +1647,20 @@ var markdownStyle = ansi.StyleConfig{
 		BlockPrefix: ". ",
 	},
 	Task: ansi.StyleTask{
-		Ticked:   "[✓] ",
-		Unticked: "[ ] ",
+		Ticked:   "\U000f0132 ", // 󰄲 nf-md-checkbox_marked
+		Unticked: "\ue640 ",    // nf-seti-checkbox_unchecked
+		StylePrimitive: ansi.StylePrimitive{
+			Color: stringPtr("2"), // green
+		},
 	},
 	Link: ansi.StylePrimitive{
-		Color:     stringPtr("6"), // cyan
-		Underline: boolPtr(true),
+		// Hide visible URL — link text already has OSC 8 hyperlink.
+		Format: "{{/*hidden*/}}",
 	},
 	LinkText: ansi.StylePrimitive{
-		Color: stringPtr("4"), // blue
-		Bold:  boolPtr(true),
+		Color:     stringPtr("4"), // blue
+		Bold:      boolPtr(true),
+		Underline: boolPtr(true),
 	},
 	Code: ansi.StyleBlock{
 		StylePrimitive: ansi.StylePrimitive{
@@ -1149,6 +1686,9 @@ var markdownStyle = ansi.StyleConfig{
 		IndentToken: stringPtr("│ "),
 	},
 	List: ansi.StyleList{
+		StyleBlock: ansi.StyleBlock{
+			Indent: uintPtr(2),
+		},
 		LevelIndent: 4,
 	},
 	Table: ansi.StyleTable{
@@ -1162,10 +1702,40 @@ func boolPtr(b bool) *bool       { return &b }
 func stringPtr(s string) *string { return &s }
 func uintPtr(u uint) *uint       { return &u }
 
+var (
+	// reImage matches markdown images: ![alt](url)
+	reImage = regexp.MustCompile(`!\[([^\]]*)\]\(([^)]+)\)`)
+	// reHTMLImg matches <img ...> tags
+	reHTMLImg = regexp.MustCompile(`(?i)<img[^>]*>`)
+	// reHTMLVideo matches <video ...>...</video> and self-closing <video ... />
+	reHTMLVideo = regexp.MustCompile(`(?is)<video[^>]*(?:/>|>.*?</video>)`)
+	// reHTMLPicture matches <picture>...</picture>
+	reHTMLPicture = regexp.MustCompile(`(?is)<picture>.*?</picture>`)
+	// reBareAssetURL matches bare GitHub asset URLs on their own line (video/image embeds).
+	reBareAssetURL = regexp.MustCompile(`(?m)^\s*(https://github\.com/user-attachments/assets/\S+)\s*$`)
+)
+
 func renderMarkdown(body string, width int) string {
 	if width <= 0 || body == "" {
 		return body
 	}
+
+	// Convert markdown images to short links.
+	body = reImage.ReplaceAllStringFunc(body, func(match string) string {
+		sub := reImage.FindStringSubmatch(match)
+		text := sub[1]
+		if text == "" {
+			text = "image"
+		}
+		return "[" + text + "](" + sub[2] + ")"
+	})
+	// Strip HTML media tags.
+	body = reHTMLPicture.ReplaceAllString(body, "")
+	body = reHTMLVideo.ReplaceAllString(body, "")
+	body = reHTMLImg.ReplaceAllString(body, "")
+	// Convert bare GitHub asset URLs (video/image embeds) to short links.
+	body = reBareAssetURL.ReplaceAllString(body, "[attached media]($1)")
+
 	renderer, err := glamour.NewTermRenderer(
 		glamour.WithStyles(markdownStyle),
 		glamour.WithWordWrap(width),

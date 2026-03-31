@@ -321,6 +321,42 @@ func (c *CachedClient) FetchFileContent(filename, ref string) (string, error) {
 	return "", fmt.Errorf("failed to fetch %s", filename)
 }
 
+// CommentCreatedMsg is sent when a review comment is successfully created.
+type CommentCreatedMsg struct {
+	Comment ReviewComment
+	Number  int
+}
+
+// CommentErrorMsg is sent when creating a comment fails.
+type CommentErrorMsg struct {
+	Err error
+}
+
+// CreateReviewComment returns a tea.Cmd that posts a new review comment.
+func (c *CachedClient) CreateReviewComment(number int, body, commitID, path string, line int, side string) tea.Cmd {
+	return func() tea.Msg {
+		comment, err := c.client.CreateReviewComment(context.Background(), number, body, commitID, path, line, side)
+		if err != nil {
+			return CommentErrorMsg{Err: err}
+		}
+		// Invalidate review comments cache so next fetch picks up the new comment.
+		c.cache.Invalidate(fmt.Sprintf("review-comments:%d", number))
+		return CommentCreatedMsg{Comment: comment, Number: number}
+	}
+}
+
+// ReplyToReviewComment returns a tea.Cmd that replies to an existing comment thread.
+func (c *CachedClient) ReplyToReviewComment(number int, commentID int, body string) tea.Cmd {
+	return func() tea.Msg {
+		comment, err := c.client.ReplyToReviewComment(context.Background(), number, commentID, body)
+		if err != nil {
+			return CommentErrorMsg{Err: err}
+		}
+		c.cache.Invalidate(fmt.Sprintf("review-comments:%d", number))
+		return CommentCreatedMsg{Comment: comment, Number: number}
+	}
+}
+
 // InvalidatePR removes cached data for a specific PR.
 func (c *CachedClient) InvalidatePR(number int) {
 	c.cache.Invalidate(fmt.Sprintf("pull:%d", number))

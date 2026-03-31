@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/blakewilliams/ghq/internal/github"
+	"github.com/blakewilliams/ghq/internal/ui/components"
+	"github.com/blakewilliams/ghq/internal/ui/styles"
 	"github.com/blakewilliams/ghq/internal/ui/uictx"
 	"charm.land/bubbles/v2/list"
 	"charm.land/bubbles/v2/spinner"
@@ -35,10 +37,6 @@ func (i prItem) FilterValue() string {
 }
 
 const (
-	iconMerge      = "\U000f0261" // 󰉡 nf-md-source_merge
-	iconClose      = "\U000f0156" // 󰅖 nf-md-close
-	iconDraft      = "\U000f0613" // 󰘓 nf-md-pencil
-	iconOpen       = "\U000f0130" // 󰄰 nf-md-checkbox_blank_circle_outline
 	iconArrowRight = "\U000f0054" // 󰁔 nf-md-arrow_right
 )
 
@@ -67,23 +65,6 @@ func makeRowStyles(bg color.Color) rowStyles {
 		title:  base.Bold(true),
 		label:  base.Foreground(lipgloss.BrightBlack),
 		row:    base,
-	}
-}
-
-func prVerb(pr github.PullRequest, bg color.Color) string {
-	base := lipgloss.NewStyle()
-	if bg != nil {
-		base = base.Background(bg)
-	}
-	switch {
-	case pr.Merged:
-		return base.Foreground(lipgloss.Magenta).Render(iconMerge + " merged")
-	case pr.State == "closed":
-		return base.Foreground(lipgloss.Red).Render(iconClose + " closed")
-	case pr.Draft:
-		return base.Foreground(lipgloss.Yellow).Render(iconDraft + " drafted")
-	default:
-		return base.Foreground(lipgloss.Green).Render(iconOpen + " opened")
 	}
 }
 
@@ -206,13 +187,19 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 	return m, nil, false
 }
 
+var (
+	listBorder = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("240"))
+)
+
 func (m Model) View() string {
 	if m.err != nil {
 		return fmt.Sprintf("Error: %v\n\nPress q to quit.", m.err)
 	}
 
 	normalStyles := makeRowStyles(nil)
-	selectedStyles := makeRowStyles(m.ctx.DiffColors.SelectColor)
+	selectedStyles := makeRowStyles(nil)
 
 	items := m.list.VisibleItems()
 	selected := m.list.Index()
@@ -221,10 +208,12 @@ func (m Model) View() string {
 		w = 80
 	}
 
-	// Compute visible window. Each item is 3 lines (2 content + 1 separator),
-	// except the last visible which is 2. Reserve 1 line for the status footer.
+	// Inner width accounts for the border (1 char each side).
+	innerW := w - 2
+
+	// Status line above the border takes 1 line, border takes 2 lines (top + bottom).
 	const linesPerItem = 3
-	maxVisible := (m.height - 1) / linesPerItem
+	maxVisible := (m.height - 3) / linesPerItem // -3 for status line + top/bottom border
 	if maxVisible < 1 {
 		maxVisible = 1
 	}
@@ -254,10 +243,7 @@ func (m Model) View() string {
 			s = selectedStyles
 		}
 
-		verb := prVerb(pr, m.ctx.DiffColors.SelectColor)
-		if !isSelected {
-			verb = prVerb(pr, nil)
-		}
+		verb := styles.PRStatusBadge(pr.State, pr.Draft, pr.Merged)
 
 		num := s.number.Render(fmt.Sprintf("#%d", pr.Number))
 		title := pr.Title
@@ -266,35 +252,38 @@ func (m Model) View() string {
 		}
 		age := s.dim.Render(relativeTime(pr.CreatedAt))
 
+		prefix := " "
+		if isSelected {
+			prefix = lipgloss.NewStyle().Foreground(lipgloss.Magenta).Render("│")
+		}
+
 		// Line 1: #number title                             time
-		line1 := " " + num + " " + title
-		gap1 := w - lipgloss.Width(line1) - lipgloss.Width(age) - 1
+		line1 := prefix + " " + num + " " + title
+		gap1 := innerW - lipgloss.Width(line1) - lipgloss.Width(age) - 1
 		if gap1 < 1 {
 			gap1 = 1
 		}
 		line1 += s.row.Render(strings.Repeat(" ", gap1)) + age
 
 		// Line 2: @user opened · branch → base · labels
-		user := s.dim.
-			UnderlineStyle(lipgloss.UnderlineDotted).
-			Hyperlink(fmt.Sprintf("https://github.com/%s", pr.User.Login)).
-			Render(pr.User.Login)
+		user := components.ColoredAuthor(pr.User.Login)
 		branch := s.dim.Render(pr.Head.Ref + " " + iconArrowRight + " " + pr.Base.Ref)
-		line2 := " " + user + " " + verb + s.dim.Render(" · ") + branch
+		line2 := prefix + " " + user + " " + verb + s.dim.Render(" · ") + branch
 		if labels := renderLabels(pr.Labels, s); labels != "" {
 			line2 += s.dim.Render(" · ") + labels
 		}
 
 		if isSelected {
-			b.WriteString(padLine(line1, w, s.row) + "\n")
-			b.WriteString(padLine(line2, w, s.row) + "\n")
+			b.WriteString(padLine(line1, innerW, s.row) + "\n")
+			b.WriteString(padLine(line2, innerW, s.row) + "\n")
 		} else {
-			b.WriteString(line1 + "\n")
-			b.WriteString(line2 + "\n")
+			b.WriteString(padLine(line1, innerW, lipgloss.NewStyle()) + "\n")
+			b.WriteString(padLine(line2, innerW, lipgloss.NewStyle()) + "\n")
 		}
 
 		if i < end-1 {
-			b.WriteString("\n")
+			sep := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(strings.Repeat("─", innerW))
+			b.WriteString(sep + "\n")
 		}
 	}
 
@@ -304,9 +293,11 @@ func (m Model) View() string {
 	if visible != total {
 		status = fmt.Sprintf(" %d of %d pull requests", visible, total)
 	}
-	b.WriteString("\n" + normalStyles.dim.Render(status))
 
-	return b.String()
+	content := strings.TrimRight(b.String(), "\n")
+	bordered := listBorder.Render(content)
+
+	return normalStyles.dim.Render(status) + "\n" + bordered
 }
 
 // padLine pads a line to full width with the row style's background.

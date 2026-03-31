@@ -1,8 +1,10 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 
 	"github.com/cli/go-gh/v2/pkg/api"
@@ -105,6 +107,52 @@ func (c *Client) GetCheckRuns(ctx context.Context, ref string) ([]CheckRun, erro
 		return nil, fmt.Errorf("getting check runs for %s: %w", ref, err)
 	}
 	return result.CheckRuns, nil
+}
+
+// CreateReviewComment creates a new review comment on a pull request diff.
+func (c *Client) CreateReviewComment(ctx context.Context, number int, body, commitID, path string, line int, side string) (ReviewComment, error) {
+	payload := struct {
+		Body     string `json:"body"`
+		CommitID string `json:"commit_id"`
+		Path     string `json:"path"`
+		Line     int    `json:"line"`
+		Side     string `json:"side"`
+	}{
+		Body:     body,
+		CommitID: commitID,
+		Path:     path,
+		Line:     line,
+		Side:     side,
+	}
+	jsonBody, err := json.Marshal(payload)
+	if err != nil {
+		return ReviewComment{}, fmt.Errorf("marshaling comment: %w", err)
+	}
+	var result ReviewComment
+	apiPath := fmt.Sprintf("repos/%s/%s/pulls/%d/comments", c.owner, c.repo, number)
+	err = c.rest.Post(apiPath, bytes.NewReader(jsonBody), &result)
+	if err != nil {
+		return ReviewComment{}, fmt.Errorf("creating review comment on PR #%d: %w", number, err)
+	}
+	return result, nil
+}
+
+// ReplyToReviewComment replies to an existing review comment thread.
+func (c *Client) ReplyToReviewComment(ctx context.Context, number int, commentID int, body string) (ReviewComment, error) {
+	payload := struct {
+		Body string `json:"body"`
+	}{Body: body}
+	jsonBody, err := json.Marshal(payload)
+	if err != nil {
+		return ReviewComment{}, fmt.Errorf("marshaling reply: %w", err)
+	}
+	var result ReviewComment
+	apiPath := fmt.Sprintf("repos/%s/%s/pulls/%d/comments/%d/replies", c.owner, c.repo, number, commentID)
+	err = c.rest.Post(apiPath, bytes.NewReader(jsonBody), &result)
+	if err != nil {
+		return ReviewComment{}, fmt.Errorf("replying to comment %d on PR #%d: %w", commentID, number, err)
+	}
+	return result, nil
 }
 
 // GetFileContent fetches the content of a file at a specific git ref (branch, tag, or SHA).

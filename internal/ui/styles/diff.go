@@ -16,10 +16,20 @@ type DiffColors struct {
 	DelFg    string // fg code for del marker/line numbers
 	HunkBg   string // bg code for hunk headers
 	HunkFg   string // fg code for hunk header text
-	SelectBg string // raw ANSI bg code for selected lines
+	SelectBg string // raw ANSI bg code for selected context lines
+
+	// Selected line bg codes — more prominent tints for cursor highlight.
+	SelectedAddBg string // bg for selected add lines
+	SelectedDelBg string // bg for selected del lines
+	SelectedCtxBg string // bg for selected context lines
 
 	// SelectColor is the computed selection bg as a color.Color for use with lipgloss.
 	SelectColor color.Color
+
+	// BorderFg is a raw ANSI fg code for borders (derived from BrightBlack).
+	BorderFg string
+	// BorderColor is the border color as a color.Color for use with lipgloss.
+	BorderColor color.Color
 
 	// ChromaStyle is a chroma style built from the terminal palette,
 	// suitable for syntax highlighting on both normal and tinted backgrounds.
@@ -51,11 +61,19 @@ func ComputeDiffColors(p terminal.Palette) DiffColors {
 	} else {
 		selectTint = color.RGBA{R: 0, G: 0, B: 0, A: 255}
 	}
-	selectBg := blendColor(selectTint, bg, 0.04)
+	selectBg := blendColor(selectTint, bg, 0.20)
+
+	borderColor := brightBlack
+	if borderColor == nil {
+		borderColor = color.RGBA{R: 128, G: 128, B: 128, A: 255}
+	}
 
 	colors := DiffColors{
-		SelectBg:    colorToBgCode(selectBg),
-		SelectColor: selectBg,
+		SelectBg:      colorToBgCode(selectBg),
+		SelectedCtxBg: colorToBgCode(selectBg),
+		SelectColor:   selectBg,
+		BorderFg:      colorToFgCode(borderColor),
+		BorderColor:   borderColor,
 	}
 
 	// Subtle bg tints.
@@ -63,18 +81,26 @@ func ComputeDiffColors(p terminal.Palette) DiffColors {
 		addBg := blendColor(green, bg, 0.08)
 		colors.AddBg = colorToBgCode(addBg)
 		colors.AddFg = colorToFgCode(ensureContrast(green, addBg))
+		// Selected add: stronger green tint.
+		selectedAddBg := blendColor(green, bg, 0.25)
+		colors.SelectedAddBg = colorToBgCode(selectedAddBg)
 	} else {
 		colors.AddBg = "\033[48;5;22m"
 		colors.AddFg = "\033[32m"
+		colors.SelectedAddBg = "\033[48;5;28m"
 	}
 
 	if red != nil {
 		delBg := blendColor(red, bg, 0.08)
 		colors.DelBg = colorToBgCode(delBg)
 		colors.DelFg = colorToFgCode(ensureContrast(red, delBg))
+		// Selected del: stronger red tint.
+		selectedDelBg := blendColor(red, bg, 0.25)
+		colors.SelectedDelBg = colorToBgCode(selectedDelBg)
 	} else {
 		colors.DelBg = "\033[48;5;52m"
 		colors.DelFg = "\033[31m"
+		colors.SelectedDelBg = "\033[48;5;88m"
 	}
 
 	if blue != nil && white != nil {

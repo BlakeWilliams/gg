@@ -43,8 +43,56 @@ var (
 	borderStyle   = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
 )
 
-// RenderDiffFile renders a single file's diff with full-width colored backgrounds.
-func RenderDiffFile(f github.PullRequestFile, fileContent string, width int, colors styles.DiffColors, comments []github.ReviewComment) string {
+// DiffRenderResult holds the rendered diff string and metadata about line positions.
+type DiffRenderResult struct {
+	Content         string // the full rendered string
+	DiffLineOffsets []int  // rendered line index for each diff line (0-based from start of Content)
+}
+
+// HighlightedDiff holds pre-highlighted diff data that is width-independent.
+// This is the expensive part (Chroma syntax highlighting) that can be cached
+// across resizes.
+type HighlightedDiff struct {
+	File      github.PullRequestFile
+	DiffLines []DiffLine
+	HlLines   []string // syntax-highlighted lines (full file), or nil
+	Filename  string   // for fallback highlighting
+}
+
+// HighlightDiffFile runs the expensive Chroma syntax highlighting and returns
+// a HighlightedDiff that can be cached and re-formatted at different widths.
+func HighlightDiffFile(f github.PullRequestFile, fileContent string, chromaStyle *chroma.Style) HighlightedDiff {
+	hd := HighlightedDiff{
+		File:     f,
+		Filename: f.Filename,
+	}
+	if f.Patch == "" {
+		return hd
+	}
+	hd.DiffLines = ParsePatchLines(f.Patch)
+	if fileContent != "" {
+		hd.HlLines = highlightFileLines(fileContent, f.Filename, chromaStyle)
+	} else {
+		// Fallback: batch-highlight the diff content.
+		var codeBuilder strings.Builder
+		for _, dl := range hd.DiffLines {
+			if dl.Type == LineHunk {
+				codeBuilder.WriteString("\n")
+			} else {
+				codeBuilder.WriteString(dl.Content)
+				codeBuilder.WriteString("\n")
+			}
+		}
+		highlighted := highlightBlock(codeBuilder.String(), f.Filename, chromaStyle)
+		hd.HlLines = strings.Split(highlighted, "\n")
+	}
+	return hd
+}
+
+// FormatDiffFile takes a pre-highlighted diff and formats it at the given width.
+// This is cheap (no Chroma) and can be re-run on resize.
+func FormatDiffFile(hd HighlightedDiff, width int, colors styles.DiffColors, comments []github.ReviewComment) DiffRenderResult {
+	f := hd.File
 	name := f.Filename
 	if f.Status == "renamed" && f.PreviousFilename != "" {
 		name = f.PreviousFilename + " → " + f.Filename
@@ -54,72 +102,91 @@ func RenderDiffFile(f github.PullRequestFile, fileContent string, width int, col
 	dels := lipgloss.NewStyle().Foreground(lipgloss.Red).Render(fmt.Sprintf("-%d", f.Deletions))
 	statsPlain := fmt.Sprintf("+%d -%d", f.Additions, f.Deletions)
 
-	nameMax := width - len(statsPlain) - 2
+	nameMax := width - len(statsPlain) - 6
 	if nameMax < 0 {
 		nameMax = 0
 	}
 	if lipgloss.Width(name) > nameMax {
 		name = ansi.Truncate(name, nameMax-1, "…")
 	}
-	gap := width - lipgloss.Width(name) - len(statsPlain)
-	if gap < 1 {
-		gap = 1
-	}
 
-	// Embed title + stats in the top border: ── filename ── +N -N ──
 	title := " " + fileNameStyle.Render(name) + " "
 	stats := " " + adds + " " + dels + " "
 	titleW := lipgloss.Width(title)
 	statsW := lipgloss.Width(stats)
-	leadW := 2 // "──"
-	fillW := width - leadW - titleW - statsW
+	leadW := 2
+	trailW := 1
+	fillW := width - leadW - titleW - statsW - trailW
 	if fillW < 0 {
 		fillW = 0
 	}
-	topBorder := borderStyle.Render("──") + title + borderStyle.Render(strings.Repeat("─", fillW)) + stats
-	// Trim or pad to exact width if stats pushed it over
-	bottomBorder := borderStyle.Render(strings.Repeat("─", width))
+	topBorder := borderStyle.Render("╭─") + title + borderStyle.Render(strings.Repeat("─", fillW)) + stats + borderStyle.Render("╮")
+	bw := width - 2
+	if bw < 0 {
+		bw = 0
+	}
+	bottomBorder := borderStyle.Render("╰" + strings.Repeat("─", bw) + "╯")
+	border := borderStyle.Render("│")
 
 	if f.Patch == "" {
-		return topBorder + "\n" + styles.SubtitleStyle.Render("(binary or empty)") + "\n" + bottomBorder
+		body := styles.SubtitleStyle.Render("(binary or empty)")
+		line := border + " " + body + " " + border
+		return DiffRenderResult{Content: topBorder + "\n" + line + "\n" + bottomBorder}
 	}
 
-	diffLines := parsePatchLines(f.Patch)
-
-	if fileContent != "" {
-		hlLines := highlightFileLines(fileContent, f.Filename, colors.ChromaStyle)
-		renderDiffLines(diffLines, hlLines, f.Filename, width, colors)
-	} else {
-		renderDiffLinesFallback(diffLines, f.Filename, width, colors)
+	innerW := width - 2
+	if innerW < 10 {
+		innerW = 10
 	}
 
-	// Index comments by the line they attach to (new-side line number).
+	// Make a working copy of diff lines so we don't mutate the cached highlight data.
+	diffLines := make([]DiffLine, len(hd.DiffLines))
+	copy(diffLines, hd.DiffLines)
+
+	// Format each line at the target width using cached highlighted content.
+	formatDiffLinesFromHL(diffLines, hd.HlLines, hd.Filename, innerW, colors)
+
 	commentsByLine := buildCommentThreads(comments)
 
 	var b strings.Builder
+	renderedLineIdx := 0
 	b.WriteString(topBorder)
 	b.WriteString("\n")
-	for _, dl := range diffLines {
-		b.WriteString(dl.Rendered)
-		b.WriteString("\n")
+	renderedLineIdx++
 
-		// Check if there are comments on this line.
+	offsets := make([]int, len(diffLines))
+	for i, dl := range diffLines {
+		offsets[i] = renderedLineIdx
+		b.WriteString(border + dl.Rendered + border)
+		b.WriteString("\n")
+		renderedLineIdx++
+
 		lineNo := dl.NewLineNo
 		if dl.Type == LineDel {
 			lineNo = dl.OldLineNo
 		}
 		if lineNo > 0 {
 			if threads, ok := commentsByLine[lineNo]; ok {
-				b.WriteString(renderCommentThread(threads, width, dl.Type, colors))
+				threadStr := renderCommentThread(threads, innerW, dl.Type, colors)
+				for _, tl := range strings.Split(strings.TrimRight(threadStr, "\n"), "\n") {
+					b.WriteString(border + tl + border + "\n")
+					renderedLineIdx++
+				}
 			}
 		}
 	}
 	b.WriteString(bottomBorder)
-	return b.String()
+	return DiffRenderResult{Content: b.String(), DiffLineOffsets: offsets}
 }
 
-// parsePatchLines parses a unified diff patch into structured DiffLines.
-func parsePatchLines(patch string) []DiffLine {
+// RenderDiffFile is a convenience that highlights and formats in one call.
+func RenderDiffFile(f github.PullRequestFile, fileContent string, width int, colors styles.DiffColors, comments []github.ReviewComment) DiffRenderResult {
+	hd := HighlightDiffFile(f, fileContent, colors.ChromaStyle)
+	return FormatDiffFile(hd, width, colors, comments)
+}
+
+// ParsePatchLines parses a unified diff patch into structured DiffLines.
+func ParsePatchLines(patch string) []DiffLine {
 	lines := strings.Split(patch, "\n")
 	result := make([]DiffLine, 0, len(lines))
 	oldNum, newNum := 0, 0
@@ -162,59 +229,26 @@ func parsePatchLines(patch string) []DiffLine {
 	return result
 }
 
-// renderDiffLines renders each DiffLine using pre-highlighted full file lines.
-func renderDiffLines(diffLines []DiffLine, hlLines []string, filename string, width int, colors styles.DiffColors) {
-	for i := range diffLines {
-		dl := &diffLines[i]
-		switch dl.Type {
-		case LineHunk:
-			dl.Rendered = renderHunkLine(dl.Content, width, colors)
-
-		case LineAdd:
-			hl := getHighlightedLine(hlLines, dl.NewLineNo)
-			hl = injectBackground(hl, colors.AddBg)
-			gutter := colors.AddBg + colors.AddFg +
-				padNum(gutterWidth) + padNum(gutterWidth, dl.NewLineNo) +
-				" " + "\033[1m" + "+" + "\033[0m" + colors.AddBg
-			dl.Rendered = padWithBg(truncateLine(gutter+hl, width), width, colors.AddBg)
-
-		case LineDel:
-			hl := highlightSnippet(dl.Content, filename, colors.ChromaStyle)
-			hl = injectBackground(hl, colors.DelBg)
-			gutter := colors.DelBg + colors.DelFg +
-				padNum(gutterWidth, dl.OldLineNo) + padNum(gutterWidth) +
-				" " + "\033[1m" + "-" + "\033[0m" + colors.DelBg
-			dl.Rendered = padWithBg(truncateLine(gutter+hl, width), width, colors.DelBg)
-
-		case LineContext:
-			hl := getHighlightedLine(hlLines, dl.NewLineNo)
-			gutter := styles.DiffLineNum.Render(
-				padNum(gutterWidth, dl.OldLineNo) + padNum(gutterWidth, dl.NewLineNo) + " ",
-			)
-			dl.Rendered = truncateLine(gutter+" "+hl, width)
+// formatDiffLinesFromHL formats diff lines using pre-highlighted content at the given width.
+// hlLines may be indexed by line number (full file highlight) or sequentially (fallback).
+// The function detects which mode based on whether line numbers in the diff lines
+// fall within the hlLines range.
+func formatDiffLinesFromHL(diffLines []DiffLine, hlLines []string, filename string, width int, colors styles.DiffColors) {
+	// Detect if hlLines are indexed by line number (full file) or sequential (fallback).
+	// Full file mode: hlLines[lineNo-1] gives the highlighted line.
+	// Fallback mode: hlLines are in diff order (including blank for hunks).
+	useLineIndex := false
+	if len(diffLines) > 0 && len(hlLines) > 0 {
+		for _, dl := range diffLines {
+			if dl.Type == LineAdd && dl.NewLineNo > 0 && dl.NewLineNo <= len(hlLines) {
+				useLineIndex = true
+				break
+			}
+			if dl.Type == LineContext && dl.NewLineNo > 0 && dl.NewLineNo <= len(hlLines) {
+				useLineIndex = true
+				break
+			}
 		}
-	}
-}
-
-// renderDiffLinesFallback renders when no file content is available.
-func renderDiffLinesFallback(diffLines []DiffLine, filename string, width int, colors styles.DiffColors) {
-	// Build a single code block from all non-hunk lines for batch highlighting.
-	var codeBuilder strings.Builder
-	for _, dl := range diffLines {
-		if dl.Type == LineHunk {
-			codeBuilder.WriteString("\n")
-		} else {
-			codeBuilder.WriteString(dl.Content)
-			codeBuilder.WriteString("\n")
-		}
-	}
-	highlighted := highlightBlock(codeBuilder.String(), filename, colors.ChromaStyle)
-	hlLines := strings.Split(highlighted, "\n")
-
-	gutterTotal := gutterWidth*2 + 1
-	codeWidth := width - gutterTotal - 1
-	if codeWidth < 1 {
-		codeWidth = 1
 	}
 
 	hlIdx := 0
@@ -223,14 +257,18 @@ func renderDiffLinesFallback(diffLines []DiffLine, filename string, width int, c
 		switch dl.Type {
 		case LineHunk:
 			dl.Rendered = renderHunkLine(dl.Content, width, colors)
-			hlIdx++
+			if !useLineIndex {
+				hlIdx++
+			}
 
 		case LineAdd:
-			hl := ""
-			if hlIdx < len(hlLines) {
+			var hl string
+			if useLineIndex {
+				hl = getHighlightedLine(hlLines, dl.NewLineNo)
+			} else if hlIdx < len(hlLines) {
 				hl = hlLines[hlIdx]
+				hlIdx++
 			}
-			hlIdx++
 			hl = injectBackground(hl, colors.AddBg)
 			gutter := colors.AddBg + colors.AddFg +
 				padNum(gutterWidth) + padNum(gutterWidth, dl.NewLineNo) +
@@ -238,11 +276,14 @@ func renderDiffLinesFallback(diffLines []DiffLine, filename string, width int, c
 			dl.Rendered = padWithBg(truncateLine(gutter+hl, width), width, colors.AddBg)
 
 		case LineDel:
-			hl := ""
-			if hlIdx < len(hlLines) {
+			var hl string
+			if useLineIndex {
+				// Del lines aren't in the new file — use snippet highlighting.
+				hl = highlightSnippet(dl.Content, filename, colors.ChromaStyle)
+			} else if hlIdx < len(hlLines) {
 				hl = hlLines[hlIdx]
+				hlIdx++
 			}
-			hlIdx++
 			hl = injectBackground(hl, colors.DelBg)
 			gutter := colors.DelBg + colors.DelFg +
 				padNum(gutterWidth, dl.OldLineNo) + padNum(gutterWidth) +
@@ -250,15 +291,17 @@ func renderDiffLinesFallback(diffLines []DiffLine, filename string, width int, c
 			dl.Rendered = padWithBg(truncateLine(gutter+hl, width), width, colors.DelBg)
 
 		case LineContext:
-			hl := ""
-			if hlIdx < len(hlLines) {
+			var hl string
+			if useLineIndex {
+				hl = getHighlightedLine(hlLines, dl.NewLineNo)
+			} else if hlIdx < len(hlLines) {
 				hl = hlLines[hlIdx]
+				hlIdx++
 			}
-			hlIdx++
 			gutter := styles.DiffLineNum.Render(
 				padNum(gutterWidth, dl.OldLineNo) + padNum(gutterWidth, dl.NewLineNo) + " ",
 			)
-			dl.Rendered = truncateLine(gutter+" "+hl, width)
+			dl.Rendered = padToWidth(truncateLine(gutter+" "+hl, width), width)
 		}
 	}
 }
@@ -278,6 +321,15 @@ func injectBackground(highlighted string, bgCode string) string {
 	// Chroma uses \033[0m, lipgloss uses \033[m — catch both.
 	s := strings.ReplaceAll(highlighted, "\033[0m", "\033[0m"+bgCode)
 	s = strings.ReplaceAll(s, "\033[m", "\033[m"+bgCode)
+	return s
+}
+
+// padToWidth pads a line to targetWidth with spaces (no background color).
+func padToWidth(s string, targetWidth int) string {
+	currentWidth := lipgloss.Width(s)
+	if currentWidth < targetWidth {
+		return s + strings.Repeat(" ", targetWidth-currentWidth)
+	}
 	return s
 }
 
@@ -441,17 +493,6 @@ func bgForLineType(lt LineType, colors styles.DiffColors) string {
 	}
 }
 
-// fgForLineType returns the raw ANSI fg code for the gutter on the given line type.
-func fgForLineType(lt LineType, colors styles.DiffColors) string {
-	switch lt {
-	case LineAdd:
-		return colors.AddFg
-	case LineDel:
-		return colors.DelFg
-	default:
-		return ""
-	}
-}
 
 // commentGutterWidth is the visible width of the gutter area in diff lines.
 // padNum(4) + padNum(4) + " " + marker(1) = 10 visible chars.
@@ -472,7 +513,7 @@ func emptyLine(bg string, width int) string {
 // the line's fg color for borders to make the comment box stand out.
 func renderCommentThread(comments []github.ReviewComment, width int, lt LineType, colors styles.DiffColors) string {
 	bg := bgForLineType(lt, colors)
-	fg := fgForLineType(lt, colors)
+	borderFg := colors.BorderFg
 	gutterStr := commentGutter(bg)
 	// Content area is everything after the gutter.
 	contentW := width - commentGutterWidth
@@ -486,9 +527,9 @@ func renderCommentThread(comments []github.ReviewComment, width int, lt LineType
 	b.WriteString(emptyLine(bg, width))
 
 	for i, c := range comments {
-		author := " \033[1m@" + c.User.Login + "\033[0m" + bg + " "
+		author := " \033[1m@" + c.User.Login + "\033[0m "
 		ageStr := relativeTime(c.CreatedAt)
-		age := dimCode + ageStr + "\033[0m" + bg + " "
+		age := dimCode + ageStr + "\033[0m "
 		authorW := 1 + 1 + len(c.User.Login) + 1 // " @user "
 		ageW := len(ageStr) + 1
 
@@ -506,9 +547,9 @@ func renderCommentThread(comments []github.ReviewComment, width int, lt LineType
 		if fillW < 0 {
 			fillW = 0
 		}
-		topLine := gutterStr + fg + left + "\033[0m" + bg +
+		topLine := gutterStr + borderFg + left + "\033[0m" +
 			author + age +
-			fg + strings.Repeat("─", fillW) + right + "\033[0m"
+			borderFg + strings.Repeat("─", fillW) + right + "\033[0m"
 		b.WriteString(padWithBg(topLine, width, bg))
 		b.WriteString("\n")
 
@@ -524,9 +565,9 @@ func renderCommentThread(comments []github.ReviewComment, width int, lt LineType
 			if pad < 0 {
 				pad = 0
 			}
-			content := gutterStr + fg + "│" + "\033[0m" + bg +
+			content := gutterStr + borderFg + "│" + "\033[0m" +
 				" " + line + strings.Repeat(" ", pad) + " " +
-				fg + "│" + "\033[0m"
+				borderFg + "│" + "\033[0m"
 			b.WriteString(padWithBg(content, width, bg))
 			b.WriteString("\n")
 		}
@@ -537,7 +578,7 @@ func renderCommentThread(comments []github.ReviewComment, width int, lt LineType
 	if fillW < 0 {
 		fillW = 0
 	}
-	bottomLine := gutterStr + fg + "╰" + strings.Repeat("─", fillW) + "╯" + "\033[0m"
+	bottomLine := gutterStr + borderFg + "╰" + strings.Repeat("─", fillW) + "╯" + "\033[0m"
 	b.WriteString(padWithBg(bottomLine, width, bg))
 	b.WriteString("\n")
 

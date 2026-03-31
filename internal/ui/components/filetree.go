@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/blakewilliams/ghq/internal/github"
+	"github.com/charmbracelet/x/ansi"
 	"charm.land/lipgloss/v2"
 )
 
@@ -157,8 +158,11 @@ func RenderFileTree(entries []FileTreeEntry, files []github.PullRequestFile, cur
 
 func padTo(s string, width int) string {
 	w := lipgloss.Width(s)
-	if w >= width {
-		return s
+	if w > width {
+		return ansi.Truncate(s, width, "")
 	}
-	return s + strings.Repeat(" ", width-w)
+	if w < width {
+		return s + strings.Repeat(" ", width-w)
+	}
+	return s
 }
