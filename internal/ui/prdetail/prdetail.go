@@ -823,7 +823,9 @@ func (m Model) handleCommentKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 }
 
 // buildSuggestionBlock returns a GitHub suggestion fenced code block
-// pre-filled with the code from the commented line(s).
+// pre-filled with the code from the commented line(s). Returns "" if the
+// selection contains deleted lines, since suggestions only apply to the
+// new side of the diff.
 func (m Model) buildSuggestionBlock() string {
 	idx := m.currentFileIdx
 	if idx < 0 || idx >= len(m.fileDiffs) {
@@ -848,13 +850,44 @@ func (m Model) buildSuggestionBlock() string {
 		if dl.Type == components.LineHunk {
 			continue
 		}
+		if dl.Type == components.LineDel {
+			return ""
+		}
 		code = append(code, dl.Content)
 	}
 
 	if len(code) == 0 {
-		return "```suggestion\n```"
+		return ""
 	}
 	return "```suggestion\n" + strings.Join(code, "\n") + "\n```"
+}
+
+// canSuggest returns true when none of the commented lines are deletions,
+// meaning a suggestion block would be valid.
+func (m Model) canSuggest() bool {
+	idx := m.currentFileIdx
+	if idx < 0 || idx >= len(m.fileDiffs) {
+		return false
+	}
+	lines := m.fileDiffs[idx]
+
+	selStart, selEnd := m.diffCursor, m.diffCursor
+	if m.selectionAnchor >= 0 && m.selectionAnchor != m.diffCursor {
+		selStart, selEnd = m.selectionAnchor, m.diffCursor
+		if selStart > selEnd {
+			selStart, selEnd = selEnd, selStart
+		}
+	}
+
+	for i := selStart; i <= selEnd; i++ {
+		if i >= len(lines) {
+			continue
+		}
+		if lines[i].Type == components.LineDel {
+			return false
+		}
+	}
+	return true
 }
 
 func (m Model) openEditorForComment() (Model, tea.Cmd, bool) {
@@ -1086,7 +1119,11 @@ func (m Model) renderCommentBox() string {
 	}
 	boxLines = append(boxLines, indent+bottomRule)
 
-	left := dimStyle.Render("esc cancel · ctrl+g $EDITOR · alt+s suggest")
+	leftHint := "esc cancel · ctrl+g $EDITOR"
+	if m.canSuggest() {
+		leftHint += " · alt+s suggest"
+	}
+	left := dimStyle.Render(leftHint)
 	right := dimStyle.Render("alt+enter submit")
 	hintGap := boxW - lipgloss.Width(left) - lipgloss.Width(right)
 	if hintGap < 1 {
