@@ -112,16 +112,19 @@ type Model struct {
 
 	// Line cursor (within current file diff)
 	diffCursor      int
+	selectionAnchor int // -1 = no selection; otherwise the diff line index where shift-select started
 	fileDiffs       [][]components.DiffLine
 	fileDiffOffsets [][]int
 
 	// Comment composing
-	composing    bool
-	commentInput textarea.Model
-	commentFile  string
-	commentLine  int
-	commentSide  string
-	replyToID    *int
+	composing        bool
+	commentInput     textarea.Model
+	commentFile      string
+	commentLine      int
+	commentSide      string
+	commentStartLine int    // >0 for multi-line comments (the first line of the range)
+	commentStartSide string // side of the first line for multi-line comments
+	replyToID        *int
 
 	// Shared
 	filesListLoaded bool
@@ -130,13 +133,14 @@ type Model struct {
 
 func New(pr github.PullRequest, ctx *uictx.Context, width, height int) Model {
 	return Model{
-		pr:             pr,
-		ctx:            ctx,
-		width:          width,
-		height:         height,
-		currentFileIdx: -1, // start on Overview
-		treeWidth:      35,
-		treeFocused:    true, // start with tree focused
+		pr:              pr,
+		ctx:             ctx,
+		width:           width,
+		height:          height,
+		currentFileIdx:  -1, // start on Overview
+		selectionAnchor: -1, // no selection
+		treeWidth:       35,
+		treeFocused:     true, // start with tree focused
 	}
 }
 
@@ -165,6 +169,9 @@ func (m Model) StatusHints() (left, right []string) {
 	}
 	left = append(left, styles.StatusBarKey.Render("h/l")+" "+styles.StatusBarHint.Render("panes"))
 	left = append(left, styles.StatusBarKey.Render("p/n")+" "+styles.StatusBarHint.Render("files"))
+	if !m.treeFocused && m.currentFileIdx >= 0 {
+		left = append(left, styles.StatusBarKey.Render("J/K")+" "+styles.StatusBarHint.Render("select range"))
+	}
 	right = append(right, highlightHint("comments", "c"))
 	right = append(right, highlightHint("reviews", "r"))
 	right = append(right, highlightHint("checks", "s"))
@@ -404,6 +411,12 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		return m, nil, true
 	}
 
+	// Clear selection on esc.
+	if msg.String() == "esc" && m.selectionAnchor >= 0 {
+		m.selectionAnchor = -1
+		return m, nil, true
+	}
+
 	switch msg.String() {
 	case "f":
 		// Toggle tree focus.
@@ -440,8 +453,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			m.moveTreeCursorBy(1)
 			return m, nil, true
 		}
-		// Diff line cursor.
+		// Diff line cursor — clear selection on normal move.
 		if m.currentFileIdx >= 0 && m.hasDiffLines() {
+			m.selectionAnchor = -1
 			m.moveDiffCursor(1)
 			return m, nil, true
 		}
@@ -454,6 +468,25 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			return m, nil, true
 		}
 		if m.currentFileIdx >= 0 && m.hasDiffLines() {
+			m.selectionAnchor = -1
+			m.moveDiffCursor(-1)
+			return m, nil, true
+		}
+	case "J", "shift+down":
+		// Extend selection downward.
+		if !m.showSidebar && !m.treeFocused && m.currentFileIdx >= 0 && m.hasDiffLines() {
+			if m.selectionAnchor < 0 {
+				m.selectionAnchor = m.diffCursor
+			}
+			m.moveDiffCursor(1)
+			return m, nil, true
+		}
+	case "K", "shift+up":
+		// Extend selection upward.
+		if !m.showSidebar && !m.treeFocused && m.currentFileIdx >= 0 && m.hasDiffLines() {
+			if m.selectionAnchor < 0 {
+				m.selectionAnchor = m.diffCursor
+			}
 			m.moveDiffCursor(-1)
 			return m, nil, true
 		}
@@ -473,6 +506,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			return m.openCommentInput()
 		}
 	case "ctrl+d":
+		m.selectionAnchor = -1
 		if m.treeFocused {
 			m.moveTreeCursorBy(m.height / 2)
 		} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
@@ -480,6 +514,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		}
 		return m, nil, true
 	case "ctrl+u":
+		m.selectionAnchor = -1
 		if m.treeFocused {
 			m.moveTreeCursorBy(-m.height / 2)
 		} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
@@ -487,6 +522,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		}
 		return m, nil, true
 	case "ctrl+f":
+		m.selectionAnchor = -1
 		if m.treeFocused {
 			m.moveTreeCursorBy(m.height)
 		} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
@@ -494,6 +530,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		}
 		return m, nil, true
 	case "ctrl+b":
+		m.selectionAnchor = -1
 		if m.treeFocused {
 			m.moveTreeCursorBy(-m.height)
 		} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
@@ -587,6 +624,7 @@ func (m *Model) moveTreeCursorBy(delta int) {
 
 // selectTreeEntry updates the right panel based on the current tree cursor.
 func (m *Model) selectTreeEntry() {
+	m.selectionAnchor = -1
 	if m.treeCursor == 0 {
 		// Overview.
 		m.currentFileIdx = -1
@@ -736,6 +774,7 @@ func (m Model) handleCommentKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 	switch msg.String() {
 	case "esc":
 		m.composing = false
+		m.selectionAnchor = -1
 		m.rebuildContent()
 		return m, nil, true
 	case "alt+enter":
@@ -743,6 +782,7 @@ func (m Model) handleCommentKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		body := strings.TrimSpace(m.commentInput.Value())
 		if body == "" {
 			m.composing = false
+			m.selectionAnchor = -1
 			m.rebuildContent()
 			return m, nil, true
 		}
@@ -754,8 +794,10 @@ func (m Model) handleCommentKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			cmd = m.ctx.Client.CreateReviewComment(
 				m.pr.Number, body, m.pr.Head.SHA,
 				m.commentFile, m.commentLine, m.commentSide,
+				m.commentStartLine, m.commentStartSide,
 			)
 		}
+		m.selectionAnchor = -1
 		m.rebuildContent()
 		return m, cmd, true
 	case "ctrl+g":
@@ -815,16 +857,59 @@ func (m Model) openCommentInput() (Model, tea.Cmd, bool) {
 	}
 
 	m.commentFile = m.files[idx].Filename
-	if dl.Type == components.LineDel {
-		m.commentLine = dl.OldLineNo
-		m.commentSide = "LEFT"
+
+	// Determine if we have a multi-line selection.
+	m.commentStartLine = 0
+	m.commentStartSide = ""
+
+	if m.selectionAnchor >= 0 && m.selectionAnchor != m.diffCursor {
+		selStart, selEnd := m.selectionAnchor, m.diffCursor
+		if selStart > selEnd {
+			selStart, selEnd = selEnd, selStart
+		}
+
+		startDL := lines[selStart]
+		endDL := lines[selEnd]
+
+		// Both ends must be non-hunk lines.
+		if startDL.Type == components.LineHunk || endDL.Type == components.LineHunk {
+			return m, nil, false
+		}
+
+		// The end line is the "line" in the API; the start line is "start_line".
+		if endDL.Type == components.LineDel {
+			m.commentLine = endDL.OldLineNo
+			m.commentSide = "LEFT"
+		} else {
+			m.commentLine = endDL.NewLineNo
+			m.commentSide = "RIGHT"
+		}
+
+		if startDL.Type == components.LineDel {
+			m.commentStartLine = startDL.OldLineNo
+			m.commentStartSide = "LEFT"
+		} else {
+			m.commentStartLine = startDL.NewLineNo
+			m.commentStartSide = "RIGHT"
+		}
 	} else {
-		m.commentLine = dl.NewLineNo
-		m.commentSide = "RIGHT"
+		// Single-line comment.
+		if dl.Type == components.LineDel {
+			m.commentLine = dl.OldLineNo
+			m.commentSide = "LEFT"
+		} else {
+			m.commentLine = dl.NewLineNo
+			m.commentSide = "RIGHT"
+		}
 	}
 
 	// Check if there's an existing comment thread on this line to reply to.
-	m.replyToID = m.findThreadRootOnLine(m.commentFile, m.commentLine)
+	// Only for single-line comments — multi-line always creates a new thread.
+	if m.commentStartLine > 0 {
+		m.replyToID = nil
+	} else {
+		m.replyToID = m.findThreadRootOnLine(m.commentFile, m.commentLine)
+	}
 
 	// Create textarea.
 	ta := textarea.New()
@@ -1088,11 +1173,18 @@ func (m Model) cursorViewportLine() int {
 	return rel
 }
 
-// overlayDiffCursor applies the cursor highlight to the one visible line.
+// overlayDiffCursor applies the cursor highlight to the one visible line,
+// or highlights all lines in the selection range when shift-selecting.
 func (m Model) overlayDiffCursor(view string) string {
 	if !m.filesListLoaded || !m.hasDiffLines() {
 		return view
 	}
+
+	// When there's a multi-line selection, highlight all lines in the range.
+	if m.selectionAnchor >= 0 && m.selectionAnchor != m.diffCursor {
+		return m.overlaySelectionRange(view)
+	}
+
 	vLine := m.cursorViewportLine()
 	if vLine < 0 {
 		return view
@@ -1102,6 +1194,90 @@ func (m Model) overlayDiffCursor(view string) string {
 		lines[vLine] = m.applyCursorHighlight(lines[vLine])
 	}
 	return strings.Join(lines, "\n")
+}
+
+// overlaySelectionRange highlights all diff lines in the selection range
+// that are visible in the viewport.
+func (m Model) overlaySelectionRange(view string) string {
+	fileIdx := m.currentFileIdx
+	if fileIdx < 0 || fileIdx >= len(m.fileDiffOffsets) {
+		return view
+	}
+
+	selStart, selEnd := m.selectionAnchor, m.diffCursor
+	if selStart > selEnd {
+		selStart, selEnd = selEnd, selStart
+	}
+
+	offsets := m.fileDiffOffsets[fileIdx]
+	diffs := m.fileDiffs[fileIdx]
+	vpTop := m.vp.YOffset()
+
+	lines := strings.Split(view, "\n")
+
+	for i := selStart; i <= selEnd; i++ {
+		if i >= len(offsets) || i >= len(diffs) {
+			continue
+		}
+		if diffs[i].Type == components.LineHunk {
+			continue
+		}
+		absLine := offsets[i]
+		rel := absLine - vpTop
+		if rel < 0 || rel >= len(lines) {
+			continue
+		}
+		lines[rel] = m.applySelectionHighlight(lines[rel], diffs[i])
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// applySelectionHighlight applies the selected background to a line in the
+// selection range. Similar to applyCursorHighlight but takes an explicit DiffLine.
+func (m Model) applySelectionHighlight(line string, dl components.DiffLine) string {
+	if dl.Type == components.LineHunk {
+		return line
+	}
+
+	const borderLen = 11
+	prefix := ""
+	suffix := ""
+	inner := line
+	if len(line) >= borderLen*2 {
+		prefix = line[:borderLen]
+		suffix = line[len(line)-borderLen:]
+		inner = line[borderLen : len(line)-borderLen]
+	}
+
+	// Replace the bold +/- gutter marker with > to indicate selection.
+	inner = strings.Replace(inner, "\033[1m+\033[0m", "\033[1m>\033[0m", 1)
+	inner = strings.Replace(inner, "\033[1m-\033[0m", "\033[1m>\033[0m", 1)
+
+	colors := m.ctx.DiffColors
+	var selBg string
+	switch dl.Type {
+	case components.LineAdd:
+		selBg = colors.SelectedAddBg
+	case components.LineDel:
+		selBg = colors.SelectedDelBg
+	default:
+		selBg = colors.SelectedCtxBg
+	}
+
+	if selBg != "" {
+		if colors.AddBg != "" {
+			inner = strings.ReplaceAll(inner, colors.AddBg, selBg)
+		}
+		if colors.DelBg != "" {
+			inner = strings.ReplaceAll(inner, colors.DelBg, selBg)
+		}
+		inner = strings.ReplaceAll(inner, "\033[0m", "\033[0m"+selBg)
+		inner = strings.ReplaceAll(inner, "\033[m", "\033[m"+selBg)
+		inner = selBg + inner + "\033[0m"
+	}
+
+	return prefix + inner + suffix
 }
 
 func (m Model) renderWithLeftSidebarFrom(view string) string {

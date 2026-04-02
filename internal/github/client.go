@@ -121,19 +121,27 @@ func (c *Client) GetCheckRuns(ctx context.Context, ref string) ([]CheckRun, erro
 }
 
 // CreateReviewComment creates a new review comment on a pull request diff.
-func (c *Client) CreateReviewComment(ctx context.Context, number int, body, commitID, path string, line int, side string) (ReviewComment, error) {
+// For multi-line comments, set startLine > 0 and startSide to the side of the
+// first line. When startLine is 0, a single-line comment is created.
+func (c *Client) CreateReviewComment(ctx context.Context, number int, body, commitID, path string, line int, side string, startLine int, startSide string) (ReviewComment, error) {
 	payload := struct {
-		Body     string `json:"body"`
-		CommitID string `json:"commit_id"`
-		Path     string `json:"path"`
-		Line     int    `json:"line"`
-		Side     string `json:"side"`
+		Body      string `json:"body"`
+		CommitID  string `json:"commit_id"`
+		Path      string `json:"path"`
+		Line      int    `json:"line"`
+		Side      string `json:"side"`
+		StartLine *int   `json:"start_line,omitempty"`
+		StartSide string `json:"start_side,omitempty"`
 	}{
 		Body:     body,
 		CommitID: commitID,
 		Path:     path,
 		Line:     line,
 		Side:     side,
+	}
+	if startLine > 0 {
+		payload.StartLine = &startLine
+		payload.StartSide = startSide
 	}
 	jsonBody, err := json.Marshal(payload)
 	if err != nil {

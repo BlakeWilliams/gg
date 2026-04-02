@@ -333,9 +333,10 @@ type CommentErrorMsg struct {
 }
 
 // CreateReviewComment returns a tea.Cmd that posts a new review comment.
-func (c *CachedClient) CreateReviewComment(number int, body, commitID, path string, line int, side string) tea.Cmd {
+// For multi-line comments, set startLine > 0 and startSide.
+func (c *CachedClient) CreateReviewComment(number int, body, commitID, path string, line int, side string, startLine int, startSide string) tea.Cmd {
 	return func() tea.Msg {
-		comment, err := c.client.CreateReviewComment(context.Background(), number, body, commitID, path, line, side)
+		comment, err := c.client.CreateReviewComment(context.Background(), number, body, commitID, path, line, side, startLine, startSide)
 		if err != nil {
 			return CommentErrorMsg{Err: err}
 		}
