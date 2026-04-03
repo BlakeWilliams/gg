@@ -508,6 +508,8 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			m.moveTreeCursorBy(m.height / 2)
 		} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
 			m.moveDiffCursorBy(m.height / 2)
+		} else {
+			m.vp.SetYOffset(m.vp.YOffset() + m.height/2)
 		}
 		return m, nil, true
 	case "ctrl+u":
@@ -516,6 +518,8 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			m.moveTreeCursorBy(-m.height / 2)
 		} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
 			m.moveDiffCursorBy(-m.height / 2)
+		} else {
+			m.vp.SetYOffset(m.vp.YOffset() - m.height/2)
 		}
 		return m, nil, true
 	case "ctrl+f":
@@ -524,6 +528,8 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			m.moveTreeCursorBy(m.height)
 		} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
 			m.moveDiffCursorBy(m.height)
+		} else {
+			m.vp.SetYOffset(m.vp.YOffset() + m.height)
 		}
 		return m, nil, true
 	case "ctrl+b":
@@ -532,25 +538,41 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			m.moveTreeCursorBy(-m.height)
 		} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
 			m.moveDiffCursorBy(-m.height)
+		} else {
+			m.vp.SetYOffset(m.vp.YOffset() - m.height)
 		}
 		return m, nil, true
 	case "G":
 		m.waitingG = false
-		m.activeViewport().GotoBottom()
-		if m.currentFileIdx >= 0 && m.hasDiffLines() {
-			m.syncDiffCursorToViewport()
+		if m.treeFocused {
+			// Jump tree cursor to last entry.
+			totalEntries := 2 + len(m.treeEntries)
+			m.moveTreeCursorBy(totalEntries)
+		} else {
+			m.activeViewport().GotoBottom()
+			if m.currentFileIdx >= 0 && m.hasDiffLines() {
+				m.syncDiffCursorToViewport()
+			}
 		}
 		return m, nil, true
 	case "g":
 		if m.waitingG {
 			m.waitingG = false
-			m.activeViewport().GotoTop()
-			if m.currentFileIdx >= 0 && m.hasDiffLines() {
-				m.syncDiffCursorToViewport()
+			if m.treeFocused {
+				// Jump tree cursor to first entry (Description).
+				m.moveTreeCursorBy(-2 - len(m.treeEntries))
+			} else {
+				m.activeViewport().GotoTop()
+				if m.currentFileIdx >= 0 && m.hasDiffLines() {
+					m.syncDiffCursorToViewport()
+				}
 			}
 			return m, nil, true
 		}
 		m.waitingG = true
+		return m, nil, true
+	case "ctrl+g":
+		// Absorb outside composing mode.
 		return m, nil, true
 	default:
 		m.waitingG = false
