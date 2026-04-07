@@ -13,7 +13,8 @@ import (
 )
 
 type Client struct {
-	rest  *api.RESTClient
+	rest *api.RESTClient
+	gql  *api.GraphQLClient
 	owner string
 	repo  string
 }
@@ -30,21 +31,28 @@ func NewClient(nwo string) (*Client, error) {
 		return nil, fmt.Errorf("creating REST client: %w", err)
 	}
 
+	gql, err := api.DefaultGraphQLClient()
+	if err != nil {
+		return nil, fmt.Errorf("creating GraphQL client: %w", err)
+	}
+
 	if nwo != "" {
 		parts := strings.SplitN(nwo, "/", 2)
 		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 			return nil, fmt.Errorf("invalid repo format %q, expected owner/repo", nwo)
 		}
-		return &Client{rest: rest, owner: parts[0], repo: parts[1]}, nil
+		return &Client{rest: rest, gql: gql, owner: parts[0], repo: parts[1]}, nil
 	}
 
 	repo, err := repository.Current()
 	if err != nil {
-		return nil, fmt.Errorf("detecting repository: %w", err)
+		// No repo detected — that's fine for inbox-only mode.
+		return &Client{rest: rest, gql: gql}, nil
 	}
 
 	return &Client{
 		rest:  rest,
+		gql:   gql,
 		owner: repo.Owner,
 		repo:  repo.Name,
 	}, nil
@@ -58,6 +66,17 @@ func (c *Client) ListPullRequests(ctx context.Context) ([]PullRequest, error) {
 		return nil, fmt.Errorf("listing pull requests: %w", err)
 	}
 	return prs, nil
+}
+
+// GetPullRequestFromRepo fetches a PR from a specific owner/repo (for inbox navigation).
+func (c *Client) GetPullRequestFromRepo(ctx context.Context, owner, repo string, number int) (PullRequest, error) {
+	var pr PullRequest
+	path := fmt.Sprintf("repos/%s/%s/pulls/%d", owner, repo, number)
+	err := c.rest.Get(path, &pr)
+	if err != nil {
+		return pr, fmt.Errorf("getting pull request %s/%s#%d: %w", owner, repo, number, err)
+	}
+	return pr, nil
 }
 
 func (c *Client) GetPullRequest(ctx context.Context, number int) (PullRequest, error) {

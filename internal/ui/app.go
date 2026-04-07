@@ -8,6 +8,7 @@ import (
 	"github.com/blakewilliams/ghq/internal/github"
 	"github.com/blakewilliams/ghq/internal/terminal"
 	"github.com/blakewilliams/ghq/internal/ui/commandbar"
+	"github.com/blakewilliams/ghq/internal/ui/home"
 	"github.com/blakewilliams/ghq/internal/ui/prdetail"
 	"github.com/blakewilliams/ghq/internal/ui/prlist"
 	"github.com/blakewilliams/ghq/internal/ui/styles"
@@ -39,19 +40,23 @@ type Model struct {
 	height     int
 }
 
-func NewApp(client *github.CachedClient) Model {
-	ctx := &uictx.Context{Client: client}
-	pl := prlist.New(ctx)
+func NewApp(client *github.CachedClient, nwo string) Model {
+	ctx := &uictx.Context{Client: client, NWO: nwo}
+	h := home.New(ctx, nwo)
 	return Model{
-		activeView: pl,
-		prList:     pl,
+		activeView: h,
 		commandBar: commandbar.New(),
 		ctx:        ctx,
 	}
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.activeView.Init(), m.ctx.Client.GCTickCmd(), queryPaletteCmd(), tea.RequestBackgroundColor)
+	return tea.Batch(
+		m.ctx.Client.FetchAuthenticatedUser(),
+		m.ctx.Client.GCTickCmd(),
+		queryPaletteCmd(),
+		tea.RequestBackgroundColor,
+	)
 }
 
 // queryPaletteCmd sends OSC 4 queries through Bubble Tea's output buffer.
@@ -144,13 +149,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
-	case prlist.PRSelectedMsg:
-		// Save prList state before switching away.
-		if pl, ok := m.activeView.(prlist.Model); ok {
-			m.prList = pl
-		}
+	case github.UserLoadedMsg:
+		m.ctx.Username = msg.User.Login
+		// Now that we have the username, init the home view.
+		return m, m.activeView.Init()
+
+	case home.PRSelectedMsg:
 		m.history = append(m.history, m.activeView)
-		m.forward = nil // clear forward stack on new navigation
+		m.forward = nil
+		return m, m.ctx.Client.FetchPR(msg.Owner, msg.Repo, msg.Number)
+
+	case github.PRLoadedMsg:
+		// Scope client to this PR's repo for all subsequent API calls.
+		if owner := msg.PR.RepoOwner(); owner != "" {
+			m.ctx.Client.SetRepo(owner, msg.PR.RepoName())
+		}
+		m.activeView = prdetail.New(msg.PR, m.ctx, m.width, m.height-chromeHeight)
+		return m, m.activeView.Init()
+
+	case prlist.PRSelectedMsg:
+		m.history = append(m.history, m.activeView)
+		m.forward = nil
 		m.activeView = prdetail.New(msg.PR, m.ctx, m.width, m.height-chromeHeight)
 		return m, m.activeView.Init()
 	}
@@ -169,6 +188,15 @@ func (m Model) navigateBack() (tea.Model, tea.Cmd) {
 	// Restore prList reference if we're going back to the list.
 	if pl, ok := prev.(prlist.Model); ok {
 		m.prList = pl
+	}
+	// Restore repo scope from the NWO flag (or clear it) when leaving PR detail.
+	if m.ctx.NWO != "" {
+		parts := strings.SplitN(m.ctx.NWO, "/", 2)
+		if len(parts) == 2 {
+			m.ctx.Client.SetRepo(parts[0], parts[1])
+		}
+	} else {
+		m.ctx.Client.SetRepo("", "")
 	}
 	resize := tea.WindowSizeMsg{Width: m.width, Height: m.height - chromeHeight}
 	m.activeView, _ = m.activeView.Update(resize)
@@ -229,13 +257,22 @@ func (m Model) View() tea.View {
 }
 
 func (m Model) renderHeader() string {
-	repo := styles.HeaderRepo.Render(m.ctx.Client.RepoFullName())
 	sep := styles.HeaderSep.Render(" / ")
 
-	crumb := " " + repo + sep + styles.HeaderSection.Render("Pulls")
-
-	if detail, ok := m.activeView.(prdetail.Model); ok {
-		crumb += sep + styles.HeaderActive.Render(fmt.Sprintf("#%d %s", detail.PRNumber(), detail.PRTitle()))
+	var crumb string
+	switch m.activeView.(type) {
+	case home.Model:
+		crumb = " " + styles.HeaderActive.Render("Inbox")
+	case prlist.Model:
+		repo := styles.HeaderRepo.Render(m.ctx.Client.RepoFullName())
+		crumb = " " + repo + sep + styles.HeaderActive.Render("Pulls")
+	case prdetail.Model:
+		detail := m.activeView.(prdetail.Model)
+		repo := styles.HeaderRepo.Render(detail.RepoFullName())
+		crumb = " " + repo + sep + styles.HeaderSection.Render("Pulls") +
+			sep + styles.HeaderActive.Render(fmt.Sprintf("#%d %s", detail.PRNumber(), detail.PRTitle()))
+	default:
+		crumb = " " + styles.HeaderActive.Render("ghq")
 	}
 
 	return styles.HeaderBar.Width(m.width).Render(crumb)
@@ -246,6 +283,11 @@ func (m Model) renderStatusBar() string {
 	sep := styles.StatusBarHint.Render("  ")
 
 	switch v := m.activeView.(type) {
+	case home.Model:
+		leftHints, rightHints := v.StatusHints()
+		leftHints = append([]string{formatHints([]string{":  cmd"})}, leftHints...)
+		left = strings.Join(leftHints, sep)
+		right = strings.Join(rightHints, sep)
 	case prlist.Model:
 		left = formatHints([]string{":  cmd", "/  filter", "enter  open"})
 	case prdetail.Model:

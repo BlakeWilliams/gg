@@ -42,6 +42,12 @@ func NewCachedClient(client *Client, opts cache.Options) *CachedClient {
 	}
 }
 
+// SetRepo changes the active repo scope for API calls.
+func (c *CachedClient) SetRepo(owner, repo string) {
+	c.client.owner = owner
+	c.client.repo = repo
+}
+
 // RepoFullName returns the owner/repo string.
 func (c *CachedClient) RepoFullName() string {
 	return c.client.RepoFullName()
@@ -356,6 +362,57 @@ func (c *CachedClient) ReplyToReviewComment(number int, commentID int, body stri
 		c.cache.Invalidate(fmt.Sprintf("review-comments:%d", number))
 		return CommentCreatedMsg{Comment: comment, Number: number}
 	}
+}
+
+// InboxLoadedMsg is sent when the inbox PRs are loaded and enriched.
+type InboxLoadedMsg struct {
+	PRs []InboxPR
+}
+
+// UserLoadedMsg is sent when the authenticated user is loaded.
+type UserLoadedMsg struct {
+	User User
+}
+
+// FetchAuthenticatedUser returns a tea.Cmd that fetches the current user.
+func (c *CachedClient) FetchAuthenticatedUser() tea.Cmd {
+	return func() tea.Msg {
+		user, err := c.client.GetAuthenticatedUser(context.Background())
+		if err != nil {
+			return QueryErrMsg{Err: err}
+		}
+		return UserLoadedMsg{User: user}
+	}
+}
+
+// FetchInbox returns a tea.Cmd that fetches all inbox PRs with enrichment.
+func (c *CachedClient) FetchInbox(username, nwo string) tea.Cmd {
+	return func() tea.Msg {
+		prs, err := c.client.FetchInboxPRs(context.Background(), username, nwo)
+		if err != nil {
+			return QueryErrMsg{Err: err}
+		}
+		// Enrich with GraphQL data.
+		prs, _ = c.client.EnrichPRs(context.Background(), prs, username)
+		return InboxLoadedMsg{PRs: prs}
+	}
+}
+
+// FetchPR returns a tea.Cmd that fetches a single PR by owner/repo/number.
+func (c *CachedClient) FetchPR(owner, repo string, number int) tea.Cmd {
+	return func() tea.Msg {
+		// Temporarily create a client scoped to this repo.
+		pr, err := c.client.GetPullRequestFromRepo(context.Background(), owner, repo, number)
+		if err != nil {
+			return QueryErrMsg{Err: err}
+		}
+		return PRLoadedMsg{PR: pr}
+	}
+}
+
+// PRLoadedMsg is sent when a single PR is loaded (for inbox → detail navigation).
+type PRLoadedMsg struct {
+	PR PullRequest
 }
 
 // InvalidatePR removes cached data for a specific PR.

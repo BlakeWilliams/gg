@@ -9,6 +9,8 @@ import (
 type Context struct {
 	Client     *github.CachedClient
 	DiffColors styles.DiffColors
+	Username   string
+	NWO        string // optional repo filter (owner/repo)
 }
 
 type View interface {

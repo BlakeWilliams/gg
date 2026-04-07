@@ -152,6 +152,10 @@ func (m Model) PRTitle() string {
 	return m.pr.Title
 }
 
+func (m Model) RepoFullName() string {
+	return m.ctx.Client.RepoFullName()
+}
+
 func (m *Model) activeViewport() *viewport.Model {
 	if m.showSidebar {
 		return &m.sidebarVP
@@ -436,10 +440,10 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		// Focus right pane.
 		m.treeFocused = false
 		return m, nil, true
-	case "p":
+	case "p", "ctrl+k":
 		m.moveTreeSelection(-1)
 		return m, nil, true
-	case "n":
+	case "n", "ctrl+j":
 		m.moveTreeSelection(1)
 		return m, nil, true
 	case "j", "down":

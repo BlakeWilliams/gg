@@ -28,7 +28,7 @@ func main() {
 		GCInterval: 1 * time.Minute,
 	})
 
-	p := tea.NewProgram(ui.NewApp(cachedClient))
+	p := tea.NewProgram(ui.NewApp(cachedClient, *nwo))
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
