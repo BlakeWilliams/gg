@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/blakewilliams/ghq/internal/git"
 	"github.com/blakewilliams/ghq/internal/github"
 	"github.com/blakewilliams/ghq/internal/terminal"
 	"github.com/blakewilliams/ghq/internal/ui/commandbar"
@@ -261,12 +262,29 @@ func (m Model) handleCommand(msg commandbar.CommandMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "inbox":
-		if _, ok := m.activeView.(localdiff.Model); ok {
+		if _, ok := m.activeView.(home.Model); !ok {
 			m.history = append(m.history, m.activeView)
 			m.forward = nil
 			h := home.New(m.ctx, m.ctx.NWO)
 			m.activeView = h
+			resize := tea.WindowSizeMsg{Width: m.width, Height: m.height - chromeHeight}
+			m.activeView, _ = m.activeView.Update(resize)
 			return m, m.activeView.Init()
+		}
+	case "pr":
+		// Open the PR for the current branch.
+		if m.repoRoot != "" {
+			branch := ""
+			if ld, ok := m.activeView.(localdiff.Model); ok {
+				branch = ld.BranchName()
+			} else {
+				branch, _ = git.CurrentBranch(m.repoRoot)
+			}
+			if branch != "" {
+				m.history = append(m.history, m.activeView)
+				m.forward = nil
+				return m, m.ctx.Client.FetchPRByBranch(branch)
+			}
 		}
 	}
 	return m, nil

@@ -79,6 +79,20 @@ func (c *Client) GetPullRequestFromRepo(ctx context.Context, owner, repo string,
 	return pr, nil
 }
 
+// GetPullRequestByBranch finds an open PR for the given head branch.
+func (c *Client) GetPullRequestByBranch(ctx context.Context, branch string) (PullRequest, error) {
+	var prs []PullRequest
+	path := fmt.Sprintf("repos/%s/%s/pulls?state=open&head=%s:%s&per_page=1", c.owner, c.repo, c.owner, branch)
+	err := c.rest.Get(path, &prs)
+	if err != nil {
+		return PullRequest{}, fmt.Errorf("finding PR for branch %s: %w", branch, err)
+	}
+	if len(prs) == 0 {
+		return PullRequest{}, fmt.Errorf("no open PR found for branch %s", branch)
+	}
+	return prs[0], nil
+}
+
 func (c *Client) GetPullRequest(ctx context.Context, number int) (PullRequest, error) {
 	var pr PullRequest
 	path := fmt.Sprintf("repos/%s/%s/pulls/%d", c.owner, c.repo, number)

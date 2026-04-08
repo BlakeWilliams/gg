@@ -77,8 +77,9 @@ type Model struct {
 	// Diff cursor.
 	diffCursor      int
 	selectionAnchor int
-	fileDiffs       [][]components.DiffLine
-	fileDiffOffsets [][]int
+	fileDiffs            [][]components.DiffLine
+	fileDiffOffsets      [][]int
+	fileCommentPositions [][]components.CommentPosition
 
 	// Copilot.
 	copilot            *copilot.Client
@@ -334,6 +335,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		m.renderedFiles = make([]string, len(msg.files))
 		m.fileDiffs = make([][]components.DiffLine, len(msg.files))
 		m.fileDiffOffsets = make([][]int, len(msg.files))
+		m.fileCommentPositions = make([][]components.CommentPosition, len(msg.files))
 		m.filesListLoaded = true
 
 		// Reuse cached highlights for files whose patch hasn't changed.
@@ -346,6 +348,11 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 					m.renderedFiles[i] = oldRendered[f.Filename]
 					continue
 				}
+			}
+			// Keep stale rendered content so the viewport doesn't flash
+			// a skeleton while the new highlight is in progress.
+			if rendered, ok := oldRendered[f.Filename]; ok {
+				m.renderedFiles[i] = rendered
 			}
 			needHighlight = append(needHighlight, i)
 		}
@@ -420,9 +427,9 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	case copilot.ReplyMsg:
 		m.copilotReplyBuf[msg.CommentID] += msg.Content
 		if msg.Done {
-			// Create the final copilot comment.
 			body := m.copilotReplyBuf[msg.CommentID]
 			delete(m.copilotReplyBuf, msg.CommentID)
+			pendingPath := m.copilotPendingPath
 			m.copilotPendingFor = ""
 			if body != "" {
 				for _, c := range m.commentStore.Comments {
@@ -442,16 +449,18 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 					}
 				}
 			}
-			m.reformatAllFiles()
+			// Only re-render the affected file.
+			if fileIdx := m.fileIndexForPath(pendingPath); fileIdx >= 0 {
+				m.formatFile(fileIdx)
+			}
 			m.rebuildContent()
-		} else {
-			// Streaming — show partial content in-line.
-			m.reformatAllFiles()
+		} else if fileIdx := m.fileIndexForPath(m.copilotPendingPath); fileIdx >= 0 && fileIdx == m.currentFileIdx {
+			// Streaming delta — only re-render if we're looking at this file.
+			m.formatFile(fileIdx)
 			m.rebuildContent()
 		}
 		cmds := []tea.Cmd{m.copilot.ListenCmd()}
 		if m.copilotPendingFor != "" {
-			// Keep the dots animation going while streaming.
 			cmds = append(cmds, tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg {
 				return copilotTickMsg{}
 			}))
@@ -460,7 +469,10 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 
 	case copilot.ErrorMsg:
 		m.copilotPendingFor = ""
-		m.reformatAllFiles()
+		// Only re-render the affected file.
+		if fileIdx := m.fileIndexForPath(m.copilotPendingPath); fileIdx >= 0 {
+			m.formatFile(fileIdx)
+		}
 		m.rebuildContent()
 		cmds := []tea.Cmd{}
 		if m.copilot != nil {
@@ -471,8 +483,11 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	case copilotTickMsg:
 		if m.copilotPendingFor != "" {
 			m.copilotDots = (m.copilotDots + 1) % 4
-			m.reformatAllFiles()
-			m.rebuildContent()
+			// Only re-render if the pending file is currently visible.
+			if fileIdx := m.fileIndexForPath(m.copilotPendingPath); fileIdx >= 0 && fileIdx == m.currentFileIdx {
+				m.formatFile(fileIdx)
+				m.rebuildContent()
+			}
 			return m, tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg {
 				return copilotTickMsg{}
 			})
@@ -771,7 +786,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 func (m Model) StatusHints() (left, right []string) {
 	if m.composing {
 		left = append(left, styles.StatusBarKey.Render("esc")+" "+styles.StatusBarHint.Render("cancel"))
-		right = append(right, styles.StatusBarKey.Render("alt+enter")+" "+styles.StatusBarHint.Render("submit"))
+		right = append(right, styles.StatusBarKey.Render("enter")+" "+styles.StatusBarHint.Render("submit"))
 		return
 	}
 	if m.treeFocused {
@@ -1086,6 +1101,9 @@ func (m *Model) formatFile(index int) {
 	if index < len(m.fileDiffOffsets) {
 		m.fileDiffOffsets[index] = result.DiffLineOffsets
 	}
+	if index < len(m.fileCommentPositions) {
+		m.fileCommentPositions[index] = result.CommentPositions
+	}
 }
 
 func (m Model) commentsForFile(filename string) []github.ReviewComment {
@@ -1108,7 +1126,7 @@ func (m Model) commentsForFile(filename string) []github.ReviewComment {
 		dots := strings.Repeat(".", m.copilotDots+1)
 		body := m.copilotReplyBuf[m.copilotPendingFor]
 		if body == "" {
-			body = "Copilot is thinking" + dots
+			body = "Thinking" + dots
 		} else {
 			body = body + dots
 		}
@@ -1383,6 +1401,7 @@ func (m Model) hasDiffLines() bool {
 func (m *Model) moveDiffCursor(delta int) {
 	m.threadCursor = 0
 	lines := m.fileDiffs[m.currentFileIdx]
+	oldPos := m.diffCursor
 	newPos := m.diffCursor + delta
 
 	for newPos >= 0 && newPos < len(lines) && lines[newPos].Type == components.LineHunk {
@@ -1393,9 +1412,36 @@ func (m *Model) moveDiffCursor(delta int) {
 		return
 	}
 	m.diffCursor = newPos
-	m.formatFile(m.currentFileIdx)
-	m.rebuildContent()
+
+	// Only re-format if moving to/from a line with comments (for highlight update).
+	if m.lineHasComments(oldPos) || m.lineHasComments(newPos) {
+		m.formatFile(m.currentFileIdx)
+		m.rebuildContent()
+	}
 	m.scrollToDiffCursor()
+}
+
+// lineHasComments returns true if the diff line at the given index has a comment thread.
+func (m Model) lineHasComments(diffIdx int) bool {
+	idx := m.currentFileIdx
+	if idx < 0 || idx >= len(m.fileDiffs) || diffIdx < 0 || diffIdx >= len(m.fileDiffs[idx]) {
+		return false
+	}
+	dl := m.fileDiffs[idx][diffIdx]
+	if dl.Type == components.LineHunk {
+		return false
+	}
+	path := m.files[idx].Filename
+	var line int
+	var side string
+	if dl.Type == components.LineDel {
+		line = dl.OldLineNo
+		side = "LEFT"
+	} else {
+		line = dl.NewLineNo
+		side = "RIGHT"
+	}
+	return m.commentStore != nil && m.commentStore.FindThreadRoot(path, line, side) != ""
 }
 
 func (m *Model) moveDiffCursorBy(delta int) {
@@ -1437,9 +1483,12 @@ func (m *Model) moveDiffCursorBy(delta int) {
 		}
 	}
 
+	oldPos := m.diffCursor
 	m.diffCursor = newPos
-	m.formatFile(m.currentFileIdx)
-	m.rebuildContent()
+	if m.lineHasComments(oldPos) || m.lineHasComments(newPos) {
+		m.formatFile(m.currentFileIdx)
+		m.rebuildContent()
+	}
 	m.scrollToDiffCursor()
 }
 
@@ -1487,41 +1536,32 @@ func (m Model) threadCommentCount() int {
 // updateThreadCountForCursor is a no-op placeholder; threadCommentCount reads live.
 func (m *Model) updateThreadCountForCursor() {}
 
-// scrollToThreadCursor scrolls the viewport to show the Nth comment in the
-// thread below the current diff line.
+// scrollToThreadCursor scrolls the viewport to show the selected comment
+// using the exact rendered positions tracked by CommentPositions.
 func (m *Model) scrollToThreadCursor() {
 	idx := m.currentFileIdx
-	if idx < 0 || idx >= len(m.fileDiffOffsets) || m.diffCursor >= len(m.fileDiffOffsets[idx]) {
+	if idx < 0 || idx >= len(m.fileCommentPositions) {
 		return
 	}
 
-	// The diff line's rendered offset.
-	diffLineOffset := m.fileDiffOffsets[idx][m.diffCursor]
-
-	// Find the next diff line's offset to know the thread's rendered range.
-	nextDiffOffset := diffLineOffset + 1
-	for i := m.diffCursor + 1; i < len(m.fileDiffOffsets[idx]); i++ {
-		nextDiffOffset = m.fileDiffOffsets[idx][i]
-		break
-	}
-
-	// The thread content starts after the diff line and occupies the space
-	// between this diff line and the next. Each comment has a header + body lines.
-	// Estimate: divide the thread region evenly among comments, scroll to the Nth.
-	threadHeight := nextDiffOffset - diffLineOffset - 1
-	count := m.threadCommentCount()
-	if count <= 0 || threadHeight <= 0 {
+	// Find the comment position matching the current cursor line and threadCursor.
+	path, line, side, ok := m.cursorThreadInfo()
+	if !ok {
 		return
 	}
 
-	// Target: the rendered line for the Nth comment (1-indexed).
-	linesPerComment := threadHeight / count
-	if linesPerComment < 1 {
-		linesPerComment = 1
+	targetLine := -1
+	for _, cp := range m.fileCommentPositions[idx] {
+		if cp.Line == line && cp.Side == side && cp.Idx == m.threadCursor-1 {
+			targetLine = cp.Offset
+			break
+		}
 	}
-	targetLine := diffLineOffset + 1 + (m.threadCursor-1)*linesPerComment
+	if targetLine < 0 {
+		_ = path // suppress unused
+		return
+	}
 
-	// Scroll so the target comment header is near the top of the viewport.
 	top := m.vp.YOffset()
 	bottom := top + m.height - 1
 
@@ -1803,7 +1843,12 @@ func (m Model) handleCommentKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		m.selectionAnchor = -1
 		m.rebuildContent()
 		return m, nil, true
-	case "alt+enter":
+	case "shift+enter":
+		// Insert newline.
+		m.commentInput.InsertString("\n")
+		m.rebuildContent()
+		return m, nil, true
+	case "enter":
 		body := strings.TrimSpace(m.commentInput.Value())
 		if body == "" {
 			m.composing = false
@@ -2026,13 +2071,24 @@ func (m Model) renderCommentBox() string {
 	}
 	boxLines = append(boxLines, indent+bottomRule)
 
-	left := dimStyle.Render("esc cancel")
-	right := dimStyle.Render("alt+enter submit")
-	hintGap := boxW - lipgloss.Width(left) - lipgloss.Width(right)
+	colors := m.ctx.DiffColors
+	cancelBtn := lipgloss.NewStyle().
+		Foreground(colors.PaletteDim).
+		Padding(0, 1).
+		Render("Cancel")
+	submitBtn := lipgloss.NewStyle().
+		Background(colors.PaletteGreen).
+		Foreground(colors.PaletteBg).
+		Bold(true).
+		Padding(0, 1).
+		Render("Submit")
+
+	buttons := cancelBtn + " " + submitBtn
+	hintGap := boxW - lipgloss.Width(buttons)
 	if hintGap < 1 {
 		hintGap = 1
 	}
-	boxLines = append(boxLines, indent+" "+left+strings.Repeat(" ", hintGap)+right)
+	boxLines = append(boxLines, indent+" "+strings.Repeat(" ", hintGap)+buttons)
 
 	return strings.Join(boxLines, "\n")
 }
@@ -2187,6 +2243,16 @@ func (m Model) getThreadHistory(c localdiff.LocalComment) []string {
 }
 
 // getFullFileDiff returns the complete patch for a file.
+// fileIndexForPath returns the index of the file with the given path, or -1.
+func (m Model) fileIndexForPath(path string) int {
+	for i, f := range m.files {
+		if f.Filename == path {
+			return i
+		}
+	}
+	return -1
+}
+
 func (m Model) getFullFileDiff(path string) string {
 	for _, f := range m.files {
 		if f.Filename == path {

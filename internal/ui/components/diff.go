@@ -43,10 +43,19 @@ var (
 	borderStyle   = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
 )
 
+// CommentPosition records the rendered line offset for a comment in a thread.
+type CommentPosition struct {
+	Line int    // diff line number (source)
+	Side string // "LEFT" or "RIGHT"
+	Idx  int    // 0-based index within the thread
+	Offset int  // rendered line index where this comment's header starts
+}
+
 // DiffRenderResult holds the rendered diff string and metadata about line positions.
 type DiffRenderResult struct {
-	Content         string // the full rendered string
-	DiffLineOffsets []int  // rendered line index for each diff line (0-based from start of Content)
+	Content          string            // the full rendered string
+	DiffLineOffsets  []int             // rendered line index for each diff line (0-based from start of Content)
+	CommentPositions []CommentPosition // rendered positions of each comment header
 }
 
 // HighlightedDiff holds pre-highlighted diff data that is width-independent.
@@ -129,6 +138,7 @@ func FormatDiffFile(hd HighlightedDiff, width int, colors styles.DiffColors, com
 	}
 
 	var b strings.Builder
+	var positions []CommentPosition
 	renderedLineIdx := 0
 
 	offsets := make([]int, len(diffLines))
@@ -154,17 +164,28 @@ func FormatDiffFile(hd HighlightedDiff, width int, colors styles.DiffColors, com
 				highlighted := ck.Line == opt.HighlightThreadLine && ck.Side == opt.HighlightThreadSide
 				hlIdx := 0
 				if highlighted {
-					hlIdx = opt.HighlightCommentIndex // 0=whole thread, >0=single comment
+					hlIdx = opt.HighlightCommentIndex
 				}
-				threadStr := renderCommentThread(threads, width, dl.Type, colors, highlighted, hlIdx, colors.HighlightBorderFg, opt.RenderBody)
-				for _, tl := range strings.Split(strings.TrimRight(threadStr, "\n"), "\n") {
+				result := renderCommentThread(threads, width, dl.Type, colors, highlighted, hlIdx, colors.HighlightBorderFg, opt.RenderBody)
+				// Record comment positions.
+				lineInThread := 0
+				for ci, cl := range result.commentLines {
+					positions = append(positions, CommentPosition{
+						Line:   ck.Line,
+						Side:   ck.Side,
+						Idx:    ci,
+						Offset: renderedLineIdx + lineInThread,
+					})
+					lineInThread += cl
+				}
+				for _, tl := range strings.Split(strings.TrimRight(result.content, "\n"), "\n") {
 					b.WriteString(tl + "\n")
 					renderedLineIdx++
 				}
 			}
 		}
 	}
-	return DiffRenderResult{Content: strings.TrimRight(b.String(), "\n"), DiffLineOffsets: offsets}
+	return DiffRenderResult{Content: strings.TrimRight(b.String(), "\n"), DiffLineOffsets: offsets, CommentPositions: positions}
 }
 
 // RenderDiffFile is a convenience that highlights and formats in one call.
@@ -593,9 +614,15 @@ func emptyLine(bg string, width int) string {
 // It inherits the background color from the line type (add/del/context) and uses
 // the line's fg color for borders to make the comment box stand out.
 // When highlighted is true, the border uses yellow instead of the dim default.
+// commentThreadResult holds the rendered thread string and per-comment line counts.
+type commentThreadResult struct {
+	content       string
+	commentLines  []int // rendered line count for each comment (header + body)
+}
+
 // renderCommentThread renders a thread of review comments.
 // hlIdx: 0 = highlight whole thread (or none if !highlighted), >0 = highlight only that 1-indexed comment.
-func renderCommentThread(comments []github.ReviewComment, width int, lt LineType, colors styles.DiffColors, highlighted bool, hlIdx int, hlBorderFg string, renderBody func(string, int, string) string) string {
+func renderCommentThread(comments []github.ReviewComment, width int, lt LineType, colors styles.DiffColors, highlighted bool, hlIdx int, hlBorderFg string, renderBody func(string, int, string) string) commentThreadResult {
 	bg := bgForLineType(lt, colors)
 	defaultBorderFg := colors.BorderFg
 	// If highlighting the whole thread (hlIdx==0), use highlight color for all borders.
@@ -611,11 +638,16 @@ func renderCommentThread(comments []github.ReviewComment, width int, lt LineType
 	}
 
 	var b strings.Builder
+	var commentLineCounts []int
+	lineCount := 0
 
 	// Blank line above.
 	b.WriteString(emptyLine(bg, width))
+	lineCount++
 
 	for i, c := range comments {
+		commentStart := lineCount
+
 		// Per-comment border color: highlight only the selected comment.
 		borderFg := threadBorderFg
 		if highlighted && hlIdx > 0 {
@@ -652,6 +684,7 @@ func renderCommentThread(comments []github.ReviewComment, width int, lt LineType
 			borderFg + strings.Repeat("─", fillW) + right + "\033[0m"
 		b.WriteString(padWithBg(topLine, width, bg))
 		b.WriteString("\n")
+		lineCount++
 
 		// Body lines: │ text │
 		innerW := contentW - 4 // "│ " + " │"
@@ -677,7 +710,10 @@ func renderCommentThread(comments []github.ReviewComment, width int, lt LineType
 				borderFg + "│" + "\033[0m"
 			b.WriteString(padWithBg(content, width, bg))
 			b.WriteString("\n")
+			lineCount++
 		}
+
+		commentLineCounts = append(commentLineCounts, lineCount-commentStart)
 	}
 
 	// Bottom border uses the last comment's border color.
@@ -699,8 +735,13 @@ func renderCommentThread(comments []github.ReviewComment, width int, lt LineType
 
 	// Blank line below.
 	b.WriteString(emptyLine(bg, width))
+	lineCount++ // bottom border
+	lineCount++ // blank line below
 
-	return b.String()
+	return commentThreadResult{
+		content:      b.String(),
+		commentLines: commentLineCounts,
+	}
 }
 
 // wrapText wraps text to the given width, splitting on whitespace.

@@ -415,6 +415,17 @@ type PRLoadedMsg struct {
 	PR PullRequest
 }
 
+// FetchPRByBranch returns a tea.Cmd that finds an open PR for the given branch.
+func (c *CachedClient) FetchPRByBranch(branch string) tea.Cmd {
+	return func() tea.Msg {
+		pr, err := c.client.GetPullRequestByBranch(context.Background(), branch)
+		if err != nil {
+			return QueryErrMsg{Err: err}
+		}
+		return PRLoadedMsg{PR: pr}
+	}
+}
+
 // InvalidatePR removes cached data for a specific PR.
 func (c *CachedClient) InvalidatePR(number int) {
 	c.cache.Invalidate(fmt.Sprintf("pull:%d", number))
