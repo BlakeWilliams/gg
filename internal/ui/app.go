@@ -5,11 +5,14 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/blakewilliams/ghq/internal/git"
 	"github.com/blakewilliams/ghq/internal/github"
 	"github.com/blakewilliams/ghq/internal/terminal"
+	"github.com/blakewilliams/ghq/internal/copilot"
 	"github.com/blakewilliams/ghq/internal/ui/commandbar"
+	"github.com/blakewilliams/ghq/internal/ui/copilotchat"
 	"github.com/blakewilliams/ghq/internal/ui/home"
 	"github.com/blakewilliams/ghq/internal/ui/localdiff"
 	"github.com/blakewilliams/ghq/internal/ui/picker"
@@ -23,11 +26,13 @@ import (
 )
 
 type inputMode int
+type quitTimeoutMsg struct{}
 
 const (
 	modeNormal inputMode = iota
 	modeCommand
 	modePicker
+	modeCopilotChat
 )
 
 const chromeHeight = 2
@@ -40,8 +45,13 @@ type Model struct {
 	forward    []uictx.View // forward stack (views we went back from)
 	mode       inputMode
 	commandBar commandbar.Model
-	picker     picker.Model
+	picker      picker.Model
+	pickerKind  string // "command", "help", "view" — routes ResultMsg
+	copilotChat    copilotchat.Model
+	chatClient     *copilot.Client // shared copilot client for chat
+	chatInitialized bool
 	ctx        *uictx.Context
+	quitPending bool // true after first ctrl+c
 	palette    terminal.Palette
 	repoRoot   string // local git repo root, if any
 	width      int
@@ -123,11 +133,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mode = modeNormal
 		return m, nil
 
+	case quitTimeoutMsg:
+		m.quitPending = false
+		return m, nil
+
 	case tea.KeyPressMsg:
 		// Hard globals — always handled regardless of view/mode.
 		if msg.String() == "ctrl+c" {
-			return m, tea.Quit
+			if m.quitPending {
+				return m, tea.Quit
+			}
+			m.quitPending = true
+			return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
+				return quitTimeoutMsg{}
+			})
 		}
+		// Any other key resets quit pending.
+		m.quitPending = false
 
 		// Command mode owns all input.
 		if m.mode == modeCommand {
@@ -143,6 +165,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
+		// Copilot chat mode owns all input.
+		if m.mode == modeCopilotChat {
+			var cmd tea.Cmd
+			m.copilotChat, cmd = m.copilotChat.Update(msg)
+			return m, cmd
+		}
+
 		// Delegate to active view first.
 		view, cmd, handled := m.activeView.HandleKey(msg)
 		if handled {
@@ -154,12 +183,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case ":", "ctrl+t":
 			m.mode = modePicker
+			m.pickerKind = "command"
 			m.picker = picker.New("Commands", m.commandPickerItems(), m.pickerInnerWidth(), m.height-chromeHeight)
 			return m, nil
 		case "?":
 			m.mode = modePicker
+			m.pickerKind = "help"
 			m.picker = picker.New("Help", m.helpPickerItems(), m.pickerInnerWidth(), m.height-chromeHeight)
 			return m, nil
+		case "C":
+			return m.openCopilotChat()
+		case "m":
+			// In prdetail, m goes back to localdiff.
+			if _, ok := m.activeView.(prdetail.Model); ok && m.repoRoot != "" {
+				if len(m.history) > 0 {
+					return m.navigateBack()
+				}
+			}
 		case "<":
 			if len(m.history) > 0 {
 				return m.navigateBack()
@@ -172,18 +212,77 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case picker.ResultMsg:
 		m.mode = modeNormal
-		if msg.Selected && msg.Value != "" {
-			return m.handleCommand(commandbar.CommandMsg{Command: msg.Value})
-		}
-		// If no item was selected but query is a number, jump to that line
+		kind := m.pickerKind
+		m.pickerKind = ""
+
 		if !msg.Selected && msg.Value != "" {
+			// Raw query — try line number.
 			if lineNo, err := strconv.Atoi(msg.Value); err == nil && lineNo > 0 {
 				var cmd tea.Cmd
 				m.activeView, cmd = m.activeView.Update(localdiff.GoToLineMsg{Line: lineNo})
 				return m, cmd
 			}
 		}
+		if !msg.Selected || msg.Value == "" {
+			return m, nil
+		}
+
+		switch kind {
+		case "command":
+			return m.handleCommand(commandbar.CommandMsg{Command: msg.Value})
+		case "view":
+			return m.handleViewPickerResult(msg.Value)
+		}
 		return m, nil
+
+	case copilotchat.CloseMsg:
+		m.mode = modeNormal
+		return m, nil
+
+	case localdiff.OpenViewPickerMsg:
+		m.mode = modePicker
+		m.pickerKind = "view"
+		m.picker = picker.New("View", msg.Items, m.pickerInnerWidth(), m.height-chromeHeight)
+		return m, nil
+
+	case localdiff.SwitchToPRMsg:
+		m.history = append(m.history, m.activeView)
+		m.forward = nil
+		if owner := msg.PR.RepoOwner(); owner != "" {
+			m.ctx.Client.SetRepo(owner, msg.PR.RepoName())
+		}
+		m.activeView = m.newPRDetail(msg.PR)
+		return m, m.activeView.Init()
+
+	// Route copilot messages by comment ID — "chat" goes to chat, others to active view.
+	case copilot.ReplyMsg:
+		if msg.CommentID == "chat" {
+			var cmd tea.Cmd
+			m.copilotChat, cmd = m.copilotChat.Update(msg)
+			return m, cmd
+		}
+		// Inline comment reply — forward to active view.
+		var cmd tea.Cmd
+		m.activeView, cmd = m.activeView.Update(msg)
+		return m, cmd
+
+	case copilot.ErrorMsg:
+		if msg.CommentID == "chat" {
+			var cmd tea.Cmd
+			m.copilotChat, cmd = m.copilotChat.Update(msg)
+			return m, cmd
+		}
+		var cmd tea.Cmd
+		m.activeView, cmd = m.activeView.Update(msg)
+		return m, cmd
+
+	case copilot.ToolMsg:
+		if msg.CommentID == "chat" {
+			var cmd tea.Cmd
+			m.copilotChat, cmd = m.copilotChat.Update(msg)
+			return m, cmd
+		}
+		return m, nil // ignore tool events for inline comments
 
 	default:
 		if m.mode == modeCommand {
@@ -194,6 +293,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode == modePicker {
 			var cmd tea.Cmd
 			m.picker, cmd = m.picker.Update(msg)
+			return m, cmd
+		}
+		if m.mode == modeCopilotChat {
+			var cmd tea.Cmd
+			m.copilotChat, cmd = m.copilotChat.Update(msg)
 			return m, cmd
 		}
 
@@ -212,13 +316,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if owner := msg.PR.RepoOwner(); owner != "" {
 			m.ctx.Client.SetRepo(owner, msg.PR.RepoName())
 		}
-		m.activeView = prdetail.New(msg.PR, m.ctx, m.width, m.height-chromeHeight)
+		m.activeView = m.newPRDetail(msg.PR)
 		return m, m.activeView.Init()
 
 	case prlist.PRSelectedMsg:
 		m.history = append(m.history, m.activeView)
 		m.forward = nil
-		m.activeView = prdetail.New(msg.PR, m.ctx, m.width, m.height-chromeHeight)
+		m.activeView = m.newPRDetail(msg.PR)
 		return m, m.activeView.Init()
 	}
 
@@ -336,13 +440,17 @@ func (m Model) View() tea.View {
 
 	content := lipgloss.NewStyle().Height(contentHeight).Render(m.activeView.View())
 
-	// Overlay picker modal if open.
+	// Overlay modals if open.
 	if m.mode == modePicker {
 		content = m.renderPickerOverlay(content, contentHeight)
+	} else if m.mode == modeCopilotChat {
+		content = m.renderChatOverlay(content, contentHeight)
 	}
 
 	var bar string
-	if m.mode == modeCommand {
+	if m.quitPending {
+		bar = styles.StatusBarKey.Render("Press ctrl+c again to quit")
+	} else if m.mode == modeCommand {
 		bar = m.commandBar.View()
 	} else {
 		bar = m.renderStatusBar()
@@ -430,6 +538,179 @@ func formatHints(hints []string) string {
 
 func hint(key, desc string) string {
 	return styles.StatusBarKey.Render(key) + " " + styles.StatusBarHint.Render(desc)
+}
+
+// newPRDetail creates a prdetail.Model and sets local context if applicable.
+func (m Model) newPRDetail(pr github.PullRequest) prdetail.Model {
+	pd := prdetail.New(pr, m.ctx, m.width, m.height-chromeHeight)
+	if m.repoRoot != "" {
+		branch, _ := git.CurrentBranch(m.repoRoot)
+		if branch == pr.Head.Ref {
+			pd.SetLocalContext(m.repoRoot)
+		}
+	}
+	return pd
+}
+
+func (m Model) handleViewPickerResult(value string) (tea.Model, tea.Cmd) {
+	switch value {
+	case "working":
+		var cmd tea.Cmd
+		m.activeView, cmd = m.activeView.Update(localdiff.SwitchModeMsg{Mode: git.DiffWorking})
+		return m, cmd
+	case "staged":
+		var cmd tea.Cmd
+		m.activeView, cmd = m.activeView.Update(localdiff.SwitchModeMsg{Mode: git.DiffStaged})
+		return m, cmd
+	case "branch":
+		var cmd tea.Cmd
+		m.activeView, cmd = m.activeView.Update(localdiff.SwitchModeMsg{Mode: git.DiffBranch})
+		return m, cmd
+	case "pr":
+		if ld, ok := m.activeView.(localdiff.Model); ok && ld.PR() != nil {
+			m.history = append(m.history, m.activeView)
+			m.forward = nil
+			pr := *ld.PR()
+			if owner := pr.RepoOwner(); owner != "" {
+				m.ctx.Client.SetRepo(owner, pr.RepoName())
+			}
+			m.activeView = m.newPRDetail(pr)
+			return m, m.activeView.Init()
+		}
+	}
+	return m, nil
+}
+
+func (m Model) openCopilotChat() (tea.Model, tea.Cmd) {
+	// Create or reuse copilot client.
+	if m.chatClient == nil {
+		repoRoot := m.repoRoot
+		if repoRoot == "" {
+			repoRoot = "."
+		}
+		cp, err := copilot.New(repoRoot)
+		if err != nil {
+			return m, nil
+		}
+		m.chatClient = cp
+	}
+
+	// Build diff context from the active view.
+	ctx := copilotchat.DiffContext{
+		RepoRoot: m.repoRoot,
+	}
+	switch v := m.activeView.(type) {
+	case localdiff.Model:
+		ctx.Files = v.Files()
+		ctx.Branch = v.BranchName()
+		if v.PR() != nil {
+			ctx.PRNumber = v.PR().Number
+		}
+	case prdetail.Model:
+		ctx.Files = v.Files()
+		ctx.PRNumber = v.PRNumber()
+	}
+
+	chatW := m.width * 2 / 3
+	if chatW < 50 {
+		chatW = 50
+	}
+	chatH := m.height * 2 / 3
+	if chatH > m.height-chromeHeight-4 {
+		chatH = m.height - chromeHeight - 4
+	}
+	if chatH < 10 {
+		chatH = 10
+	}
+
+	if !m.chatInitialized {
+		m.copilotChat = copilotchat.New(m.chatClient, ctx, m.ctx.Username, chatW-4, chatH)
+		m.chatInitialized = true
+	}
+	m.mode = modeCopilotChat
+	cmds := []tea.Cmd{m.chatClient.ListenCmd()}
+	// Restart spinner if chat is still waiting for a response.
+	if resume := m.copilotChat.ResumeCmd(); resume != nil {
+		cmds = append(cmds, resume)
+	}
+	return m, tea.Batch(cmds...)
+}
+
+func (m Model) renderChatOverlay(bg string, bgHeight int) string {
+	chatView := m.copilotChat.View()
+	chatLines := strings.Split(chatView, "\n")
+
+	modalW := m.width * 2 / 3
+	if modalW < 50 {
+		modalW = 50
+	}
+	if modalW > m.width-4 {
+		modalW = m.width - 4
+	}
+	innerW := modalW - 4
+	modalH := len(chatLines) + 2
+
+	padY := (bgHeight - modalH) / 3
+	if padY < 1 {
+		padY = 1
+	}
+
+	bc := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
+	titleStr := " " + lipgloss.NewStyle().Bold(true).Render("Copilot") + " "
+	titleW := lipgloss.Width(titleStr)
+	fillW := modalW - 3 - titleW
+	if fillW < 0 {
+		fillW = 0
+	}
+	topBorder := bc.Render("╭─") + titleStr + bc.Render(strings.Repeat("─", fillW)+"╮")
+	bw := modalW - 2
+	if bw < 0 {
+		bw = 0
+	}
+	bottomBorder := bc.Render("╰" + strings.Repeat("─", bw) + "╯")
+	side := bc.Render("│")
+
+	var modalLines []string
+	modalLines = append(modalLines, topBorder)
+	for _, cl := range chatLines {
+		clW := lipgloss.Width(cl)
+		pad := innerW - clW
+		if pad < 0 {
+			pad = 0
+		}
+		modalLines = append(modalLines, side+" "+cl+strings.Repeat(" ", pad)+" "+side)
+	}
+	modalLines = append(modalLines, bottomBorder)
+
+	bgLines := strings.Split(bg, "\n")
+	padX := (m.width - modalW) / 2
+	rightStart := padX + modalW
+
+	for i, ml := range modalLines {
+		row := padY + i
+		if row >= 0 && row < len(bgLines) {
+			bgLine := bgLines[row]
+			bgW := lipgloss.Width(bgLine)
+
+			left := ""
+			if padX > 0 {
+				left = truncateVisible(bgLine, padX)
+				leftW := lipgloss.Width(left)
+				if leftW < padX {
+					left += strings.Repeat(" ", padX-leftW)
+				}
+			}
+
+			right := ""
+			if bgW > rightStart {
+				right = xansi.Cut(bgLine, rightStart, bgW)
+			}
+
+			bgLines[row] = left + "\033[0m" + ml + "\033[0m" + right
+		}
+	}
+
+	return strings.Join(bgLines, "\n")
 }
 
 func (m Model) commandPickerItems() []picker.Item {

@@ -45,17 +45,19 @@ func New(repoRoot string, changedDirs []string) (*Watcher, error) {
 	// Watch the repo root for top-level file changes.
 	fsw.Add(repoRoot)
 
-	// Watch directories that contain changed files.
-	seen := map[string]bool{repoRoot: true}
+	// Watch .git/refs/heads/ recursively to detect commits.
+	addDirRecursive(fsw, filepath.Join(repoRoot, ".git", "refs", "heads"))
+
+	// Watch all directories in the repo (excluding .git).
+	// This ensures we detect edits in any subdirectory.
+	addRepoDirectories(fsw, repoRoot)
+
+	// Also watch any extra dirs specified by the caller.
 	for _, dir := range changedDirs {
 		absDir := dir
 		if !filepath.IsAbs(dir) {
 			absDir = filepath.Join(repoRoot, dir)
 		}
-		if seen[absDir] {
-			continue
-		}
-		seen[absDir] = true
 		if info, err := os.Stat(absDir); err == nil && info.IsDir() {
 			fsw.Add(absDir)
 		}
@@ -114,10 +116,19 @@ func (w *Watcher) loop() {
 	}
 }
 
-// isGitInternal returns true for paths inside .git/.
+// isGitInternal returns true for paths inside .git/, except for
+// .git/refs/heads/ which we watch to detect commits.
 func isGitInternal(repoRoot, path string) bool {
 	gitDir := filepath.Join(repoRoot, ".git")
-	return strings.HasPrefix(path, gitDir+string(os.PathSeparator)) || path == gitDir
+	if !strings.HasPrefix(path, gitDir+string(os.PathSeparator)) && path != gitDir {
+		return false
+	}
+	// Allow refs/heads changes through (commit detection).
+	refsHeads := filepath.Join(gitDir, "refs", "heads")
+	if strings.HasPrefix(path, refsHeads) {
+		return false
+	}
+	return true
 }
 
 // WaitCmd returns a tea.Cmd that blocks until a file change is detected.
@@ -151,6 +162,42 @@ func (w *Watcher) Close() {
 	w.once.Do(func() {
 		close(w.done)
 		w.fsw.Close()
+	})
+}
+
+// addRepoDirectories walks the repo and adds all directories to the watcher,
+// skipping .git, node_modules, vendor, and other common non-source dirs.
+func addRepoDirectories(fsw *fsnotify.Watcher, repoRoot string) {
+	skipDirs := map[string]bool{
+		".git": true, "node_modules": true, "vendor": true,
+		".next": true, "dist": true, "build": true, "__pycache__": true,
+	}
+	filepath.Walk(repoRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !info.IsDir() {
+			return nil
+		}
+		base := filepath.Base(path)
+		if skipDirs[base] {
+			return filepath.SkipDir
+		}
+		fsw.Add(path)
+		return nil
+	})
+}
+
+// addDirRecursive adds a directory and all subdirectories to the watcher.
+func addDirRecursive(fsw *fsnotify.Watcher, dir string) {
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			fsw.Add(path)
+		}
+		return nil
 	})
 }
 

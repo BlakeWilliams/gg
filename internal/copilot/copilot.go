@@ -20,6 +20,13 @@ type ReplyMsg struct {
 	Done      bool
 }
 
+// ToolMsg signals a tool execution event.
+type ToolMsg struct {
+	CommentID string
+	Name      string
+	Done      bool
+}
+
 // ErrorMsg carries a Copilot error.
 type ErrorMsg struct {
 	CommentID string
@@ -38,6 +45,7 @@ type Client struct {
 	events           chan tea.Msg
 	activeCommentID  string // current comment being replied to
 	listenerAttached bool
+	lastSendAt       time.Time
 	log              *log.Logger
 }
 
@@ -91,7 +99,6 @@ func (c *Client) ListenCmd() tea.Cmd {
 // SendComment sends a comment with diff context to Copilot and streams back replies.
 func (c *Client) SendComment(commentID, body, filePath, fileContent, fullDiff, diffHunk string, threadHistory []string) tea.Cmd {
 	return func() tea.Msg {
-		// Wait for SDK to be ready, with a timeout.
 		select {
 		case <-c.ready:
 		case <-time.After(30 * time.Second):
@@ -105,6 +112,14 @@ func (c *Client) SendComment(commentID, body, filePath, fileContent, fullDiff, d
 
 		c.mu.Lock()
 		c.activeCommentID = commentID
+
+		// If session seems stuck (last send was > 2 min ago with no idle), reset it.
+		if c.session != nil && !c.lastSendAt.IsZero() && time.Since(c.lastSendAt) > 2*time.Minute {
+			c.log.Println("session appears stuck, resetting...")
+			c.session.Disconnect()
+			c.session = nil
+			c.listenerAttached = false
+		}
 
 		if c.session == nil {
 			c.log.Println("creating copilot session...")
@@ -132,6 +147,10 @@ func (c *Client) SendComment(commentID, body, filePath, fileContent, fullDiff, d
 		prompt := buildReviewPrompt(body, filePath, fileContent, fullDiff, diffHunk, threadHistory)
 		c.log.Printf("sending prompt (%d chars) for comment %s", len(prompt), commentID)
 
+		c.mu.Lock()
+		c.lastSendAt = time.Now()
+		c.mu.Unlock()
+
 		_, err := c.session.Send(c.ctx, sdk.MessageOptions{
 			Prompt: prompt,
 		})
@@ -141,6 +160,22 @@ func (c *Client) SendComment(commentID, body, filePath, fileContent, fullDiff, d
 		}
 
 		c.log.Println("session.Send returned successfully")
+
+		// Start a response timeout — if no events within 60s, error out.
+		go func() {
+			time.Sleep(60 * time.Second)
+			c.mu.Lock()
+			// Only fire timeout if this send is still active.
+			if c.activeCommentID == commentID && !c.lastSendAt.IsZero() {
+				c.log.Printf("response timeout for %s", commentID)
+				c.lastSendAt = time.Time{}
+				c.mu.Unlock()
+				c.events <- ErrorMsg{CommentID: commentID, Err: fmt.Errorf("copilot response timeout (60s)")}
+			} else {
+				c.mu.Unlock()
+			}
+		}()
+
 		return nil
 	}
 }
@@ -168,10 +203,19 @@ func (c *Client) setupListener() {
 				name = *event.Data.ToolName
 			}
 			c.log.Printf("tool start: %s", name)
+			c.events <- ToolMsg{CommentID: commentID, Name: name, Done: false}
 		case sdk.SessionEventTypeToolExecutionComplete:
-			c.log.Printf("tool complete")
+			name := ""
+			if event.Data.ToolName != nil {
+				name = *event.Data.ToolName
+			}
+			c.log.Printf("tool complete: %s", name)
+			c.events <- ToolMsg{CommentID: commentID, Name: name, Done: true}
 		case sdk.SessionEventTypeSessionIdle:
 			c.log.Printf("session idle for %s", commentID)
+			c.mu.Lock()
+			c.lastSendAt = time.Time{}
+			c.mu.Unlock()
 			c.events <- ReplyMsg{
 				CommentID: commentID,
 				Done:      true,

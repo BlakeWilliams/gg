@@ -51,13 +51,33 @@ func RepoRoot(dir string) (string, error) {
 }
 
 // CurrentBranch returns the current branch name.
+// On a repo with no commits yet, falls back to reading .git/HEAD directly.
 func CurrentBranch(dir string) (string, error) {
 	cmd := exec.Command("git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD")
 	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("git current branch: %w", err)
+	if err == nil {
+		branch := strings.TrimSpace(string(out))
+		if branch != "HEAD" {
+			return branch, nil
+		}
 	}
-	return strings.TrimSpace(string(out)), nil
+	// Fallback: read .git/HEAD for orphan branches (no commits yet).
+	headFile := filepath.Join(dir, ".git", "HEAD")
+	data, err := os.ReadFile(headFile)
+	if err != nil {
+		return "main", nil // ultimate fallback
+	}
+	ref := strings.TrimSpace(string(data))
+	if strings.HasPrefix(ref, "ref: refs/heads/") {
+		return strings.TrimPrefix(ref, "ref: refs/heads/"), nil
+	}
+	return "main", nil
+}
+
+// HasCommits returns true if the repo has at least one commit.
+func HasCommits(dir string) bool {
+	cmd := exec.Command("git", "-C", dir, "rev-parse", "HEAD")
+	return cmd.Run() == nil
 }
 
 // DefaultBranch tries to detect the default branch (main, master, etc.).
@@ -89,18 +109,26 @@ func DefaultBranch(dir string) (string, error) {
 func Diff(dir string, mode DiffMode) (string, error) {
 	var args []string
 
+	hasCommits := HasCommits(dir)
+
 	switch mode {
 	case DiffWorking:
-		args = []string{"-C", dir, "diff", "HEAD", "--no-color"}
+		if hasCommits {
+			args = []string{"-C", dir, "diff", "HEAD", "--no-color"}
+		} else {
+			// No commits yet — show staged files (everything that's been git add'd).
+			args = []string{"-C", dir, "diff", "--cached", "--no-color"}
+		}
 	case DiffStaged:
-		// Staged mode intentionally excludes untracked files.
 		args = []string{"-C", dir, "diff", "--cached", "--no-color"}
 	case DiffBranch:
+		if !hasCommits {
+			return "", nil // can't diff branches with no commits
+		}
 		defaultBranch, err := DefaultBranch(dir)
 		if err != nil {
 			return "", err
 		}
-		// Find merge base to get clean branch diff.
 		mbCmd := exec.Command("git", "-C", dir, "merge-base", defaultBranch, "HEAD")
 		mbOut, err := mbCmd.Output()
 		if err != nil {

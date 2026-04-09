@@ -8,10 +8,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blakewilliams/ghq/internal/comments"
+	"github.com/blakewilliams/ghq/internal/copilot"
+	"github.com/blakewilliams/ghq/internal/git"
 	"github.com/blakewilliams/ghq/internal/github"
+	"github.com/blakewilliams/ghq/internal/watcher"
 	"github.com/blakewilliams/ghq/internal/ui/components"
 	"github.com/blakewilliams/ghq/internal/ui/styles"
 	"github.com/blakewilliams/ghq/internal/ui/uictx"
+	"github.com/google/uuid"
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
@@ -126,27 +131,58 @@ type Model struct {
 	commentStartSide string // side of the first line for multi-line comments
 	replyToID        *int
 
+	// Copilot / local comments
+	localComments      *comments.CommentStore
+	copilotClient      *copilot.Client
+	copilotReplyBuf    map[string]string
+	copilotPendingFor  string
+	copilotPendingPath string
+	copilotPendingLine int
+	copilotPendingSide string
+	copilotDots        int
+	repoRoot           string // non-empty if branch is checked out locally
+	localBranch        bool   // true if PR branch == local branch
+	refWatcher         *watcher.RefWatcher
+	threadCursor       int
+	fileCommentPositions [][]components.CommentPosition
+
 	// Shared
 	filesListLoaded bool
 	waitingG        bool
 }
 
 func New(pr github.PullRequest, ctx *uictx.Context, width, height int) Model {
+	repoNWO := ""
+	if pr.Base.Repo != nil {
+		repoNWO = pr.Base.Repo.Owner.Login + "/" + pr.Base.Repo.Name
+	}
 	return Model{
 		pr:              pr,
 		ctx:             ctx,
 		width:           width,
 		height:          height,
-		currentFileIdx:  -1, // start on Overview
-		selectionAnchor: -1, // no selection
+		currentFileIdx:  -1,
+		selectionAnchor: -1,
 		treeWidth:       35,
-		treeFocused:     true, // start with tree focused
+		treeFocused:     true,
+		localComments:   comments.LoadComments(repoNWO),
+		copilotReplyBuf: make(map[string]string),
 	}
 }
 
-func (m Model) PRNumber() int {
-	return m.pr.Number
+// SetLocalContext enables local-aware features when the PR branch is checked out.
+func (m *Model) SetLocalContext(repoRoot string) {
+	m.repoRoot = repoRoot
+	m.localBranch = true
+	cp, _ := copilot.New(repoRoot)
+	m.copilotClient = cp
+	// Watch for pushes to trigger PR re-fetch.
+	rw, _ := watcher.NewRefWatcher(repoRoot, m.pr.Head.Ref)
+	m.refWatcher = rw
 }
+
+func (m Model) PRNumber() int                    { return m.pr.Number }
+func (m Model) Files() []github.PullRequestFile  { return m.files }
 
 func (m Model) PRTitle() string {
 	return m.pr.Title
@@ -199,6 +235,9 @@ func (m Model) StatusHints() (left, right []string) {
 	right = append(right, highlightHint("comments", "c"))
 	right = append(right, highlightHint("reviews", "r"))
 	right = append(right, highlightHint("checks", "s"))
+	if m.localBranch {
+		right = append(right, styles.StatusBarKey.Render("Local"))
+	}
 	return
 }
 
@@ -218,7 +257,7 @@ func (m Model) Init() tea.Cmd {
 	body := m.pr.Body
 	width := m.descWidth()
 	prNumber := m.pr.Number
-	return tea.Batch(
+	cmds := []tea.Cmd{
 		func() tea.Msg {
 			rendered := renderMarkdown(body, width)
 			return descRenderedMsg{content: rendered, prNumber: prNumber}
@@ -228,7 +267,14 @@ func (m Model) Init() tea.Cmd {
 		m.ctx.Client.GetIssueComments(m.pr.Number),
 		m.ctx.Client.GetReviewComments(m.pr.Number),
 		m.ctx.Client.GetCheckRuns(m.pr.Head.SHA),
-	)
+	}
+	if m.copilotClient != nil {
+		cmds = append(cmds, m.copilotClient.ListenCmd())
+	}
+	if m.refWatcher != nil {
+		cmds = append(cmds, m.refWatcher.WaitCmd())
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
@@ -337,6 +383,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		// Parse diff lines for each file (for cursor navigation).
 		m.fileDiffs = make([][]components.DiffLine, len(msg.Files))
 		m.fileDiffOffsets = make([][]int, len(msg.Files))
+		m.fileCommentPositions = make([][]components.CommentPosition, len(msg.Files))
 		for i, f := range msg.Files {
 			m.fileDiffs[i] = components.ParsePatchLines(f.Patch)
 		}
@@ -385,6 +432,85 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		return m, nil
 
 	case github.QueryErrMsg:
+		return m, nil
+
+	case copilot.ReplyMsg:
+		m.copilotReplyBuf[msg.CommentID] += msg.Content
+		if msg.Done {
+			body := m.copilotReplyBuf[msg.CommentID]
+			delete(m.copilotReplyBuf, msg.CommentID)
+			m.copilotPendingFor = ""
+			if body != "" {
+				for _, c := range m.localComments.Comments {
+					if c.ID == msg.CommentID {
+						reply := comments.LocalComment{
+							ID:          uuid.New().String(),
+							Body:        strings.TrimSpace(body),
+							Path:        c.Path,
+							Line:        c.Line,
+							Side:        c.Side,
+							InReplyToID: c.ID,
+							Author:      "copilot",
+							CreatedAt:   time.Now(),
+						}
+						m.localComments.Add(reply)
+						break
+					}
+				}
+			}
+			if fileIdx := m.fileIndexForPath(m.copilotPendingPath); fileIdx >= 0 && fileIdx == m.currentFileIdx {
+				m.formatFile(fileIdx)
+				m.rebuildContent()
+			}
+		} else if fileIdx := m.fileIndexForPath(m.copilotPendingPath); fileIdx >= 0 && fileIdx == m.currentFileIdx {
+			m.formatFile(fileIdx)
+			m.rebuildContent()
+		}
+		cmds := []tea.Cmd{}
+		if m.copilotClient != nil {
+			cmds = append(cmds, m.copilotClient.ListenCmd())
+		}
+		return m, tea.Batch(cmds...)
+
+	case copilot.ErrorMsg:
+		m.copilotPendingFor = ""
+		cmds := []tea.Cmd{}
+		if m.copilotClient != nil {
+			cmds = append(cmds, m.copilotClient.ListenCmd())
+		}
+		return m, tea.Batch(cmds...)
+
+	case watcher.RefChangedMsg:
+		// Branch ref changed — likely a push. Wait 2s for GitHub to process, then re-fetch.
+		return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
+			return refetchPRMsg{}
+		})
+
+	case refetchPRMsg:
+		// Invalidate and re-fetch PR data.
+		m.ctx.Client.InvalidatePR(m.pr.Number)
+		cmds := []tea.Cmd{
+			m.ctx.Client.GetPullRequestFiles(m.pr.Number),
+			m.ctx.Client.GetReviews(m.pr.Number),
+			m.ctx.Client.GetReviewComments(m.pr.Number),
+			m.ctx.Client.GetCheckRuns(m.pr.Head.SHA),
+		}
+		if m.refWatcher != nil {
+			cmds = append(cmds, m.refWatcher.WaitCmd())
+		}
+		return m, tea.Batch(cmds...)
+
+	case copilotTickMsg:
+		if m.copilotPendingFor != "" {
+			m.copilotDots = (m.copilotDots + 1) % 4
+			if fileIdx := m.fileIndexForPath(m.copilotPendingPath); fileIdx >= 0 && fileIdx == m.currentFileIdx {
+				m.formatFile(fileIdx)
+				m.rebuildContent()
+			}
+			return m, tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg {
+				return copilotTickMsg{}
+			})
+		}
 		return m, nil
 
 	case editorFinishedMsg:
@@ -814,6 +940,16 @@ func (m *Model) scrollToDiffCursor() {
 }
 
 // editorFinishedMsg is sent when $EDITOR exits.
+type copilotTickMsg struct{}
+type refetchPRMsg struct{}
+
+func (m Model) authorName() string {
+	if m.ctx.Username != "" {
+		return m.ctx.Username
+	}
+	return "you"
+}
+
 type editorFinishedMsg struct {
 	content string
 	err     error
@@ -826,8 +962,62 @@ func (m Model) handleCommentKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		m.selectionAnchor = -1
 		m.rebuildContent()
 		return m, nil, true
+	case "shift+enter":
+		m.commentInput.InsertString("\n")
+		m.rebuildContent()
+		return m, nil, true
+	case "enter":
+		// Submit as local comment + send to copilot.
+		body := strings.TrimSpace(m.commentInput.Value())
+		if body == "" {
+			m.composing = false
+			m.selectionAnchor = -1
+			m.rebuildContent()
+			return m, nil, true
+		}
+		m.composing = false
+
+		comment := comments.LocalComment{
+			ID:        uuid.New().String(),
+			Body:      body,
+			Path:      m.commentFile,
+			Line:      m.commentLine,
+			Side:      m.commentSide,
+			StartLine: m.commentStartLine,
+			StartSide: m.commentStartSide,
+			Author:    m.authorName(),
+			CreatedAt: time.Now(),
+		}
+		m.localComments.Add(comment)
+		m.selectionAnchor = -1
+		m.reformatAllFiles()
+		m.rebuildContent()
+
+		if m.copilotClient != nil {
+			m.copilotPendingFor = comment.ID
+			m.copilotPendingPath = comment.Path
+			m.copilotPendingLine = comment.Line
+			m.copilotPendingSide = comment.Side
+			m.copilotDots = 0
+			var fileContent string
+			if m.repoRoot != "" {
+				fileContent, _ = git.FileContent(m.repoRoot, comment.Path)
+			}
+			fullDiff := ""
+			for _, f := range m.files {
+				if f.Filename == comment.Path {
+					fullDiff = f.Patch
+					break
+				}
+			}
+			return m, tea.Batch(
+				m.copilotClient.SendComment(comment.ID, body, comment.Path, fileContent, fullDiff, "", nil),
+				tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg { return copilotTickMsg{} }),
+			), true
+		}
+		return m, nil, true
 	case "alt+enter":
-		// Submit comment.
+		// Submit comment to GitHub API.
 		body := strings.TrimSpace(m.commentInput.Value())
 		if body == "" {
 			m.composing = false
@@ -1811,17 +2001,23 @@ func (m Model) formatFile(index int) {
 	if index < len(m.fileDiffOffsets) {
 		m.fileDiffOffsets[index] = result.DiffLineOffsets
 	}
+	if index < len(m.fileCommentPositions) {
+		m.fileCommentPositions[index] = result.CommentPositions
+	}
 }
 
 // reformatAllFiles re-formats all highlighted files at the current width.
 // This is cheap (no Chroma) and used on resize.
 func (m *Model) reformatAllFiles() {
-	for i := 0; i < m.filesHighlighted; i++ {
-		m.formatFile(i)
+	for i := 0; i < len(m.files); i++ {
+		if i < len(m.highlightedFiles) && m.highlightedFiles[i].File.Filename != "" {
+			m.formatFile(i)
+		}
 	}
 }
 
-// commentsForFile returns review comments that belong to the given file.
+// commentsForFile returns review comments that belong to the given file,
+// merging GitHub review comments with local copilot comments.
 func (m Model) commentsForFile(filename string) []github.ReviewComment {
 	var result []github.ReviewComment
 	for _, c := range m.reviewComments {
@@ -1829,7 +2025,48 @@ func (m Model) commentsForFile(filename string) []github.ReviewComment {
 			result = append(result, c)
 		}
 	}
+
+	// Merge local/copilot comments.
+	if m.localComments != nil {
+		result = append(result, m.localComments.ForFile(filename)...)
+	}
+
+	// Add pending copilot reply.
+	if m.copilotPendingFor != "" && m.copilotPendingPath == filename {
+		dots := strings.Repeat(".", m.copilotDots+1)
+		body := m.copilotReplyBuf[m.copilotPendingFor]
+		if body == "" {
+			body = "Thinking" + dots
+		} else {
+			body = body + dots
+		}
+		line := m.copilotPendingLine
+		replyToInt := comments.IDToInt(m.copilotPendingFor)
+		pending := github.ReviewComment{
+			ID:           0,
+			Body:         body,
+			Path:         filename,
+			Line:         &line,
+			OriginalLine: &line,
+			Side:         m.copilotPendingSide,
+			InReplyToID:  &replyToInt,
+			User:         github.User{Login: "copilot"},
+			CreatedAt:    time.Now(),
+			UpdatedAt:    time.Now(),
+		}
+		result = append(result, pending)
+	}
+
 	return result
+}
+
+func (m Model) fileIndexForPath(path string) int {
+	for i, f := range m.files {
+		if f.Filename == path {
+			return i
+		}
+	}
+	return -1
 }
 
 

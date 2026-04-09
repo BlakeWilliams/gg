@@ -10,6 +10,7 @@ import (
 	"github.com/blakewilliams/ghq/internal/github"
 	"github.com/blakewilliams/ghq/internal/localdiff"
 	"github.com/blakewilliams/ghq/internal/ui/components"
+	"github.com/blakewilliams/ghq/internal/ui/picker"
 	"github.com/blakewilliams/ghq/internal/ui/styles"
 	"github.com/blakewilliams/ghq/internal/ui/uictx"
 	"github.com/blakewilliams/ghq/internal/watcher"
@@ -42,6 +43,21 @@ type copilotTickMsg struct{}
 // GoToLineMsg is sent from the command bar to jump to a source line number.
 type GoToLineMsg struct {
 	Line int
+}
+
+// SwitchToPRMsg is sent when the user selects the PR view from the mode picker.
+type SwitchToPRMsg struct {
+	PR github.PullRequest
+}
+
+// OpenViewPickerMsg is sent to app.go to open the view mode picker.
+type OpenViewPickerMsg struct {
+	Items []picker.Item
+}
+
+// SwitchModeMsg is sent from app.go back to localdiff to change the diff mode.
+type SwitchModeMsg struct {
+	Mode git.DiffMode
 }
 
 var dimStyle = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
@@ -117,6 +133,13 @@ type Model struct {
 	// 0 = on the diff line itself, 1 = first comment, 2 = second, etc.
 	threadCursor int
 
+	// PR detection.
+	pr       *github.PullRequest // nil if no PR for this branch
+	prLoaded bool                // true once checked
+
+	// Render cache.
+	lastContent string
+
 	// Shared.
 	filesListLoaded bool
 	waitingG        bool
@@ -150,8 +173,10 @@ func New(ctx *uictx.Context, repoRoot string, width, height int) Model {
 	}
 }
 
-func (m Model) BranchName() string     { return m.branch }
-func (m Model) DiffMode() git.DiffMode { return m.mode }
+func (m Model) BranchName() string              { return m.branch }
+func (m Model) DiffMode() git.DiffMode          { return m.mode }
+func (m Model) PR() *github.PullRequest         { return m.pr }
+func (m Model) Files() []github.PullRequestFile { return m.files }
 
 func (m Model) authorName() string {
 	if m.ctx.Username != "" {
@@ -253,6 +278,10 @@ func (m Model) Init() tea.Cmd {
 	}
 	if m.copilot != nil {
 		cmds = append(cmds, m.copilot.ListenCmd())
+	}
+	// Auto-detect PR for this branch.
+	if !m.prLoaded {
+		cmds = append(cmds, m.ctx.Client.FetchPRByBranch(m.branch))
 	}
 	return tea.Batch(cmds...)
 }
@@ -385,7 +414,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 			}
 		}
 
-		m.rebuildContent()
+		m.rebuildContentIfChanged()
 		// Preserve scroll position on file-watcher reloads (not initial load).
 		if m.savedFilename == "" && savedOffset > 0 {
 			m.vp.SetYOffset(savedOffset)
@@ -399,19 +428,39 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	case diffErrorMsg:
 		return m, nil
 
-	case watcher.FileChangedMsg:
-		// File changed on disk — re-run diff, then re-arm watcher after cooldown.
-		return m, tea.Batch(
-			m.loadDiff(),
-			m.watchAfterCooldown(),
-		)
+	case SwitchModeMsg:
+		m.saveViewState()
+		m.mode = msg.Mode
+		m.filesListLoaded = false
+		m.filesHighlighted = 0
+		m.filesLoading = true
+		m.currentFileIdx = -1
+		m.treeCursor = 0
+		vs := localdiff.LoadViewState(m.repoRoot, m.branch, m.mode)
+		m.savedFilename = vs.Filename
+		m.savedLineNo = vs.LineNo
+		m.savedSide = vs.Side
+		return m, m.loadDiff()
 
-	case watchReadyMsg:
-		// Cooldown elapsed — re-arm watcher.
-		if m.watcher != nil {
-			return m, m.watcher.WaitCmd()
+	case github.PRLoadedMsg:
+		m.pr = &msg.PR
+		m.prLoaded = true
+		return m, nil
+
+	case github.QueryErrMsg:
+		// Could be PR detection failure — just mark as checked.
+		if !m.prLoaded {
+			m.prLoaded = true
 		}
 		return m, nil
+
+	case watcher.FileChangedMsg:
+		// File changed on disk — re-run diff and immediately re-arm watcher.
+		cmds := []tea.Cmd{m.loadDiff()}
+		if m.watcher != nil {
+			cmds = append(cmds, m.watcher.WaitCmd())
+		}
+		return m, tea.Batch(cmds...)
 
 	case fileHighlightedMsg:
 		if msg.index >= len(m.highlightedFiles) {
@@ -468,7 +517,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		} else if fileIdx := m.fileIndexForPath(m.copilotPendingPath); fileIdx >= 0 && fileIdx == m.currentFileIdx {
 			// Streaming delta — only re-render if we're looking at this file.
 			m.formatFile(fileIdx)
-			m.rebuildContent()
+			m.rebuildContentIfChanged()
 		}
 		cmds := []tea.Cmd{m.copilot.ListenCmd()}
 		if m.copilotPendingFor != "" {
@@ -494,10 +543,9 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	case copilotTickMsg:
 		if m.copilotPendingFor != "" {
 			m.copilotDots = (m.copilotDots + 1) % 4
-			// Only re-render if the pending file is currently visible.
 			if fileIdx := m.fileIndexForPath(m.copilotPendingPath); fileIdx >= 0 && fileIdx == m.currentFileIdx {
 				m.formatFile(fileIdx)
-				m.rebuildContent()
+				m.rebuildContentIfChanged()
 			}
 			return m, tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg {
 				return copilotTickMsg{}
@@ -628,20 +676,10 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		m.treeFocused = !m.treeFocused
 		return m, nil, true
 	case "m":
-		// Save current mode position, then cycle.
-		m.saveViewState()
-		m.mode = (m.mode + 1) % 3
-		m.filesListLoaded = false
-		m.filesHighlighted = 0
-		m.filesLoading = true
-		m.currentFileIdx = -1
-		m.treeCursor = 0
-		// Restore saved position for the new mode on this branch.
-		vs := localdiff.LoadViewState(m.repoRoot, m.branch, m.mode)
-		m.savedFilename = vs.Filename
-		m.savedLineNo = vs.LineNo
-		m.savedSide = vs.Side
-		return m, m.loadDiff(), true
+		// Open view mode picker.
+		return m, func() tea.Msg {
+			return OpenViewPickerMsg{Items: m.buildViewPickerItems()}
+		}, true
 	case "h", "left":
 		m.treeFocused = true
 		return m, nil, true
@@ -854,7 +892,11 @@ func (m Model) StatusHints() (left, right []string) {
 			left = append(left, styles.StatusBarKey.Render("x")+" "+styles.StatusBarHint.Render("resolve"))
 		}
 	}
-	right = append(right, styles.StatusBarKey.Render("m")+" "+styles.StatusBarHint.Render(m.mode.String()))
+	modeStr := m.mode.String()
+	if m.pr != nil {
+		modeStr += fmt.Sprintf(" · PR #%d", m.pr.Number)
+	}
+	right = append(right, styles.StatusBarKey.Render("m")+" "+styles.StatusBarHint.Render(modeStr))
 	return
 }
 
@@ -1000,10 +1042,37 @@ func (m *Model) rebuildContent() {
 	m.vp.SetWidth(innerW)
 	m.vp.SetHeight(innerH)
 
+	var newContent string
 	if m.currentFileIdx == -1 {
-		m.vp.SetContent(m.buildOverviewContent(innerW))
+		newContent = m.buildOverviewContent(innerW)
 	} else {
-		m.vp.SetContent(m.buildFileContent(innerW))
+		newContent = m.buildFileContent(innerW)
+	}
+	m.vp.SetContent(newContent)
+}
+
+// rebuildContentIfChanged only updates the viewport if the content actually changed.
+// Use this for paths where the content might not have changed (timer ticks, etc.)
+func (m *Model) rebuildContentIfChanged() {
+	innerW := m.rightPanelInnerWidth()
+	innerH := m.height - 2
+
+	if !m.vpReady {
+		m.vp = viewport.New()
+		m.vpReady = true
+	}
+	m.vp.SetWidth(innerW)
+	m.vp.SetHeight(innerH)
+
+	var newContent string
+	if m.currentFileIdx == -1 {
+		newContent = m.buildOverviewContent(innerW)
+	} else {
+		newContent = m.buildFileContent(innerW)
+	}
+	if newContent != m.lastContent {
+		m.lastContent = newContent
+		m.vp.SetContent(newContent)
 	}
 }
 
@@ -2406,6 +2475,44 @@ func (m Model) getThreadHistory(c localdiff.LocalComment) []string {
 
 // getFullFileDiff returns the complete patch for a file.
 // fileIndexForPath returns the index of the file with the given path, or -1.
+func (m Model) buildViewPickerItems() []picker.Item {
+	items := []picker.Item{
+		{
+			Label:       "Working Tree",
+			Description: "Uncommitted changes vs HEAD",
+			Value:       "working",
+			Keywords:    []string{"local", "unstaged"},
+		},
+		{
+			Label:       "Staged",
+			Description: "Staged changes (git add)",
+			Value:       "staged",
+			Keywords:    []string{"cached", "index"},
+		},
+	}
+
+	defaultBranch, _ := git.DefaultBranch(m.repoRoot)
+	if m.branch != defaultBranch {
+		items = append(items, picker.Item{
+			Label:       "Branch Diff",
+			Description: "vs " + defaultBranch,
+			Value:       "branch",
+			Keywords:    []string{"compare", "base"},
+		})
+	}
+
+	if m.pr != nil {
+		items = append(items, picker.Item{
+			Label:       fmt.Sprintf("PR #%d", m.pr.Number),
+			Description: m.pr.Title,
+			Value:       "pr",
+			Keywords:    []string{"pull request", "review"},
+		})
+	}
+
+	return items
+}
+
 func (m Model) fileIndexForPath(path string) int {
 	for i, f := range m.files {
 		if f.Filename == path {
