@@ -1832,31 +1832,29 @@ func (a alertBanner) Render(w int, focused bool, subCursor int) string {
 		chevron = "▾"
 	}
 
-	innerW := w - 2
-	if innerW < 10 {
-		innerW = 10
+	// Layout: ╭ + title + ─fill─ + ╮  (total = w)
+	// Rows:   │ + space + ›/space + space + content + pad + space + │  (total = w)
+	// So content area = w - 6 (│ + space + 2-char-pointer + space + │)
+	contentW := w - 6
+	if contentW < 4 {
+		contentW = 4
 	}
 
-	// Top border with title: ╭─ icon ▸ title ───╮
+	// Top border: ╭ titleStr ───╮
 	titleStr := " " + a.icon + " " + chevron + " " + a.title + " "
 	if focused && subCursor == -1 {
 		titleStr = titleColor.Bold(true).Render(titleStr)
 	} else {
 		titleStr = titleColor.Render(titleStr)
 	}
-
 	titleVisW := xansi.StringWidth(titleStr)
-	topFill := w - 2 - titleVisW
+	topFill := w - 2 - titleVisW // -2 for ╭ and ╮
 	if topFill < 0 {
 		topFill = 0
 	}
 	topLine := border.Render("╭") + titleStr + border.Render(strings.Repeat("─", topFill)+"╮")
 
-	botFill := w - 2
-	if botFill < 0 {
-		botFill = 0
-	}
-	botLine := border.Render("╰" + strings.Repeat("─", botFill) + "╯")
+	botLine := border.Render("╰" + strings.Repeat("─", max(0, w-2)) + "╯")
 
 	if !a.expanded || len(a.details) == 0 {
 		return topLine + "\n" + botLine
@@ -1866,26 +1864,44 @@ func (a alertBanner) Render(w int, focused bool, subCursor int) string {
 	lines = append(lines, topLine)
 
 	for i, d := range a.details {
-		rowContent := d
-		rowVisW := xansi.StringWidth(rowContent) + 2
-		rowPad := innerW - rowVisW
+		// Truncate content to fit.
+		rowContent := truncateToWidth(d, contentW)
+		rowVisW := xansi.StringWidth(rowContent)
+		rowPad := contentW - rowVisW
 		if rowPad < 0 {
 			rowPad = 0
 		}
 
-		left := border.Render("│") + " "
-		right := " " + border.Render("│")
+		left := border.Render("│")
+		right := border.Render("│")
 
 		if focused && subCursor == i {
 			style := titleColor.Bold(true)
-			lines = append(lines, left+style.Render("› "+rowContent)+strings.Repeat(" ", rowPad)+right)
+			lines = append(lines, left+" "+style.Render("› "+rowContent)+strings.Repeat(" ", rowPad)+" "+right)
 		} else {
-			lines = append(lines, left+dimText.Render("  "+rowContent)+strings.Repeat(" ", rowPad)+right)
+			lines = append(lines, left+" "+dimText.Render("  "+rowContent)+strings.Repeat(" ", rowPad)+" "+right)
 		}
 	}
 
 	lines = append(lines, botLine)
 	return strings.Join(lines, "\n")
+}
+
+func truncateToWidth(s string, maxW int) string {
+	w := xansi.StringWidth(s)
+	if w <= maxW {
+		return s
+	}
+	// Trim rune by rune until it fits with ellipsis.
+	runes := []rune(xansi.Strip(s))
+	for len(runes) > 0 {
+		candidate := string(runes) + "…"
+		if xansi.StringWidth(candidate) <= maxW {
+			return candidate
+		}
+		runes = runes[:len(runes)-1]
+	}
+	return "…"
 }
 
 func (m Model) buildBanners(w int) []alertBanner {
