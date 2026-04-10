@@ -232,6 +232,44 @@ func (c *CachedClient) GetCheckRuns(ref string) tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
+// BranchProtectionLoadedMsg is sent when branch protection is loaded.
+type BranchProtectionLoadedMsg struct {
+	Protection *BranchProtection
+	Branch     string
+}
+
+// GetBranchProtection returns a tea.Cmd that fetches branch protection with caching.
+func (c *CachedClient) GetBranchProtection(branch string) tea.Cmd {
+	key := fmt.Sprintf("branch-protection:%s", branch)
+	fetchFn := func() (*BranchProtection, error) {
+		return c.client.GetBranchProtection(context.Background(), branch)
+	}
+
+	data, found, _, refetchFn := cache.Query(c.cache, key, fetchFn)
+
+	var cmds []tea.Cmd
+
+	if found {
+		prot := data
+		cmds = append(cmds, func() tea.Msg {
+			return BranchProtectionLoadedMsg{Protection: prot, Branch: branch}
+		})
+	}
+
+	if refetchFn != nil {
+		fn := refetchFn
+		cmds = append(cmds, func() tea.Msg {
+			result, err := fn()
+			if err != nil {
+				return QueryErrMsg{Err: err}
+			}
+			return BranchProtectionLoadedMsg{Protection: result, Branch: branch}
+		})
+	}
+
+	return tea.Batch(cmds...)
+}
+
 // GetPullRequestFiles returns a tea.Cmd that fetches PR files with caching.
 func (c *CachedClient) GetPullRequestFiles(number int) tea.Cmd {
 	key := fmt.Sprintf("pull-files:%d", number)

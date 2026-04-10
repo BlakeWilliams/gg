@@ -22,6 +22,12 @@ type PullRequest struct {
 	ChangedFiles       int        `json:"changed_files"`
 	Labels             []Label    `json:"labels"`
 	RequestedReviewers []User     `json:"requested_reviewers"`
+	RequestedTeams     []Team     `json:"requested_teams"`
+}
+
+type Team struct {
+	Name string `json:"name"`
+	Slug string `json:"slug"`
 }
 
 type User struct {
@@ -93,4 +99,12 @@ type PullRequestFile struct {
 	Deletions        int    `json:"deletions"`
 	Patch            string `json:"patch"`
 	PreviousFilename string `json:"previous_filename"`
+}
+
+type BranchProtection struct {
+	RequiredPullRequestReviews *RequiredPullRequestReviews `json:"required_pull_request_reviews"`
+}
+
+type RequiredPullRequestReviews struct {
+	RequiredApprovingReviewCount int `json:"required_approving_review_count"`
 }

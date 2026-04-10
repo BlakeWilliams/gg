@@ -2,6 +2,7 @@ package prdetail
 
 import (
 	"fmt"
+	"image/color"
 	"os"
 	"os/exec"
 	"regexp"
@@ -90,6 +91,7 @@ type Model struct {
 	comments       []github.IssueComment
 	reviewComments []github.ReviewComment
 	checkRuns      []github.CheckRun
+	branchProt     *github.BranchProtection
 
 	// Files
 	files            []github.PullRequestFile
@@ -129,6 +131,12 @@ type Model struct {
 	// Shared
 	filesListLoaded bool
 	waitingG        bool
+
+	// Overview banners
+	expandedBanners map[string]bool // which alert banners are expanded
+	overviewCursor  int             // which banner is focused
+	bannerSubCursor int             // -1 = banner header, 0+ = detail row index
+	bannerCount     int             // number of banners in current overview
 }
 
 func New(pr github.PullRequest, ctx *uictx.Context, width, height int) Model {
@@ -141,6 +149,9 @@ func New(pr github.PullRequest, ctx *uictx.Context, width, height int) Model {
 		selectionAnchor: -1, // no selection
 		treeWidth:       35,
 		treeFocused:     true, // start with tree focused
+		expandedBanners: make(map[string]bool),
+		overviewCursor:  0,
+		bannerSubCursor: -1,
 	}
 }
 
@@ -204,6 +215,7 @@ func (m Model) Init() tea.Cmd {
 		m.ctx.Client.GetIssueComments(m.pr.Number),
 		m.ctx.Client.GetReviewComments(m.pr.Number),
 		m.ctx.Client.GetCheckRuns(m.pr.Head.SHA),
+		m.ctx.Client.GetBranchProtection(m.pr.Base.Ref),
 	)
 }
 
@@ -302,7 +314,13 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		if msg.Ref == m.pr.Head.SHA {
 			m.checkRuns = msg.CheckRuns
 			m.rebuildSidebar()
+			m.rebuildContent()
 		}
+		return m, nil
+
+	case github.BranchProtectionLoadedMsg:
+		m.branchProt = msg.Protection
+		m.rebuildContent()
 		return m, nil
 
 	case github.PRFilesLoadedMsg:
@@ -450,6 +468,11 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			m.moveTreeCursorBy(1)
 			return m, nil, true
 		}
+		if m.currentFileIdx == -1 && m.bannerCount > 0 {
+			m.moveOverviewCursor(1)
+			m.rebuildContent()
+			return m, nil, true
+		}
 		// Diff line cursor — clear selection on normal move.
 		if m.currentFileIdx >= 0 && m.hasDiffLines() {
 			m.selectionAnchor = -1
@@ -462,6 +485,11 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		}
 		if m.treeFocused {
 			m.moveTreeCursorBy(-1)
+			return m, nil, true
+		}
+		if m.currentFileIdx == -1 && m.bannerCount > 0 {
+			m.moveOverviewCursor(-1)
+			m.rebuildContent()
 			return m, nil, true
 		}
 		if m.currentFileIdx >= 0 && m.hasDiffLines() {
@@ -492,6 +520,38 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			// Select current tree entry — switch to right panel.
 			m.selectTreeEntry()
 			m.treeFocused = false
+			return m, nil, true
+		}
+		if m.currentFileIdx == -1 && m.bannerCount > 0 {
+			banners := m.buildBanners(0)
+			if m.overviewCursor >= 0 && m.overviewCursor < len(banners) {
+				b := banners[m.overviewCursor]
+				if m.bannerSubCursor == -1 {
+					m.expandedBanners[b.key] = !m.expandedBanners[b.key]
+					if !m.expandedBanners[b.key] {
+						m.bannerSubCursor = -1
+					}
+				} else if m.bannerSubCursor >= 0 && m.bannerSubCursor < len(b.details) {
+					// In-app file navigation takes priority.
+					if m.bannerSubCursor < len(b.fileNavs) && b.fileNavs[m.bannerSubCursor] >= 0 {
+						fileIdx := b.fileNavs[m.bannerSubCursor]
+						m.currentFileIdx = fileIdx
+						if m.bannerSubCursor < len(b.diffLineNavs) && b.diffLineNavs[m.bannerSubCursor] >= 0 {
+							m.diffCursor = b.diffLineNavs[m.bannerSubCursor]
+						} else {
+							m.diffCursor = m.firstNonHunkLine(fileIdx)
+						}
+						m.syncTreeFromFileIdx()
+						m.rebuildContent()
+						m.scrollToDiffCursor()
+					} else if b.key == "reviews" {
+						m.toggleSidebar(sidebarReviews)
+					} else if m.bannerSubCursor < len(b.detailLinks) && b.detailLinks[m.bannerSubCursor] != "" {
+						_ = exec.Command("open", b.detailLinks[m.bannerSubCursor]).Start()
+					}
+				}
+				m.rebuildContent()
+			}
 			return m, nil, true
 		}
 		// Open comment input on diff line.
@@ -1270,7 +1330,7 @@ func (m Model) renderLayout(rightView string) string {
 	if m.currentFileIdx >= 0 && m.currentFileIdx < len(m.files) {
 		rightTitle = " " + lipgloss.NewStyle().Bold(true).Render(m.files[m.currentFileIdx].Filename) + " "
 	} else {
-		rightTitle = " " + lipgloss.NewStyle().Bold(true).Render("Description") + " "
+		rightTitle = " " + lipgloss.NewStyle().Bold(true).Render("Overview") + " "
 	}
 	rtW := lipgloss.Width(rightTitle)
 	rtFill := rightW - 3 - rtW
@@ -1670,8 +1730,9 @@ func (m *Model) rebuildContent() {
 	}
 }
 
-func (m Model) buildOverviewContent(w int) string {
+func (m *Model) buildOverviewContent(w int) string {
 	var content strings.Builder
+	bannerW := m.contentWidth() - overviewPad*2
 
 	// Status + metadata line.
 	meta := styles.PRStatusBadge(m.pr.State, m.pr.Draft, m.pr.Merged) +
@@ -1686,15 +1747,503 @@ func (m Model) buildOverviewContent(w int) string {
 		Render(fmt.Sprintf("#%d %s", m.pr.Number, m.pr.Title))
 	content.WriteString("\n" + indent(title, overviewPad) + "\n")
 
+	// Alert banners (only for open PRs).
+	if m.pr.State == "open" && !m.pr.Merged {
+		banners := m.buildBanners(bannerW)
+		m.bannerCount = len(banners)
+		if m.overviewCursor >= m.bannerCount {
+			m.overviewCursor = max(0, m.bannerCount-1)
+		}
+
+		content.WriteString("\n")
+		for i, b := range banners {
+			focused := !m.treeFocused && i == m.overviewCursor
+			sub := -1
+			if focused {
+				sub = m.bannerSubCursor
+			}
+			content.WriteString(indent(b.Render(bannerW, focused, sub), overviewPad) + "\n")
+		}
+	} else {
+		m.bannerCount = 0
+	}
+
 	// Description body.
 	descBody := strings.TrimSpace(m.descContent)
-	if descBody == "" {
-		descBody = dimStyle.Render("No description provided.")
+	if descBody != "" {
+		header := dimStyle.Render("── Description ──")
+		content.WriteString("\n" + indent(header, overviewPad) + "\n")
+		content.WriteString("\n" + indent(descBody, overviewPad))
+	} else if m.pr.Merged || m.pr.State == "closed" {
+		content.WriteString("\n" + indent(dimStyle.Render("No description provided."), overviewPad))
 	}
-	content.WriteString("\n" + indent(descBody, overviewPad))
 	content.WriteString("\n")
 
 	return content.String()
+}
+
+type alertLevel int
+
+const (
+	alertSuccess alertLevel = iota
+	alertWarning
+	alertDanger
+	alertInfo
+)
+
+type alertBanner struct {
+	key          string
+	level        alertLevel
+	icon         string
+	title        string
+	expanded     bool
+	details      []string // detail lines shown when expanded
+	detailLinks  []string // URL per detail (empty = no link)
+	fileNavs     []int    // file index per detail for in-app nav (-1 = none)
+	diffLineNavs []int    // target diff line index per detail (-1 = file start)
+}
+
+func (a alertBanner) Render(w int, focused bool, subCursor int) string {
+	var fg color.Color
+	switch a.level {
+	case alertSuccess:
+		fg = lipgloss.Green
+	case alertWarning:
+		fg = lipgloss.Yellow
+	case alertDanger:
+		fg = lipgloss.Red
+	case alertInfo:
+		fg = lipgloss.Cyan
+	}
+
+	border := lipgloss.NewStyle().Foreground(fg)
+	dimText := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
+	titleColor := lipgloss.NewStyle().Foreground(fg)
+
+	chevron := "▸"
+	if a.expanded && len(a.details) > 0 {
+		chevron = "▾"
+	}
+
+	innerW := w - 2
+	if innerW < 10 {
+		innerW = 10
+	}
+
+	// Top border with title: ╭─ icon ▸ title ───╮
+	titleStr := " " + a.icon + " " + chevron + " " + a.title + " "
+	if focused && subCursor == -1 {
+		titleStr = titleColor.Bold(true).Render(titleStr)
+	} else {
+		titleStr = titleColor.Render(titleStr)
+	}
+
+	titleVisW := xansi.StringWidth(titleStr)
+	topFill := w - 2 - titleVisW
+	if topFill < 0 {
+		topFill = 0
+	}
+	topLine := border.Render("╭") + titleStr + border.Render(strings.Repeat("─", topFill)+"╮")
+
+	botFill := w - 2
+	if botFill < 0 {
+		botFill = 0
+	}
+	botLine := border.Render("╰" + strings.Repeat("─", botFill) + "╯")
+
+	if !a.expanded || len(a.details) == 0 {
+		return topLine + "\n" + botLine
+	}
+
+	var lines []string
+	lines = append(lines, topLine)
+
+	for i, d := range a.details {
+		rowContent := d
+		rowVisW := xansi.StringWidth(rowContent) + 2
+		rowPad := innerW - rowVisW
+		if rowPad < 0 {
+			rowPad = 0
+		}
+
+		left := border.Render("│") + " "
+		right := " " + border.Render("│")
+
+		if focused && subCursor == i {
+			style := titleColor.Bold(true)
+			lines = append(lines, left+style.Render("› "+rowContent)+strings.Repeat(" ", rowPad)+right)
+		} else {
+			lines = append(lines, left+dimText.Render("  "+rowContent)+strings.Repeat(" ", rowPad)+right)
+		}
+	}
+
+	lines = append(lines, botLine)
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) buildBanners(w int) []alertBanner {
+	var banners []alertBanner
+
+	// CI checks banner
+	var failedChecks, pendingChecks, passedChecks []github.CheckRun
+	for _, c := range m.checkRuns {
+		if c.Status != "completed" {
+			pendingChecks = append(pendingChecks, c)
+		} else if c.Conclusion != nil && (*c.Conclusion == "success" || *c.Conclusion == "skipped" || *c.Conclusion == "neutral") {
+			passedChecks = append(passedChecks, c)
+		} else {
+			failedChecks = append(failedChecks, c)
+		}
+	}
+	total := len(failedChecks) + len(pendingChecks) + len(passedChecks)
+
+	if len(failedChecks) > 0 {
+		title := fmt.Sprintf("%d of %d checks failing", len(failedChecks), total)
+		var details, links []string
+		var navs []int
+		for _, c := range failedChecks {
+			conclusion := "failed"
+			if c.Conclusion != nil {
+				conclusion = *c.Conclusion
+			}
+			details = append(details, fmt.Sprintf("%s %s · %s", iconXCircle, c.Name, conclusion))
+			links = append(links, c.HTMLURL)
+			navs = append(navs, -1)
+		}
+		banners = append(banners, alertBanner{
+			key: "checks", level: alertDanger, icon: iconXCircle, title: title,
+			expanded: m.expandedBanners["checks"], details: details, detailLinks: links, fileNavs: navs,
+		})
+	} else if len(pendingChecks) > 0 {
+		title := fmt.Sprintf("%d of %d checks running", len(pendingChecks), total)
+		var details, links []string
+		var navs []int
+		for _, c := range pendingChecks {
+			details = append(details, fmt.Sprintf("%s %s · in progress", iconClock, c.Name))
+			links = append(links, c.HTMLURL)
+			navs = append(navs, -1)
+		}
+		banners = append(banners, alertBanner{
+			key: "checks", level: alertWarning, icon: iconClock, title: title,
+			expanded: m.expandedBanners["checks"], details: details, detailLinks: links, fileNavs: navs,
+		})
+	} else if total > 0 {
+		var details, links []string
+		var navs []int
+		for _, c := range passedChecks {
+			conclusion := "passed"
+			if c.Conclusion != nil && *c.Conclusion != "success" {
+				conclusion = *c.Conclusion
+			}
+			details = append(details, fmt.Sprintf("%s %s · %s", iconCheckCircle, c.Name, conclusion))
+			links = append(links, c.HTMLURL)
+			navs = append(navs, -1)
+		}
+		banners = append(banners, alertBanner{
+			key: "checks", level: alertSuccess, icon: iconCheckCircle,
+			title:   fmt.Sprintf("All %d checks passed", total),
+			expanded: m.expandedBanners["checks"], details: details, detailLinks: links, fileNavs: navs,
+		})
+	}
+
+	// Reviews and changes-requested banners.
+	latestByUser := m.latestReviewByUser()
+	repoName := m.ctx.Client.RepoFullName()
+
+	// Separate out changes requested into its own banner.
+	// Iterate m.reviews in order to keep stable ordering.
+	var changesDetails, changesLinks []string
+	var changesNavs, changesDiffNavs []int
+	changesSeen := make(map[string]bool)
+	for _, r := range m.reviews {
+		latest, ok := latestByUser[r.User.Login]
+		if !ok || latest.ID != r.ID || latest.State != "CHANGES_REQUESTED" || changesSeen[r.User.Login] {
+			continue
+		}
+		changesSeen[r.User.Login] = true
+		line := r.User.Login + " · " + iconXCircle + " changes requested"
+		if r.Body != "" {
+			body := strings.ReplaceAll(r.Body, "\n", " ")
+			if len(body) > 60 {
+				body = body[:57] + "..."
+			}
+			line += " · " + body
+		}
+		changesDetails = append(changesDetails, line)
+		changesLinks = append(changesLinks, fmt.Sprintf("https://github.com/%s/pull/%d#pullrequestreview-%d", repoName, m.pr.Number, r.ID))
+		changesNavs = append(changesNavs, -1)
+		changesDiffNavs = append(changesDiffNavs, -1)
+	}
+	if len(changesDetails) > 0 {
+		noun := "reviewer"
+		if len(changesDetails) > 1 {
+			noun = "reviewers"
+		}
+		banners = append(banners, alertBanner{
+			key: "changes", level: alertDanger, icon: iconXCircle,
+			title:    fmt.Sprintf("%d %s requested changes", len(changesDetails), noun),
+			expanded: m.expandedBanners["changes"], details: changesDetails,
+			detailLinks: changesLinks, fileNavs: changesNavs, diffLineNavs: changesDiffNavs,
+		})
+	}
+
+	// Review progress banner (TODO-style: approved / required).
+	// Required = requested_reviewers + requested_teams + anyone who requested changes (they need to re-approve).
+	requiredCount := len(m.pr.RequestedReviewers) + len(m.pr.RequestedTeams) + len(changesDetails)
+
+	// If branch protection specifies a minimum, use that as the floor.
+	if m.branchProt != nil && m.branchProt.RequiredPullRequestReviews != nil {
+		minRequired := m.branchProt.RequiredPullRequestReviews.RequiredApprovingReviewCount
+		if minRequired > requiredCount {
+			requiredCount = minRequired
+		}
+	}
+
+	var approvedCount int
+	var reviewDetails, reviewLinks []string
+	var reviewNavs, reviewDiffNavs []int
+
+	// Show each reviewer's status.
+	seen := make(map[string]bool)
+	for _, r := range m.reviews {
+		latest, ok := latestByUser[r.User.Login]
+		if !ok || latest.ID != r.ID || seen[r.User.Login] {
+			continue
+		}
+		seen[r.User.Login] = true
+
+		var stateText string
+		switch r.State {
+		case "APPROVED":
+			approvedCount++
+			stateText = iconCheckCircle + " approved"
+		case "CHANGES_REQUESTED":
+			stateText = iconXCircle + " changes requested"
+		case "COMMENTED":
+			stateText = iconComment + " commented"
+		case "DISMISSED":
+			stateText = iconSlash + " dismissed"
+		default:
+			continue
+		}
+		reviewDetails = append(reviewDetails, r.User.Login+" · "+stateText)
+		reviewLinks = append(reviewLinks, "")
+		reviewNavs = append(reviewNavs, -1)
+		reviewDiffNavs = append(reviewDiffNavs, -1)
+	}
+
+	// Pending individual reviewers.
+	for _, u := range m.pr.RequestedReviewers {
+		if seen[u.Login] {
+			continue
+		}
+		reviewDetails = append(reviewDetails, u.Login+" · "+iconClock+" awaiting review")
+		reviewLinks = append(reviewLinks, "")
+		reviewNavs = append(reviewNavs, -1)
+		reviewDiffNavs = append(reviewDiffNavs, -1)
+	}
+
+	// Pending team reviewers.
+	for _, t := range m.pr.RequestedTeams {
+		reviewDetails = append(reviewDetails, t.Name+" (team) · "+iconClock+" awaiting review")
+		reviewLinks = append(reviewLinks, "")
+		reviewNavs = append(reviewNavs, -1)
+		reviewDiffNavs = append(reviewDiffNavs, -1)
+	}
+
+	if requiredCount > 0 || approvedCount > 0 {
+		var level alertLevel
+		var title string
+		if requiredCount == 0 && approvedCount > 0 {
+			level = alertSuccess
+			title = fmt.Sprintf("%d approved", approvedCount)
+		} else if approvedCount >= requiredCount {
+			level = alertSuccess
+			title = fmt.Sprintf("%d/%d approved", approvedCount, requiredCount)
+		} else {
+			level = alertWarning
+			title = fmt.Sprintf("%d/%d approved", approvedCount, requiredCount)
+		}
+
+		banners = append(banners, alertBanner{
+			key: "reviews", level: level, icon: iconReview, title: title,
+			expanded: m.expandedBanners["reviews"], details: reviewDetails,
+			detailLinks: reviewLinks, fileNavs: reviewNavs, diffLineNavs: reviewDiffNavs,
+		})
+	}
+
+	// Unresolved threads banner.
+	unresolvedThreads := m.unresolvedThreadDetails()
+	if len(unresolvedThreads) > 0 {
+		noun := "thread"
+		if len(unresolvedThreads) > 1 {
+			noun = "threads"
+		}
+		title := fmt.Sprintf("%d unresolved comment %s", len(unresolvedThreads), noun)
+		var details, links []string
+		var navs, diffNavs []int
+		for _, t := range unresolvedThreads {
+			body := strings.ReplaceAll(t.body, "\n", " ")
+			if len(body) > 60 {
+				body = body[:57] + "..."
+			}
+			line := fmt.Sprintf("%s %s", iconComment, t.path)
+			if t.line > 0 {
+				line += fmt.Sprintf(":%d", t.line)
+			}
+			line += " · " + body
+			details = append(details, line)
+			links = append(links, "")
+
+			fileIdx := -1
+			diffIdx := -1
+			for i, f := range m.files {
+				if f.Filename == t.path {
+					fileIdx = i
+					if t.line > 0 && i < len(m.fileDiffs) {
+						for di, dl := range m.fileDiffs[i] {
+							if dl.NewLineNo == t.line {
+								diffIdx = di
+								break
+							}
+						}
+					}
+					break
+				}
+			}
+			navs = append(navs, fileIdx)
+			diffNavs = append(diffNavs, diffIdx)
+		}
+		banners = append(banners, alertBanner{
+			key: "threads", level: alertWarning, icon: iconComments, title: title,
+			expanded: m.expandedBanners["threads"], details: details, detailLinks: links,
+			fileNavs: navs, diffLineNavs: diffNavs,
+		})
+	}
+
+	// Ready to merge.
+	if len(failedChecks) == 0 && len(pendingChecks) == 0 && len(changesDetails) == 0 &&
+		len(unresolvedThreads) == 0 && len(m.pr.RequestedReviewers) == 0 &&
+		len(m.pr.RequestedTeams) == 0 && approvedCount > 0 &&
+		(requiredCount == 0 || approvedCount >= requiredCount) && total > 0 {
+		banners = append(banners, alertBanner{
+			key: "merge", level: alertSuccess, icon: iconMerge,
+			title: "Ready to merge",
+		})
+	}
+
+	return banners
+}
+
+func (m Model) bannerKeys() []string {
+	banners := m.buildBanners(0)
+	keys := make([]string, len(banners))
+	for i, b := range banners {
+		keys[i] = b.key
+	}
+	return keys
+}
+
+func (m *Model) moveOverviewCursor(dir int) {
+	banners := m.buildBanners(0)
+	if len(banners) == 0 {
+		return
+	}
+
+	cur := m.overviewCursor
+	sub := m.bannerSubCursor
+
+	if dir > 0 {
+		// Moving down.
+		if cur < len(banners) {
+			b := banners[cur]
+			if b.expanded && len(b.details) > 0 && sub < len(b.details)-1 {
+				m.bannerSubCursor = sub + 1
+				return
+			}
+		}
+		if cur < len(banners)-1 {
+			m.overviewCursor = cur + 1
+			m.bannerSubCursor = -1
+		}
+	} else {
+		// Moving up.
+		if sub > -1 {
+			m.bannerSubCursor = sub - 1
+			return
+		}
+		if cur > 0 {
+			m.overviewCursor = cur - 1
+			prev := banners[cur-1]
+			if prev.expanded && len(prev.details) > 0 {
+				m.bannerSubCursor = len(prev.details) - 1
+			} else {
+				m.bannerSubCursor = -1
+			}
+		}
+	}
+}
+
+type unresolvedThread struct {
+	path string
+	line int
+	body string
+}
+
+func (m Model) unresolvedThreadDetails() []unresolvedThread {
+	// Collect replies by root ID.
+	threadReplies := make(map[int][]github.ReviewComment)
+	for _, rc := range m.reviewComments {
+		if rc.InReplyToID != nil {
+			threadReplies[*rc.InReplyToID] = append(threadReplies[*rc.InReplyToID], rc)
+		}
+	}
+
+	// Iterate in slice order to preserve stable ordering.
+	seen := make(map[int]bool)
+	var result []unresolvedThread
+	for _, rc := range m.reviewComments {
+		if rc.InReplyToID != nil {
+			continue
+		}
+		if seen[rc.ID] {
+			continue
+		}
+		seen[rc.ID] = true
+
+		resolved := false
+		for _, reply := range threadReplies[rc.ID] {
+			if strings.Contains(strings.ToLower(reply.Body), "resolved") {
+				resolved = true
+			}
+		}
+		if !resolved {
+			line := 0
+			if rc.Line != nil {
+				line = *rc.Line
+			}
+			result = append(result, unresolvedThread{
+				path: rc.Path,
+				line: line,
+				body: rc.Body,
+			})
+		}
+	}
+	return result
+}
+
+func (m Model) latestReviewByUser() map[string]github.Review {
+	latest := make(map[string]github.Review)
+	for _, r := range m.reviews {
+		if r.State == "PENDING" {
+			continue
+		}
+		existing, ok := latest[r.User.Login]
+		if !ok || r.SubmittedAt.After(existing.SubmittedAt) {
+			latest[r.User.Login] = r
+		}
+	}
+	return latest
 }
 
 func (m *Model) buildFileContent(w int) string {

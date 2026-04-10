@@ -120,6 +120,17 @@ func (c *Client) GetCheckRuns(ctx context.Context, ref string) ([]CheckRun, erro
 	return result.CheckRuns, nil
 }
 
+func (c *Client) GetBranchProtection(ctx context.Context, branch string) (*BranchProtection, error) {
+	var result BranchProtection
+	path := fmt.Sprintf("repos/%s/%s/branches/%s/protection", c.owner, c.repo, branch)
+	err := c.rest.Get(path, &result)
+	if err != nil {
+		// Branch protection may not exist — return nil, not an error.
+		return nil, nil
+	}
+	return &result, nil
+}
+
 // CreateReviewComment creates a new review comment on a pull request diff.
 // For multi-line comments, set startLine > 0 and startSide to the side of the
 // first line. When startLine is 0, a single-line comment is created.
