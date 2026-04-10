@@ -129,6 +129,15 @@ func (c *Client) GetCurrentUser(ctx context.Context) (User, error) {
 	return user, nil
 }
 
+func (c *Client) GetUserTeams(ctx context.Context) ([]Team, error) {
+	var teams []Team
+	err := c.rest.Get("user/teams?per_page=100", &teams)
+	if err != nil {
+		return nil, fmt.Errorf("getting user teams: %w", err)
+	}
+	return teams, nil
+}
+
 func (c *Client) GetBranchProtection(ctx context.Context, branch string) (*BranchProtection, error) {
 	var result BranchProtection
 	path := fmt.Sprintf("repos/%s/%s/branches/%s/protection", c.owner, c.repo, branch)

@@ -61,6 +61,13 @@ const (
 	sidebarChecks
 )
 
+type overviewMode int
+
+const (
+	modeAuthor   overviewMode = iota
+	modeReviewer
+)
+
 type descRenderedMsg struct {
 	content  string
 	prNumber int
@@ -93,6 +100,7 @@ type Model struct {
 	checkRuns      []github.CheckRun
 	branchProt     *github.BranchProtection
 	currentUser    string // login of the authenticated user
+	userTeamSlugs  map[string]bool // team slugs the current user belongs to
 
 	// Files
 	files            []github.PullRequestFile
@@ -138,6 +146,8 @@ type Model struct {
 	overviewCursor  int             // which banner is focused
 	bannerSubCursor int             // -1 = banner header, 0+ = detail row index
 	bannerCount     int             // number of banners in current overview
+	viewMode        overviewMode    // author or reviewer
+	modeOverride    bool            // true if user manually toggled with 'a'
 }
 
 func New(pr github.PullRequest, ctx *uictx.Context, width, height int) Model {
@@ -171,6 +181,23 @@ func (m *Model) activeViewport() *viewport.Model {
 	return &m.vp
 }
 
+// detectMode auto-detects whether the current user is the author or a reviewer.
+// Author = PR creator or an assignee. Everyone else = reviewer.
+func (m Model) detectMode() overviewMode {
+	if m.currentUser == "" {
+		return modeAuthor
+	}
+	if m.pr.User.Login == m.currentUser {
+		return modeAuthor
+	}
+	for _, a := range m.pr.Assignees {
+		if a.Login == m.currentUser {
+			return modeAuthor
+		}
+	}
+	return modeReviewer
+}
+
 // StatusHints returns left and right hint groups for the status bar.
 // Entries are pre-rendered.
 func (m Model) StatusHints() (left, right []string) {
@@ -183,6 +210,13 @@ func (m Model) StatusHints() (left, right []string) {
 	left = append(left, styles.StatusBarKey.Render("p/n")+" "+styles.StatusBarHint.Render("files"))
 	if !m.treeFocused && m.currentFileIdx >= 0 {
 		left = append(left, styles.StatusBarKey.Render("J/K")+" "+styles.StatusBarHint.Render("select range"))
+	}
+	if m.currentFileIdx == -1 {
+		modeLabel := "author"
+		if m.viewMode == modeReviewer {
+			modeLabel = "reviewer"
+		}
+		left = append(left, styles.StatusBarKey.Render("a")+" "+styles.StatusBarHint.Render(modeLabel))
 	}
 	right = append(right, highlightHint("comments", "c"))
 	right = append(right, highlightHint("reviews", "r"))
@@ -218,6 +252,7 @@ func (m Model) Init() tea.Cmd {
 		m.ctx.Client.GetCheckRuns(m.pr.Head.SHA),
 		m.ctx.Client.GetBranchProtection(m.pr.Base.Ref),
 		m.ctx.Client.GetCurrentUser(),
+		m.ctx.Client.GetUserTeams(),
 	)
 }
 
@@ -327,6 +362,20 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 
 	case github.CurrentUserLoadedMsg:
 		m.currentUser = msg.User.Login
+		if !m.modeOverride {
+			m.viewMode = m.detectMode()
+		}
+		m.rebuildContent()
+		return m, nil
+
+	case github.UserTeamsLoadedMsg:
+		m.userTeamSlugs = make(map[string]bool)
+		for _, t := range msg.Teams {
+			m.userTeamSlugs[t.Slug] = true
+		}
+		if !m.modeOverride {
+			m.viewMode = m.detectMode()
+		}
 		m.rebuildContent()
 		return m, nil
 
@@ -530,7 +579,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			return m, nil, true
 		}
 		if m.currentFileIdx == -1 && m.bannerCount > 0 {
-			banners := m.buildBanners(0)
+			banners := m.buildBannersForMode(0)
 			if m.overviewCursor >= 0 && m.overviewCursor < len(banners) {
 				b := banners[m.overviewCursor]
 				if m.bannerSubCursor == -1 {
@@ -566,6 +615,19 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			return m.openCommentInput()
 		}
 	case "a":
+		if m.currentFileIdx == -1 {
+			m.modeOverride = true
+			if m.viewMode == modeAuthor {
+				m.viewMode = modeReviewer
+			} else {
+				m.viewMode = modeAuthor
+			}
+			m.overviewCursor = 0
+			m.bannerSubCursor = -1
+			m.rebuildContent()
+			m.vp.GotoTop()
+			return m, nil, true
+		}
 		if !m.showSidebar && m.currentFileIdx >= 0 && m.hasDiffLines() {
 			return m.openCommentInput()
 		}
@@ -1337,7 +1399,17 @@ func (m Model) renderLayout(rightView string) string {
 	if m.currentFileIdx >= 0 && m.currentFileIdx < len(m.files) {
 		rightTitle = " " + lipgloss.NewStyle().Bold(true).Render(m.files[m.currentFileIdx].Filename) + " "
 	} else {
-		rightTitle = " " + lipgloss.NewStyle().Bold(true).Render("Overview") + " "
+		active := lipgloss.NewStyle().Bold(true)
+		inactive := rightBorderStyle
+		sep := rightBorderStyle.Render(" │ ")
+		authorLabel := inactive.Render("Author")
+		reviewerLabel := inactive.Render("Reviewer")
+		if m.viewMode == modeAuthor {
+			authorLabel = active.Render("Author")
+		} else {
+			reviewerLabel = active.Render("Reviewer")
+		}
+		rightTitle = " " + authorLabel + sep + reviewerLabel + " "
 	}
 	rtW := lipgloss.Width(rightTitle)
 	rtFill := rightW - 3 - rtW
@@ -1756,7 +1828,7 @@ func (m *Model) buildOverviewContent(w int) string {
 
 	// Alert banners (only for open PRs).
 	if m.pr.State == "open" && !m.pr.Merged {
-		banners := m.buildBanners(bannerW)
+		banners := m.buildBannersForMode(bannerW)
 		m.bannerCount = len(banners)
 		if m.overviewCursor >= m.bannerCount {
 			m.overviewCursor = max(0, m.bannerCount-1)
@@ -1827,9 +1899,12 @@ func (a alertBanner) Render(w int, focused bool, subCursor int) string {
 	dimText := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
 	titleColor := lipgloss.NewStyle().Foreground(fg)
 
-	chevron := "▸"
-	if a.expanded && len(a.details) > 0 {
-		chevron = "▾"
+	chevron := ""
+	if len(a.details) > 0 {
+		chevron = " ▸"
+		if a.expanded {
+			chevron = " ▾"
+		}
 	}
 
 	// Layout: ╭ + title + ─fill─ + ╮  (total = w)
@@ -1840,8 +1915,8 @@ func (a alertBanner) Render(w int, focused bool, subCursor int) string {
 		contentW = 4
 	}
 
-	// Top border: ╭ titleStr ───╮
-	titleStr := " " + a.icon + " " + chevron + " " + a.title + " "
+	// Top border: ╭ icon ▸ title ───╮
+	titleStr := " " + a.icon + chevron + " " + a.title + " "
 	if focused && subCursor == -1 {
 		titleStr = titleColor.Bold(true).Render(titleStr)
 	} else {
@@ -2095,6 +2170,68 @@ func (m Model) buildBanners(w int) []alertBanner {
 		})
 	}
 
+	// Personal review banner (reviewer mode only).
+	if m.currentUser != "" {
+		myLatest, hasReviewed := latestByUser[m.currentUser]
+		isRequested := false
+		for _, u := range m.pr.RequestedReviewers {
+			if u.Login == m.currentUser {
+				isRequested = true
+				break
+			}
+		}
+		if !isRequested && m.userTeamSlugs != nil {
+			for _, t := range m.pr.RequestedTeams {
+				if m.userTeamSlugs[t.Slug] {
+					isRequested = true
+					break
+				}
+			}
+		}
+
+		// Check for pending (in-progress) review — skipped by latestByUser.
+		hasPending := false
+		for _, r := range m.reviews {
+			if r.User.Login == m.currentUser && r.State == "PENDING" {
+				hasPending = true
+				break
+			}
+		}
+
+		if hasPending {
+			banners = append(banners, alertBanner{
+				key: "myreview", level: alertWarning, icon: iconReview,
+				title: "Review in progress",
+			})
+		} else if isRequested && !hasReviewed {
+			banners = append(banners, alertBanner{
+				key: "myreview", level: alertDanger, icon: iconReview,
+				title: "Your review is requested",
+			})
+		} else if hasReviewed {
+			var level alertLevel
+			var title string
+			switch myLatest.State {
+			case "APPROVED":
+				level = alertSuccess
+				title = "You approved this PR"
+			case "CHANGES_REQUESTED":
+				level = alertWarning
+				title = "You requested changes"
+			case "COMMENTED":
+				level = alertInfo
+				title = "You commented"
+			default:
+				level = alertInfo
+				title = "You reviewed"
+			}
+			banners = append(banners, alertBanner{
+				key: "myreview", level: level, icon: iconReview,
+				title: title,
+			})
+		}
+	}
+
 	// Unresolved threads banner.
 	unresolvedThreads := m.unresolvedThreadDetails()
 	if len(unresolvedThreads) > 0 {
@@ -2209,8 +2346,40 @@ func (m Model) buildBanners(w int) []alertBanner {
 	return banners
 }
 
+// bannerOrderForMode defines which banners appear and in what order per mode.
+// Keys not listed are excluded from that mode entirely.
+var authorBannerOrder = []string{"checks", "changes", "replies", "threads", "reviews", "merge"}
+var reviewerBannerOrder = []string{"myreview", "replies", "checks", "merge"}
+
+func (m Model) buildBannersForMode(w int) []alertBanner {
+	all := m.buildBanners(w)
+
+	order := authorBannerOrder
+	if m.viewMode == modeReviewer {
+		order = reviewerBannerOrder
+	}
+
+	allowed := make(map[string]bool)
+	for _, key := range order {
+		allowed[key] = true
+	}
+
+	byKey := make(map[string][]alertBanner)
+	for _, b := range all {
+		if allowed[b.key] {
+			byKey[b.key] = append(byKey[b.key], b)
+		}
+	}
+
+	var result []alertBanner
+	for _, key := range order {
+		result = append(result, byKey[key]...)
+	}
+	return result
+}
+
 func (m Model) bannerKeys() []string {
-	banners := m.buildBanners(0)
+	banners := m.buildBannersForMode(0)
 	keys := make([]string, len(banners))
 	for i, b := range banners {
 		keys[i] = b.key
@@ -2219,7 +2388,7 @@ func (m Model) bannerKeys() []string {
 }
 
 func (m *Model) moveOverviewCursor(dir int) {
-	banners := m.buildBanners(0)
+	banners := m.buildBannersForMode(0)
 	if len(banners) == 0 {
 		return
 	}

@@ -23,11 +23,17 @@ type PullRequest struct {
 	Labels             []Label    `json:"labels"`
 	RequestedReviewers []User     `json:"requested_reviewers"`
 	RequestedTeams     []Team     `json:"requested_teams"`
+	Assignees          []User     `json:"assignees"`
 }
 
 type Team struct {
-	Name string `json:"name"`
-	Slug string `json:"slug"`
+	Name         string `json:"name"`
+	Slug         string `json:"slug"`
+	Organization *Org   `json:"organization"`
+}
+
+type Org struct {
+	Login string `json:"login"`
 }
 
 type User struct {

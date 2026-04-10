@@ -116,6 +116,42 @@ func (c *CachedClient) GetCurrentUser() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
+// UserTeamsLoadedMsg is sent when the user's teams are loaded.
+type UserTeamsLoadedMsg struct {
+	Teams []Team
+}
+
+// GetUserTeams returns a tea.Cmd that fetches the authenticated user's teams with caching.
+func (c *CachedClient) GetUserTeams() tea.Cmd {
+	fetchFn := func() ([]Team, error) {
+		return c.client.GetUserTeams(context.Background())
+	}
+
+	data, found, _, refetchFn := cache.Query(c.cache, "user-teams", fetchFn)
+
+	var cmds []tea.Cmd
+
+	if found {
+		teams := data
+		cmds = append(cmds, func() tea.Msg {
+			return UserTeamsLoadedMsg{Teams: teams}
+		})
+	}
+
+	if refetchFn != nil {
+		fn := refetchFn
+		cmds = append(cmds, func() tea.Msg {
+			result, err := fn()
+			if err != nil {
+				return QueryErrMsg{Err: err}
+			}
+			return UserTeamsLoadedMsg{Teams: result}
+		})
+	}
+
+	return tea.Batch(cmds...)
+}
+
 // ReviewsLoadedMsg is sent when PR reviews are loaded.
 type ReviewsLoadedMsg struct {
 	Reviews []Review
