@@ -311,7 +311,7 @@ func (m Model) Init() tea.Cmd {
 		client := m.ctx.Client
 		branch := m.branch
 		cmds = append(cmds, func() tea.Msg {
-			pr, err := client.FetchPRByBranch(branch)
+			pr, err := client.FetchPRByBranch(m.ctx.Owner, m.ctx.Repo, branch)
 			if err != nil {
 				return prDetectFailedMsg{}
 			}

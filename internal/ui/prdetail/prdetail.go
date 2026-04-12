@@ -59,44 +59,44 @@ type CommentErrorMsg struct {
 	Err error
 }
 
-func fetchPullRequestFiles(c *github.CachedClient, number int) tea.Cmd {
-	data, found, refetch := c.GetPullRequestFiles(number)
+func fetchPullRequestFiles(c *github.CachedClient, owner, repo string, number int) tea.Cmd {
+	data, found, refetch := c.GetPullRequestFiles(owner, repo, number)
 	return uictx.CachedCmd(data, found, refetch, func(files []github.PullRequestFile) tea.Msg {
 		return PRFilesLoadedMsg{Files: files, Number: number}
 	})
 }
 
-func fetchReviews(c *github.CachedClient, number int) tea.Cmd {
-	data, found, refetch := c.GetReviews(number)
+func fetchReviews(c *github.CachedClient, owner, repo string, number int) tea.Cmd {
+	data, found, refetch := c.GetReviews(owner, repo, number)
 	return uictx.CachedCmd(data, found, refetch, func(reviews []github.Review) tea.Msg {
 		return ReviewsLoadedMsg{Reviews: reviews, Number: number}
 	})
 }
 
-func fetchIssueComments(c *github.CachedClient, number int) tea.Cmd {
-	data, found, refetch := c.GetIssueComments(number)
+func fetchIssueComments(c *github.CachedClient, owner, repo string, number int) tea.Cmd {
+	data, found, refetch := c.GetIssueComments(owner, repo, number)
 	return uictx.CachedCmd(data, found, refetch, func(comments []github.IssueComment) tea.Msg {
 		return CommentsLoadedMsg{Comments: comments, Number: number}
 	})
 }
 
-func fetchReviewComments(c *github.CachedClient, number int) tea.Cmd {
-	data, found, refetch := c.GetReviewComments(number)
+func fetchReviewComments(c *github.CachedClient, owner, repo string, number int) tea.Cmd {
+	data, found, refetch := c.GetReviewComments(owner, repo, number)
 	return uictx.CachedCmd(data, found, refetch, func(comments []github.ReviewComment) tea.Msg {
 		return ReviewCommentsLoadedMsg{Comments: comments, Number: number}
 	})
 }
 
-func fetchCheckRuns(c *github.CachedClient, ref string) tea.Cmd {
-	data, found, refetch := c.GetCheckRuns(ref)
+func fetchCheckRuns(c *github.CachedClient, owner, repo, ref string) tea.Cmd {
+	data, found, refetch := c.GetCheckRuns(owner, repo, ref)
 	return uictx.CachedCmd(data, found, refetch, func(checks []github.CheckRun) tea.Msg {
 		return CheckRunsLoadedMsg{CheckRuns: checks, Ref: ref}
 	})
 }
 
-func createReviewComment(c *github.CachedClient, number int, body, commitID, path string, line int, side string, startLine int, startSide string) tea.Cmd {
+func createReviewComment(c *github.CachedClient, owner, repo string, number int, body, commitID, path string, line int, side string, startLine int, startSide string) tea.Cmd {
 	return func() tea.Msg {
-		comment, err := c.CreateReviewComment(number, body, commitID, path, line, side, startLine, startSide)
+		comment, err := c.CreateReviewComment(owner, repo, number, body, commitID, path, line, side, startLine, startSide)
 		if err != nil {
 			return CommentErrorMsg{Err: err}
 		}
@@ -104,9 +104,9 @@ func createReviewComment(c *github.CachedClient, number int, body, commitID, pat
 	}
 }
 
-func replyToReviewComment(c *github.CachedClient, number int, commentID int, body string) tea.Cmd {
+func replyToReviewComment(c *github.CachedClient, owner, repo string, number int, commentID int, body string) tea.Cmd {
 	return func() tea.Msg {
-		comment, err := c.ReplyToReviewComment(number, commentID, body)
+		comment, err := c.ReplyToReviewComment(owner, repo, number, commentID, body)
 		if err != nil {
 			return CommentErrorMsg{Err: err}
 		}
@@ -168,9 +168,10 @@ type fileHighlightedMsg struct {
 type prefetchDoneMsg struct{}
 
 type Model struct {
-	pr     github.PullRequest
-	ctx    *uictx.Context
-	client *github.CachedClient // scoped to this PR's repo
+	pr    github.PullRequest
+	ctx   *uictx.Context
+	owner string
+	repo  string
 	width  int
 	height int
 
@@ -241,16 +242,17 @@ type Model struct {
 }
 
 func New(pr github.PullRequest, ctx *uictx.Context, width, height int) Model {
-	client := ctx.Client
-	repoNWO := ""
+	owner, repo := ctx.Owner, ctx.Repo
 	if pr.Base.Repo != nil {
-		repoNWO = pr.Base.Repo.Owner.Login + "/" + pr.Base.Repo.Name
-		client = ctx.Client.Scoped(pr.Base.Repo.Owner.Login, pr.Base.Repo.Name)
+		owner = pr.Base.Repo.Owner.Login
+		repo = pr.Base.Repo.Name
 	}
+	repoNWO := owner + "/" + repo
 	return Model{
 		pr:              pr,
 		ctx:             ctx,
-		client:          client,
+		owner:           owner,
+		repo:            repo,
 		width:           width,
 		height:          height,
 		currentFileIdx:  -1,
@@ -281,7 +283,7 @@ func (m Model) PRTitle() string {
 }
 
 func (m Model) RepoFullName() string {
-	return m.client.RepoFullName()
+	return m.owner + "/" + m.repo
 }
 
 func (m *Model) activeViewport() *viewport.Model {
@@ -354,11 +356,11 @@ func (m Model) Init() tea.Cmd {
 			rendered := renderMarkdown(body, width)
 			return descRenderedMsg{content: rendered, prNumber: prNumber}
 		},
-		fetchPullRequestFiles(m.client, m.pr.Number),
-		fetchReviews(m.client, m.pr.Number),
-		fetchIssueComments(m.client, m.pr.Number),
-		fetchReviewComments(m.client, m.pr.Number),
-		fetchCheckRuns(m.client, m.pr.Head.SHA),
+		fetchPullRequestFiles(m.ctx.Client, m.owner, m.repo, m.pr.Number),
+		fetchReviews(m.ctx.Client, m.owner, m.repo, m.pr.Number),
+		fetchIssueComments(m.ctx.Client, m.owner, m.repo, m.pr.Number),
+		fetchReviewComments(m.ctx.Client, m.owner, m.repo, m.pr.Number),
+		fetchCheckRuns(m.ctx.Client, m.owner, m.repo, m.pr.Head.SHA),
 	}
 	if m.copilotClient != nil {
 		cmds = append(cmds, m.copilotClient.ListenCmd())
@@ -580,12 +582,12 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 
 	case refetchPRMsg:
 		// Invalidate and re-fetch PR data.
-		m.client.InvalidatePR(m.pr.Number)
+		m.ctx.Client.InvalidatePR(m.owner, m.repo, m.pr.Number)
 		cmds := []tea.Cmd{
-			fetchPullRequestFiles(m.client, m.pr.Number),
-			fetchReviews(m.client, m.pr.Number),
-			fetchReviewComments(m.client, m.pr.Number),
-			fetchCheckRuns(m.client, m.pr.Head.SHA),
+			fetchPullRequestFiles(m.ctx.Client, m.owner, m.repo, m.pr.Number),
+			fetchReviews(m.ctx.Client, m.owner, m.repo, m.pr.Number),
+			fetchReviewComments(m.ctx.Client, m.owner, m.repo, m.pr.Number),
+			fetchCheckRuns(m.ctx.Client, m.owner, m.repo, m.pr.Head.SHA),
 		}
 		if m.refWatcher != nil {
 			cmds = append(cmds, m.refWatcher.WaitCmd())
@@ -1120,10 +1122,10 @@ func (m Model) handleCommentKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		m.composing = false
 		var cmd tea.Cmd
 		if m.replyToID != nil {
-			cmd = replyToReviewComment(m.client, m.pr.Number, *m.replyToID, body)
+			cmd = replyToReviewComment(m.ctx.Client, m.owner, m.repo, m.pr.Number, *m.replyToID, body)
 		} else {
 			cmd = createReviewComment(
-				m.client, m.pr.Number, body, m.pr.Head.SHA,
+				m.ctx.Client, m.owner, m.repo, m.pr.Number, body, m.pr.Head.SHA,
 				m.commentFile, m.commentLine, m.commentSide,
 				m.commentStartLine, m.commentStartSide,
 			)
@@ -1701,7 +1703,7 @@ func (m Model) buildOverviewContent(w int) string {
 	content.WriteString("\n" + indent(meta, overviewPad) + "\n")
 
 	// Title.
-	prURL := fmt.Sprintf("https://github.com/%s/pull/%d", m.client.RepoFullName(), m.pr.Number)
+	prURL := fmt.Sprintf("https://github.com/%s/pull/%d", m.owner + "/" + m.repo, m.pr.Number)
 	title := lipgloss.NewStyle().Bold(true).
 		UnderlineStyle(lipgloss.UnderlineDotted).
 		Hyperlink(prURL).
@@ -1780,13 +1782,13 @@ func (m Model) highlightFileCmd(index int) tea.Cmd {
 	f := m.files[index]
 	ref := m.pr.Head.SHA
 	prNumber := m.pr.Number
-	client := m.client
+	client := m.ctx.Client
 	chromaStyle := m.ctx.DiffColors.ChromaStyle
 
 	return func() tea.Msg {
 		var fileContent string
 		if f.Status != "removed" && f.Patch != "" {
-			if content, err := client.FetchFileContent(f.Filename, ref); err == nil {
+			if content, err := client.FetchFileContent(m.owner, m.repo, f.Filename, ref); err == nil {
 				fileContent = content
 			}
 		}
@@ -1890,7 +1892,7 @@ func (m Model) prefetchFiles(n int) []tea.Cmd {
 	}
 
 	ref := m.pr.Head.SHA
-	client := m.client
+	client := m.ctx.Client
 	var cmds []tea.Cmd
 	for i := 0; i < limit; i++ {
 		f := m.files[i]
@@ -1899,7 +1901,7 @@ func (m Model) prefetchFiles(n int) []tea.Cmd {
 		}
 		filename := f.Filename
 		cmds = append(cmds, func() tea.Msg {
-			client.FetchFileContent(filename, ref)
+			client.FetchFileContent(m.owner, m.repo, filename, ref)
 			return prefetchDoneMsg{}
 		})
 	}

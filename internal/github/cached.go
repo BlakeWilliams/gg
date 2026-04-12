@@ -22,31 +22,6 @@ func NewCachedClient(client *Client, opts cache.Options) *CachedClient {
 	}
 }
 
-// Scoped returns a new CachedClient targeting the given owner/repo,
-// sharing the same cache and REST/GraphQL clients.
-func (c *CachedClient) Scoped(owner, repo string) *CachedClient {
-	return &CachedClient{
-		client: &Client{
-			rest:  c.client.rest,
-			gql:   c.client.gql,
-			owner: owner,
-			repo:  repo,
-		},
-		cache: c.cache,
-	}
-}
-
-// Owner returns the repo owner.
-func (c *CachedClient) Owner() string { return c.client.owner }
-
-// Repo returns the repo name.
-func (c *CachedClient) Repo() string { return c.client.repo }
-
-// RepoFullName returns the owner/repo string.
-func (c *CachedClient) RepoFullName() string {
-	return c.client.RepoFullName()
-}
-
 // GCInterval returns the configured GC interval for tick commands.
 func (c *CachedClient) GCInterval() time.Duration {
 	return c.cache.GCInterval()
@@ -58,9 +33,10 @@ func (c *CachedClient) GC() {
 }
 
 // InvalidatePR removes cached data for a specific PR.
-func (c *CachedClient) InvalidatePR(number int) {
-	c.cache.Invalidate(fmt.Sprintf("pull:%d", number))
-	c.cache.Invalidate(fmt.Sprintf("pull-files:%d", number))
+func (c *CachedClient) InvalidatePR(owner, repo string, number int) {
+	key := fmt.Sprintf("%s/%s:pull:%d", owner, repo, number)
+	c.cache.Invalidate(key)
+	c.cache.Invalidate(fmt.Sprintf("%s/%s:pull-files:%d", owner, repo, number))
 }
 
 // InvalidateAll clears the entire cache.
@@ -69,85 +45,75 @@ func (c *CachedClient) InvalidateAll() {
 }
 
 // --- Cached query methods ---
-// These return (data, found, refetchFn) from the cache layer.
-// found=true means cached data is available immediately.
-// refetchFn is non-nil when the data needs a fresh fetch (cache miss or stale).
 
-// ListPullRequests returns cached PRs and an optional refetch function.
-func (c *CachedClient) ListPullRequests() (data []PullRequest, found bool, refetch func() ([]PullRequest, error)) {
+func (c *CachedClient) ListPullRequests(owner, repo string) (data []PullRequest, found bool, refetch func() ([]PullRequest, error)) {
+	key := fmt.Sprintf("%s/%s:pulls", owner, repo)
 	fetchFn := func() ([]PullRequest, error) {
-		return c.client.ListPullRequests(context.Background())
+		return c.client.ListPullRequests(context.Background(), owner, repo)
 	}
-	data, found, _, refetch = cache.Query(c.cache, "pulls", fetchFn)
+	data, found, _, refetch = cache.Query(c.cache, key, fetchFn)
 	return
 }
 
-// GetReviews returns cached reviews and an optional refetch function.
-func (c *CachedClient) GetReviews(number int) (data []Review, found bool, refetch func() ([]Review, error)) {
-	key := fmt.Sprintf("reviews:%d", number)
+func (c *CachedClient) GetReviews(owner, repo string, number int) (data []Review, found bool, refetch func() ([]Review, error)) {
+	key := fmt.Sprintf("%s/%s:reviews:%d", owner, repo, number)
 	fetchFn := func() ([]Review, error) {
-		return c.client.GetReviews(context.Background(), number)
+		return c.client.GetReviews(context.Background(), owner, repo, number)
 	}
 	data, found, _, refetch = cache.Query(c.cache, key, fetchFn)
 	return
 }
 
-// GetIssueComments returns cached comments and an optional refetch function.
-func (c *CachedClient) GetIssueComments(number int) (data []IssueComment, found bool, refetch func() ([]IssueComment, error)) {
-	key := fmt.Sprintf("comments:%d", number)
+func (c *CachedClient) GetIssueComments(owner, repo string, number int) (data []IssueComment, found bool, refetch func() ([]IssueComment, error)) {
+	key := fmt.Sprintf("%s/%s:comments:%d", owner, repo, number)
 	fetchFn := func() ([]IssueComment, error) {
-		return c.client.GetIssueComments(context.Background(), number)
+		return c.client.GetIssueComments(context.Background(), owner, repo, number)
 	}
 	data, found, _, refetch = cache.Query(c.cache, key, fetchFn)
 	return
 }
 
-// GetReviewComments returns cached review comments and an optional refetch function.
-func (c *CachedClient) GetReviewComments(number int) (data []ReviewComment, found bool, refetch func() ([]ReviewComment, error)) {
-	key := fmt.Sprintf("review-comments:%d", number)
+func (c *CachedClient) GetReviewComments(owner, repo string, number int) (data []ReviewComment, found bool, refetch func() ([]ReviewComment, error)) {
+	key := fmt.Sprintf("%s/%s:review-comments:%d", owner, repo, number)
 	fetchFn := func() ([]ReviewComment, error) {
-		return c.client.GetReviewComments(context.Background(), number)
+		return c.client.GetReviewComments(context.Background(), owner, repo, number)
 	}
 	data, found, _, refetch = cache.Query(c.cache, key, fetchFn)
 	return
 }
 
-// GetCheckRuns returns cached check runs and an optional refetch function.
-func (c *CachedClient) GetCheckRuns(ref string) (data []CheckRun, found bool, refetch func() ([]CheckRun, error)) {
-	key := fmt.Sprintf("check-runs:%s", ref)
+func (c *CachedClient) GetCheckRuns(owner, repo, ref string) (data []CheckRun, found bool, refetch func() ([]CheckRun, error)) {
+	key := fmt.Sprintf("%s/%s:check-runs:%s", owner, repo, ref)
 	fetchFn := func() ([]CheckRun, error) {
-		return c.client.GetCheckRuns(context.Background(), ref)
+		return c.client.GetCheckRuns(context.Background(), owner, repo, ref)
 	}
 	data, found, _, refetch = cache.Query(c.cache, key, fetchFn)
 	return
 }
 
-// GetPullRequestFiles returns cached PR files and an optional refetch function.
-func (c *CachedClient) GetPullRequestFiles(number int) (data []PullRequestFile, found bool, refetch func() ([]PullRequestFile, error)) {
-	key := fmt.Sprintf("pull-files:%d", number)
+func (c *CachedClient) GetPullRequestFiles(owner, repo string, number int) (data []PullRequestFile, found bool, refetch func() ([]PullRequestFile, error)) {
+	key := fmt.Sprintf("%s/%s:pull-files:%d", owner, repo, number)
 	fetchFn := func() ([]PullRequestFile, error) {
-		return c.client.GetPullRequestFiles(context.Background(), number)
+		return c.client.GetPullRequestFiles(context.Background(), owner, repo, number)
 	}
 	data, found, _, refetch = cache.Query(c.cache, key, fetchFn)
 	return
 }
 
-// GetFileContent returns cached file content and an optional refetch function.
-func (c *CachedClient) GetFileContent(filename, ref string) (data string, found bool, refetch func() (string, error)) {
-	key := fmt.Sprintf("file-content:%s:%s", ref, filename)
+func (c *CachedClient) GetFileContent(owner, repo, filename, ref string) (data string, found bool, refetch func() (string, error)) {
+	key := fmt.Sprintf("%s/%s:file-content:%s:%s", owner, repo, ref, filename)
 	fetchFn := func() (string, error) {
-		return c.client.GetFileContent(context.Background(), filename, ref)
+		return c.client.GetFileContent(context.Background(), owner, repo, filename, ref)
 	}
 	data, found, _, refetch = cache.Query(c.cache, key, fetchFn)
 	return
 }
 
 // FetchFileContent synchronously fetches file content, using the cache.
-// Intended for use inside a goroutine.
-func (c *CachedClient) FetchFileContent(filename, ref string) (string, error) {
-	key := fmt.Sprintf("file-content:%s:%s", ref, filename)
+func (c *CachedClient) FetchFileContent(owner, repo, filename, ref string) (string, error) {
+	key := fmt.Sprintf("%s/%s:file-content:%s:%s", owner, repo, ref, filename)
 	fetchFn := func() (string, error) {
-		return c.client.GetFileContent(context.Background(), filename, ref)
+		return c.client.GetFileContent(context.Background(), owner, repo, filename, ref)
 	}
 
 	data, found, _, refetchFn := cache.Query(c.cache, key, fetchFn)
@@ -162,12 +128,10 @@ func (c *CachedClient) FetchFileContent(filename, ref string) (string, error) {
 
 // --- Direct fetch methods (no caching) ---
 
-// FetchAuthenticatedUser fetches the current user.
 func (c *CachedClient) FetchAuthenticatedUser() (User, error) {
 	return c.client.GetAuthenticatedUser(context.Background())
 }
 
-// FetchInbox fetches all inbox PRs with GraphQL enrichment.
 func (c *CachedClient) FetchInbox(username, nwo string) ([]InboxPR, error) {
 	prs, err := c.client.FetchInboxPRs(context.Background(), username, nwo)
 	if err != nil {
@@ -177,32 +141,28 @@ func (c *CachedClient) FetchInbox(username, nwo string) ([]InboxPR, error) {
 	return prs, nil
 }
 
-// FetchPR fetches a single PR by owner/repo/number.
 func (c *CachedClient) FetchPR(owner, repo string, number int) (PullRequest, error) {
-	return c.client.GetPullRequestFromRepo(context.Background(), owner, repo, number)
+	return c.client.GetPullRequest(context.Background(), owner, repo, number)
 }
 
-// FetchPRByBranch finds an open PR for the given branch.
-func (c *CachedClient) FetchPRByBranch(branch string) (PullRequest, error) {
-	return c.client.GetPullRequestByBranch(context.Background(), branch)
+func (c *CachedClient) FetchPRByBranch(owner, repo, branch string) (PullRequest, error) {
+	return c.client.GetPullRequestByBranch(context.Background(), owner, repo, branch)
 }
 
-// CreateReviewComment posts a new review comment.
-func (c *CachedClient) CreateReviewComment(number int, body, commitID, path string, line int, side string, startLine int, startSide string) (ReviewComment, error) {
-	comment, err := c.client.CreateReviewComment(context.Background(), number, body, commitID, path, line, side, startLine, startSide)
+func (c *CachedClient) CreateReviewComment(owner, repo string, number int, body, commitID, path string, line int, side string, startLine int, startSide string) (ReviewComment, error) {
+	comment, err := c.client.CreateReviewComment(context.Background(), owner, repo, number, body, commitID, path, line, side, startLine, startSide)
 	if err != nil {
 		return ReviewComment{}, err
 	}
-	c.cache.Invalidate(fmt.Sprintf("review-comments:%d", number))
+	c.cache.Invalidate(fmt.Sprintf("%s/%s:review-comments:%d", owner, repo, number))
 	return comment, nil
 }
 
-// ReplyToReviewComment replies to an existing comment thread.
-func (c *CachedClient) ReplyToReviewComment(number int, commentID int, body string) (ReviewComment, error) {
-	comment, err := c.client.ReplyToReviewComment(context.Background(), number, commentID, body)
+func (c *CachedClient) ReplyToReviewComment(owner, repo string, number int, commentID int, body string) (ReviewComment, error) {
+	comment, err := c.client.ReplyToReviewComment(context.Background(), owner, repo, number, commentID, body)
 	if err != nil {
 		return ReviewComment{}, err
 	}
-	c.cache.Invalidate(fmt.Sprintf("review-comments:%d", number))
+	c.cache.Invalidate(fmt.Sprintf("%s/%s:review-comments:%d", owner, repo, number))
 	return comment, nil
 }

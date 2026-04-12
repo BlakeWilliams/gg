@@ -27,8 +27,8 @@ type PRsLoadedMsg struct {
 }
 
 // ListPullRequests returns a tea.Cmd that fetches PRs with caching.
-func ListPullRequests(c *github.CachedClient) tea.Cmd {
-	data, found, refetch := c.ListPullRequests()
+func ListPullRequests(c *github.CachedClient, owner, repo string) tea.Cmd {
+	data, found, refetch := c.ListPullRequests(owner, repo)
 	return uictx.CachedCmd(data, found, refetch, func(prs []github.PullRequest) tea.Msg {
 		return PRsLoadedMsg{PRs: prs}
 	})
@@ -167,7 +167,7 @@ func New(ctx *uictx.Context) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.list.StartSpinner(), ListPullRequests(m.ctx.Client))
+	return tea.Batch(m.list.StartSpinner(), ListPullRequests(m.ctx.Client, m.ctx.Owner, m.ctx.Repo))
 }
 
 func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {

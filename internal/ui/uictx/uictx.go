@@ -28,9 +28,9 @@ func FetchPR(c *github.CachedClient, owner, repo string, number int) tea.Cmd {
 }
 
 // FetchPRByBranch returns a tea.Cmd that finds an open PR for the given branch.
-func FetchPRByBranch(c *github.CachedClient, branch string) tea.Cmd {
+func FetchPRByBranch(c *github.CachedClient, owner, repo, branch string) tea.Cmd {
 	return func() tea.Msg {
-		pr, err := c.FetchPRByBranch(branch)
+		pr, err := c.FetchPRByBranch(owner, repo, branch)
 		if err != nil {
 			return QueryErrMsg{Err: err}
 		}

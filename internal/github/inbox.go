@@ -7,27 +7,6 @@ import (
 	"time"
 )
 
-// GetAuthenticatedUser returns the currently authenticated GitHub user.
-func (c *Client) GetAuthenticatedUser(ctx context.Context) (User, error) {
-	var user User
-	err := c.rest.Get("user", &user)
-	if err != nil {
-		return user, fmt.Errorf("getting authenticated user: %w", err)
-	}
-	return user, nil
-}
-
-// SearchIssues searches GitHub issues/PRs with the given query string.
-func (c *Client) SearchIssues(ctx context.Context, query string) ([]SearchIssueResult, error) {
-	var resp SearchResponse
-	path := fmt.Sprintf("search/issues?q=%s&per_page=100&sort=updated&order=desc", query)
-	err := c.rest.Get(path, &resp)
-	if err != nil {
-		return nil, fmt.Errorf("searching issues: %w", err)
-	}
-	return resp.Items, nil
-}
-
 // FetchInboxPRs fetches all PRs relevant to the given username from all repos.
 // It makes 4 parallel searches and deduplicates the results.
 // If nwo is non-empty, results are scoped to that repo.

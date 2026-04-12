@@ -274,7 +274,7 @@ func (m Model) detectedRepo() string {
 	if m.nwo != "" {
 		return m.nwo
 	}
-	r := m.ctx.Client.RepoFullName()
+	r := m.ctx.Owner + "/" + m.ctx.Repo
 	if r == "/" {
 		return "" // no repo detected
 	}

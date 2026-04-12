@@ -400,7 +400,7 @@ func (m Model) handleCommand(msg commandbar.CommandMsg) (tea.Model, tea.Cmd) {
 	case "refresh":
 		if _, ok := m.activeView.(prlist.Model); ok {
 			m.ctx.Client.InvalidateAll()
-			return m, prlist.ListPullRequests(m.ctx.Client)
+			return m, prlist.ListPullRequests(m.ctx.Client, m.ctx.Owner, m.ctx.Repo)
 		}
 		if _, ok := m.activeView.(localdiff.Model); ok {
 			m.activeView = localdiff.New(m.ctx, m.repoRoot, m.width, m.height-chromeHeight)
@@ -445,7 +445,7 @@ func (m Model) handleCommand(msg commandbar.CommandMsg) (tea.Model, tea.Cmd) {
 			if branch != "" {
 				m.history = append(m.history, m.activeView)
 				m.forward = nil
-				return m, uictx.FetchPRByBranch(m.ctx.Client, branch)
+				return m, uictx.FetchPRByBranch(m.ctx.Client, m.ctx.Owner, m.ctx.Repo, branch)
 			}
 		}
 	case "working":
@@ -500,7 +500,7 @@ func (m Model) renderHeader() string {
 	sep := styles.HeaderSep.Render(" / ")
 
 	// Always show repo name if available.
-	repo := m.ctx.Client.RepoFullName()
+	repo := m.ctx.Owner + "/" + m.ctx.Repo
 	var crumb string
 
 	switch v := m.activeView.(type) {
