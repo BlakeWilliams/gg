@@ -48,6 +48,15 @@ func gcTickCmd(c *github.CachedClient) tea.Cmd {
 	})
 }
 
+// emptyView is a no-op view used as a placeholder before the user picks a mode.
+type emptyView struct{}
+
+func (emptyView) Init() tea.Cmd                                        { return nil }
+func (e emptyView) Update(tea.Msg) (uictx.View, tea.Cmd)               { return e, nil }
+func (e emptyView) HandleKey(tea.KeyPressMsg) (uictx.View, tea.Cmd, bool) { return e, nil, false }
+func (emptyView) View() string                                         { return "" }
+func (emptyView) KeyBindings() []uictx.KeyBinding                      { return nil }
+
 type inputMode int
 type quitTimeoutMsg struct{}
 
@@ -124,7 +133,7 @@ func NewApp(cfg AppConfig) Model {
 		m.activeView = inboxui.New(ctx, m.nwo())
 	default:
 		// No mode specified — show startup picker over blank screen.
-		m.activeView = nil
+		m.activeView = emptyView{}
 	}
 
 	return m
@@ -194,9 +203,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.commandBar.SetWidth(msg.Width)
 		contentMsg := tea.WindowSizeMsg{Width: msg.Width, Height: msg.Height - chromeHeight}
 		var cmd tea.Cmd
-		if m.activeView != nil {
-			m.activeView, cmd = m.activeView.Update(contentMsg)
-		}
+		m.activeView, cmd = m.activeView.Update(contentMsg)
 		return m, cmd
 
 	case commandbar.CommandMsg:
@@ -253,12 +260,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Delegate to active view first.
-		if m.activeView != nil {
-			view, cmd, handled := m.activeView.HandleKey(msg)
-			if handled {
-				m.activeView = view
-				return m, cmd
-			}
+		view, cmd, handled := m.activeView.HandleKey(msg)
+		if handled {
+			m.activeView = view
+			return m, cmd
 		}
 
 		// Global shortcuts (view didn't claim the key).
@@ -402,12 +407,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	// Forward non-key messages to active view.
-	if m.activeView != nil {
-		var cmd tea.Cmd
-		m.activeView, cmd = m.activeView.Update(msg)
-		return m, cmd
-	}
-	return m, nil
+	var cmd tea.Cmd
+	m.activeView, cmd = m.activeView.Update(msg)
+	return m, cmd
 }
 
 func (m Model) navigateBack() (tea.Model, tea.Cmd) {
@@ -523,11 +525,7 @@ func (m Model) View() tea.View {
 		contentHeight = 0
 	}
 
-	var viewContent string
-	if m.activeView != nil {
-		viewContent = m.activeView.View()
-	}
-	content := lipgloss.NewStyle().Height(contentHeight).Render(viewContent)
+	content := lipgloss.NewStyle().Height(contentHeight).Render(m.activeView.View())
 
 	// Overlay modals if open.
 	if m.mode == modePicker {
