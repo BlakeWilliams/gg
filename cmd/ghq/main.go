@@ -29,11 +29,7 @@ func main() {
 		GCInterval: 1 * time.Minute,
 	})
 
-	// Detect git repo for local diff view.
-	var repoRoot string
-	if git.IsGitRepo(".") {
-		repoRoot, _ = git.RepoRoot(".")
-	}
+	repoRoot, _ := git.RepoRoot(".")
 
 	p := tea.NewProgram(ui.NewApp(cachedClient, *nwo, repoRoot))
 	if _, err := p.Run(); err != nil {

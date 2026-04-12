@@ -25,6 +25,21 @@ type PRSelectedMsg struct {
 	Number int
 }
 
+// InboxLoadedMsg is sent when the inbox PRs are loaded and enriched.
+type InboxLoadedMsg struct {
+	PRs []github.InboxPR
+}
+
+func fetchInbox(c *github.CachedClient, username, nwo string) tea.Cmd {
+	return func() tea.Msg {
+		prs, err := c.FetchInbox(username, nwo)
+		if err != nil {
+			return uictx.QueryErrMsg{Err: err}
+		}
+		return InboxLoadedMsg{PRs: prs}
+	}
+}
+
 type filter string
 
 const (
@@ -92,7 +107,7 @@ func (m Model) Init() tea.Cmd {
 	}
 	m.loading = true
 	return tea.Batch(
-		m.ctx.Client.FetchInbox(m.ctx.Username, ""),
+		fetchInbox(m.ctx.Client, m.ctx.Username, ""),
 		m.spinner.Tick,
 		m.scheduleRefresh(),
 	)
@@ -114,11 +129,11 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	case inboxRefreshMsg:
 		// Background refresh — don't show loading indicator.
 		return m, tea.Batch(
-			m.ctx.Client.FetchInbox(m.ctx.Username, ""),
+			fetchInbox(m.ctx.Client, m.ctx.Username, ""),
 			m.scheduleRefresh(),
 		)
 
-	case github.InboxLoadedMsg:
+	case InboxLoadedMsg:
 		m.loading = false
 		newPRs := inbox.ProcessInbox(msg.PRs, m.ctx.Username)
 
@@ -146,7 +161,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		}
 		return m, nil
 
-	case github.QueryErrMsg:
+	case uictx.QueryErrMsg:
 		m.loading = false
 		return m, nil
 
@@ -200,7 +215,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		}
 	case "r":
 		m.loading = true
-		return m, tea.Batch(m.ctx.Client.FetchInbox(m.ctx.Username, ""), m.spinner.Tick), true
+		return m, tea.Batch(fetchInbox(m.ctx.Client, m.ctx.Username, ""), m.spinner.Tick), true
 	case "tab":
 		// Toggle between all repos and current repo.
 		if m.detectedRepo() == "" {

@@ -2,13 +2,14 @@ package localdiff
 
 import (
 	"fmt"
+	"os/exec"
 	"strings"
 	"time"
 
+	"github.com/blakewilliams/ghq/internal/comments"
 	"github.com/blakewilliams/ghq/internal/copilot"
 	"github.com/blakewilliams/ghq/internal/git"
 	"github.com/blakewilliams/ghq/internal/github"
-	"github.com/blakewilliams/ghq/internal/localdiff"
 	"github.com/blakewilliams/ghq/internal/ui/components"
 	"github.com/blakewilliams/ghq/internal/ui/picker"
 	"github.com/blakewilliams/ghq/internal/ui/styles"
@@ -107,7 +108,7 @@ type Model struct {
 	copilotDots        int               // animation frame (0-3)
 
 	// Comments.
-	commentStore     *localdiff.CommentStore
+	commentStore     *comments.CommentStore
 	composing        bool
 	commentInput     textarea.Model
 	commentFile      string
@@ -138,19 +139,21 @@ type Model struct {
 	prLoaded bool                // true once checked
 
 	// Render cache.
-	lastContent string
+	lastContent          string
+	lastFormattedStreamLen int // length of copilot reply buffer at last formatFile
 
 	// Shared.
-	filesListLoaded bool
-	waitingG        bool
+	filesListLoaded  bool
+	waitingG         bool
+	stagingInFlight  int // number of staging ops in progress
 }
 
 func New(ctx *uictx.Context, repoRoot string, width, height int) Model {
 	branch, _ := git.CurrentBranch(repoRoot)
 	w, _ := watcher.New(repoRoot, nil)
 	cp, _ := copilot.New(repoRoot)
-	active := localdiff.LoadActiveState(repoRoot, branch)
-	vs := localdiff.LoadViewState(repoRoot, branch, active.Mode)
+	active := comments.LoadActiveState(repoRoot, branch)
+	vs := comments.LoadViewState(repoRoot, branch, active.Mode)
 	return Model{
 		ctx:              ctx,
 		repoRoot:         repoRoot,
@@ -163,7 +166,7 @@ func New(ctx *uictx.Context, repoRoot string, width, height int) Model {
 		treeWidth:        35,
 		treeFocused:      true,
 		watcher:          w,
-		commentStore:     localdiff.LoadComments(repoRoot),
+		commentStore:     comments.LoadComments(repoRoot),
 		copilot:          cp,
 		copilotReplyBuf:  make(map[string]string),
 		fileCursors:      make(map[int]int),
@@ -234,6 +237,21 @@ func (m Model) findDiffLineBySourceLine(fileIdx, lineNo int, side string) int {
 	return best
 }
 
+// treeFileIndex returns the file index for the file under the tree cursor, or -1.
+func (m Model) treeFileIndex() int {
+	if m.treeCursor < 2 {
+		return -1 // Overview or separator
+	}
+	eIdx := m.treeCursor - 2
+	if eIdx >= 0 && eIdx < len(m.treeEntries) {
+		e := m.treeEntries[eIdx]
+		if !e.IsDir && e.FileIndex >= 0 {
+			return e.FileIndex
+		}
+	}
+	return -1
+}
+
 // treeIndexForFile returns the tree cursor index for a given file index.
 func (m Model) treeIndexForFile(fileIdx int) int {
 	for i, e := range m.treeEntries {
@@ -263,12 +281,12 @@ func (m Model) saveViewState() {
 			}
 		}
 	}
-	localdiff.SaveViewState(m.repoRoot, m.branch, m.mode, localdiff.ViewState{
+	comments.SaveViewState(m.repoRoot, m.branch, m.mode, comments.ViewState{
 		Filename: filename,
 		LineNo:   lineNo,
 		Side:     side,
 	})
-	localdiff.SaveActiveState(m.repoRoot, m.branch, localdiff.ActiveState{Mode: m.mode})
+	comments.SaveActiveState(m.repoRoot, m.branch, comments.ActiveState{Mode: m.mode})
 }
 
 func (m Model) Init() tea.Cmd {
@@ -281,7 +299,7 @@ func (m Model) Init() tea.Cmd {
 	}
 	// Auto-detect PR for this branch.
 	if !m.prLoaded {
-		cmds = append(cmds, m.ctx.Client.FetchPRByBranch(m.branch))
+		cmds = append(cmds, uictx.FetchPRByBranch(m.ctx.Client, m.branch))
 	}
 	return tea.Batch(cmds...)
 }
@@ -407,10 +425,12 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 			m.treeCursor = 0
 		}
 
-		// Re-format files that kept their highlights (cheap, updates offsets).
-		for i, f := range msg.files {
+		// Only re-format the current file if it kept its highlights.
+		// Other files will be formatted lazily when navigated to.
+		if m.currentFileIdx >= 0 && m.currentFileIdx < len(msg.files) {
+			f := msg.files[m.currentFileIdx]
 			if _, ok := oldHighlights[f.Filename]; ok && oldPatches[f.Filename] == f.Patch {
-				m.formatFile(i)
+				m.formatFile(m.currentFileIdx)
 			}
 		}
 
@@ -419,7 +439,16 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		if m.savedFilename == "" && savedOffset > 0 {
 			m.vp.SetYOffset(savedOffset)
 		}
+
+		// Only highlight files that actually changed.
 		if len(needHighlight) > 0 {
+			// Prioritize the current file if it needs highlighting.
+			for i, idx := range needHighlight {
+				if idx == m.currentFileIdx {
+					needHighlight[0], needHighlight[i] = needHighlight[i], needHighlight[0]
+					break
+				}
+			}
 			return m, m.highlightFileCmd(needHighlight[0])
 		}
 		m.filesLoading = false
@@ -436,26 +465,43 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		m.filesLoading = true
 		m.currentFileIdx = -1
 		m.treeCursor = 0
-		vs := localdiff.LoadViewState(m.repoRoot, m.branch, m.mode)
+		vs := comments.LoadViewState(m.repoRoot, m.branch, m.mode)
 		m.savedFilename = vs.Filename
 		m.savedLineNo = vs.LineNo
 		m.savedSide = vs.Side
 		return m, m.loadDiff()
 
-	case github.PRLoadedMsg:
+	case uictx.PRLoadedMsg:
 		m.pr = &msg.PR
 		m.prLoaded = true
 		return m, nil
 
-	case github.QueryErrMsg:
+	case uictx.QueryErrMsg:
 		// Could be PR detection failure — just mark as checked.
 		if !m.prLoaded {
 			m.prLoaded = true
 		}
 		return m, nil
 
+	case stageDoneMsg:
+		m.stagingInFlight--
+		if m.stagingInFlight < 0 {
+			m.stagingInFlight = 0
+		}
+		// If all staging ops are done, do a single clean reload.
+		if m.stagingInFlight == 0 {
+			return m, m.loadDiff()
+		}
+		return m, nil
+
 	case watcher.FileChangedMsg:
-		// File changed on disk — re-run diff and immediately re-arm watcher.
+		// Suppress reloads while staging is in flight to avoid lock contention.
+		if m.stagingInFlight > 0 {
+			if m.watcher != nil {
+				return m, m.watcher.WaitCmd()
+			}
+			return m, nil
+		}
 		cmds := []tea.Cmd{m.loadDiff()}
 		if m.watcher != nil {
 			cmds = append(cmds, m.watcher.WaitCmd())
@@ -491,7 +537,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 			if body != "" {
 				for _, c := range m.commentStore.Comments {
 					if c.ID == msg.CommentID {
-						reply := localdiff.LocalComment{
+						reply := comments.LocalComment{
 							ID:          uuid.New().String(),
 							Body:        strings.TrimSpace(body),
 							Path:        c.Path,
@@ -516,6 +562,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 			}
 		} else if fileIdx := m.fileIndexForPath(m.copilotPendingPath); fileIdx >= 0 && fileIdx == m.currentFileIdx {
 			// Streaming delta — only re-render if we're looking at this file.
+			m.lastFormattedStreamLen = len(m.copilotReplyBuf[msg.CommentID])
 			m.formatFile(fileIdx)
 			m.rebuildContentIfChanged()
 		}
@@ -543,9 +590,14 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	case copilotTickMsg:
 		if m.copilotPendingFor != "" {
 			m.copilotDots = (m.copilotDots + 1) % 4
+			// Only re-format if new streaming content arrived since last format.
+			streamLen := len(m.copilotReplyBuf[m.copilotPendingFor])
 			if fileIdx := m.fileIndexForPath(m.copilotPendingPath); fileIdx >= 0 && fileIdx == m.currentFileIdx {
-				m.formatFile(fileIdx)
-				m.rebuildContentIfChanged()
+				if streamLen != m.lastFormattedStreamLen {
+					m.lastFormattedStreamLen = streamLen
+					m.formatFile(fileIdx)
+					m.rebuildContentIfChanged()
+				}
 			}
 			return m, tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg {
 				return copilotTickMsg{}
@@ -676,20 +728,38 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		m.treeFocused = !m.treeFocused
 		return m, nil, true
 	case "m":
-		// Open view mode picker.
-		return m, func() tea.Msg {
-			return OpenViewPickerMsg{Items: m.buildViewPickerItems()}
-		}, true
+		// Cycle diff mode: Working → Staged → Branch (skip Branch on default branch).
+		m.saveViewState()
+		defaultBranch, _ := git.DefaultBranch(m.repoRoot)
+		if m.branch == defaultBranch {
+			if m.mode == git.DiffWorking {
+				m.mode = git.DiffStaged
+			} else {
+				m.mode = git.DiffWorking
+			}
+		} else {
+			m.mode = (m.mode + 1) % 3
+		}
+		m.filesListLoaded = false
+		m.filesHighlighted = 0
+		m.filesLoading = true
+		m.currentFileIdx = -1
+		m.treeCursor = 0
+		vs := comments.LoadViewState(m.repoRoot, m.branch, m.mode)
+		m.savedFilename = vs.Filename
+		m.savedLineNo = vs.LineNo
+		m.savedSide = vs.Side
+		return m, m.loadDiff(), true
 	case "h", "left":
 		m.treeFocused = true
 		return m, nil, true
 	case "l", "right":
 		m.treeFocused = false
 		return m, nil, true
-	case "p", "ctrl+k":
+	case "ctrl+k":
 		m.moveTreeSelection(-1)
 		return m, nil, true
-	case "n", "ctrl+j":
+	case "ctrl+j":
 		m.moveTreeSelection(1)
 		return m, nil, true
 	case "j", "down":
@@ -772,6 +842,59 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 				return m, nil, true
 			}
 		}
+	case "s":
+		if m.mode == git.DiffWorking {
+			if m.treeFocused {
+				// Stage the whole file under the tree cursor.
+				if fileIdx := m.treeFileIndex(); fileIdx >= 0 {
+					m.currentFileIdx = fileIdx
+					return m.stageWholeFile(false)
+				}
+			} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
+				status := m.files[m.currentFileIdx].Status
+				if status == "removed" || status == "renamed" {
+					return m.stageWholeFile(false)
+				}
+				return m.stageSelection(false)
+			}
+		}
+	case "u":
+		if m.mode == git.DiffStaged {
+			if m.treeFocused {
+				if fileIdx := m.treeFileIndex(); fileIdx >= 0 {
+					m.currentFileIdx = fileIdx
+					return m.stageWholeFile(true)
+				}
+			} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
+				return m.stageSelection(true)
+			}
+		}
+	case "S":
+		if m.mode == git.DiffWorking {
+			if m.treeFocused {
+				if fileIdx := m.treeFileIndex(); fileIdx >= 0 {
+					m.currentFileIdx = fileIdx
+					return m.stageWholeFile(false)
+				}
+			} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
+				status := m.files[m.currentFileIdx].Status
+				if status == "removed" || status == "renamed" {
+					return m.stageWholeFile(false)
+				}
+				return m.stageHunk(false)
+			}
+		}
+	case "U":
+		if m.mode == git.DiffStaged {
+			if m.treeFocused {
+				if fileIdx := m.treeFileIndex(); fileIdx >= 0 {
+					m.currentFileIdx = fileIdx
+					return m.stageWholeFile(true)
+				}
+			} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
+				return m.stageHunk(true)
+			}
+		}
 	case "ctrl+d":
 		m.selectionAnchor = -1
 		if m.treeFocused {
@@ -852,7 +975,7 @@ func (m Model) KeyBindings() []uictx.KeyBinding {
 		{Key: "J / K", Description: "Extend selection range"},
 		{Key: "h / l", Description: "Focus left / right pane"},
 		{Key: "f", Description: "Toggle tree focus"},
-		{Key: "p / n", Description: "Previous / next file"},
+		{Key: "ctrl+j / k", Description: "Previous / next file"},
 		{Key: "ctrl+d / u", Description: "Scroll half page down / up"},
 		{Key: "ctrl+f / b", Description: "Scroll full page down / up"},
 		{Key: "g g", Description: "Go to top"},
@@ -862,6 +985,10 @@ func (m Model) KeyBindings() []uictx.KeyBinding {
 		{Key: "enter", Description: "Select file / enter comment thread"},
 		{Key: "r", Description: "Reply to comment thread"},
 		{Key: "x", Description: "Resolve / unresolve thread"},
+		{Key: "s", Description: "Stage line/selection (Working mode)"},
+		{Key: "u", Description: "Unstage line/selection (Staged mode)"},
+		{Key: "S", Description: "Stage entire hunk"},
+		{Key: "U", Description: "Unstage entire hunk"},
 		{Key: ":N", Description: "Jump to line number N"},
 		{Key: "esc", Description: "Cancel / exit thread"},
 	}
@@ -879,7 +1006,7 @@ func (m Model) StatusHints() (left, right []string) {
 		left = append(left, styles.StatusBarKey.Render("f")+" "+styles.StatusBarHint.Render("focus tree"))
 	}
 	left = append(left, styles.StatusBarKey.Render("h/l")+" "+styles.StatusBarHint.Render("panes"))
-	left = append(left, styles.StatusBarKey.Render("p/n")+" "+styles.StatusBarHint.Render("files"))
+	left = append(left, styles.StatusBarKey.Render("ctrl+j/k")+" "+styles.StatusBarHint.Render("files"))
 	if !m.treeFocused && m.currentFileIdx >= 0 {
 		left = append(left, styles.StatusBarKey.Render("J/K")+" "+styles.StatusBarHint.Render("select range"))
 		if m.threadCursor > 0 {
@@ -1182,7 +1309,7 @@ func (m *Model) formatFile(index int) {
 	hl := m.highlightedFiles[index]
 	width := m.contentWidth()
 	colors := m.ctx.DiffColors
-	comments := m.commentsForFile(index)
+	fileComments := m.commentsForFile(index)
 
 	// Highlight the comment thread under the cursor.
 	var opts components.DiffFormatOptions
@@ -1211,7 +1338,7 @@ func (m *Model) formatFile(index int) {
 		return renderMarkdownBody(body, width, bg)
 	}
 
-	result := components.FormatDiffFile(hl, width, colors, comments, opts)
+	result := components.FormatDiffFile(hl, width, colors, fileComments, opts)
 	m.renderedFiles[index] = result.Content
 	if index < len(m.fileDiffOffsets) {
 		m.fileDiffOffsets[index] = result.DiffLineOffsets
@@ -1226,7 +1353,7 @@ func (m Model) commentsForFile(fileIdx int) []github.ReviewComment {
 		return nil
 	}
 	filename := m.files[fileIdx].Filename
-	comments := m.commentStore.ForFile(filename)
+	fileComments := m.commentStore.ForFile(filename)
 
 	// Wrap width for comment bodies inside the thread box.
 	var gutterW int
@@ -1253,7 +1380,7 @@ func (m Model) commentsForFile(fileIdx int) []github.ReviewComment {
 			body = body + dots
 		}
 		line := m.copilotPendingLine
-		replyToInt := localdiff.IDToInt(m.copilotPendingFor)
+		replyToInt := comments.IDToInt(m.copilotPendingFor)
 		pending := github.ReviewComment{
 			ID:           0,
 			Body:         body,
@@ -1266,10 +1393,10 @@ func (m Model) commentsForFile(fileIdx int) []github.ReviewComment {
 			CreatedAt:    time.Now(),
 			UpdatedAt:    time.Now(),
 		}
-		comments = append(comments, pending)
+		fileComments = append(fileComments, pending)
 	}
 
-	return comments
+	return fileComments
 }
 
 // renderMarkdownBody does lightweight inline markdown rendering suitable
@@ -1878,10 +2005,14 @@ func (m *Model) scrollAndSyncCursor(delta int) {
 		}
 	}
 	if best >= 0 {
+		oldCursor := m.diffCursor
 		m.diffCursor = best
+		// Only reformat if cursor moved to/from a commented line.
+		if m.lineHasComments(oldCursor) || m.lineHasComments(best) {
+			m.formatFile(idx)
+			m.rebuildContent()
+		}
 	}
-	m.formatFile(idx)
-	m.rebuildContent()
 }
 
 func (m *Model) syncDiffCursorToViewport() {
@@ -2086,7 +2217,7 @@ func (m Model) handleCommentKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		}
 		m.composing = false
 
-		comment := localdiff.LocalComment{
+		comment := comments.LocalComment{
 			ID:        uuid.New().String(),
 			Body:      body,
 			Path:      m.commentFile,
@@ -2399,7 +2530,7 @@ func (m *Model) toggleResolveAtCursor() bool {
 }
 
 // getDiffHunkForComment extracts the diff hunk around the commented line.
-func (m Model) getDiffHunkForComment(c localdiff.LocalComment) string {
+func (m Model) getDiffHunkForComment(c comments.LocalComment) string {
 	// Find the file index.
 	fileIdx := -1
 	for i, f := range m.files {
@@ -2457,7 +2588,7 @@ func (m Model) getDiffHunkForComment(c localdiff.LocalComment) string {
 }
 
 // getThreadHistory returns the bodies of all comments in a thread for context.
-func (m Model) getThreadHistory(c localdiff.LocalComment) []string {
+func (m Model) getThreadHistory(c comments.LocalComment) []string {
 	if c.InReplyToID == "" {
 		return nil
 	}
@@ -2520,6 +2651,233 @@ func (m Model) fileIndexForPath(path string) int {
 		}
 	}
 	return -1
+}
+
+type stageDoneMsg struct{}
+
+// stageWholeFile stages an entire file using the appropriate git command.
+func (m Model) stageWholeFile(unstage bool) (Model, tea.Cmd, bool) {
+	idx := m.currentFileIdx
+	if idx >= len(m.files) {
+		return m, nil, false
+	}
+	filename := m.files[idx].Filename
+	fileStatus := m.files[idx].Status
+	repoRoot := m.repoRoot
+
+	// Optimistically remove the file from the view.
+	m.removeDiffLines(idx, 0, len(m.fileDiffs[idx])-1)
+	m.stagingInFlight++
+
+	return m, func() tea.Msg {
+		if unstage {
+			exec.Command("git", "-C", repoRoot, "reset", "HEAD", "--", filename).Run()
+		} else if fileStatus == "removed" {
+			// Stage a deletion.
+			exec.Command("git", "-C", repoRoot, "rm", "--cached", "--", filename).Run()
+		} else {
+			exec.Command("git", "-C", repoRoot, "add", "--", filename).Run()
+		}
+		return stageDoneMsg{}
+	}, true
+}
+
+// stageSelection stages or unstages the current line or J/K selection range.
+func (m Model) stageSelection(unstage bool) (Model, tea.Cmd, bool) {
+	idx := m.currentFileIdx
+	if idx >= len(m.fileDiffs) || idx >= len(m.files) {
+		return m, nil, false
+	}
+
+	lines := m.fileDiffs[idx]
+	filename := m.files[idx].Filename
+	fileStatus := m.files[idx].Status
+	patch := m.files[idx].Patch
+	repoRoot := m.repoRoot
+
+	// Determine selection range.
+	selStart, selEnd := m.diffCursor, m.diffCursor
+	if m.selectionAnchor >= 0 && m.selectionAnchor != m.diffCursor {
+		selStart, selEnd = m.selectionAnchor, m.diffCursor
+		if selStart > selEnd {
+			selStart, selEnd = selEnd, selStart
+		}
+	}
+
+	// Collect line numbers to stage.
+	var newLineNos, oldLineNos []int
+	for i := selStart; i <= selEnd; i++ {
+		if i >= len(lines) {
+			continue
+		}
+		dl := lines[i]
+		switch dl.Type {
+		case components.LineAdd:
+			newLineNos = append(newLineNos, dl.NewLineNo)
+		case components.LineDel:
+			oldLineNos = append(oldLineNos, dl.OldLineNo)
+		}
+	}
+
+	if len(newLineNos) == 0 && len(oldLineNos) == 0 {
+		return m, nil, true
+	}
+
+	m.selectionAnchor = -1
+
+	// Optimistically remove staged lines from the current diff view.
+	m.removeDiffLines(idx, selStart, selEnd)
+	m.stagingInFlight++
+
+	return m, func() tea.Msg {
+		git.StageLines(repoRoot, filename, fileStatus, patch, newLineNos, oldLineNos, unstage)
+		return stageDoneMsg{}
+	}, true
+}
+
+// stageHunk stages or unstages the entire hunk the cursor is in.
+func (m Model) stageHunk(unstage bool) (Model, tea.Cmd, bool) {
+	idx := m.currentFileIdx
+	if idx >= len(m.fileDiffs) || idx >= len(m.files) {
+		return m, nil, false
+	}
+
+	lines := m.fileDiffs[idx]
+	if m.diffCursor >= len(lines) {
+		return m, nil, false
+	}
+
+	dl := lines[m.diffCursor]
+	if dl.Type == components.LineHunk {
+		return m, nil, false
+	}
+
+	filename := m.files[idx].Filename
+	fileStatus := m.files[idx].Status
+	patch := m.files[idx].Patch
+	repoRoot := m.repoRoot
+
+	var lineNo int
+	var side string
+	if dl.Type == components.LineDel {
+		lineNo = dl.OldLineNo
+		side = "LEFT"
+	} else {
+		lineNo = dl.NewLineNo
+		side = "RIGHT"
+	}
+
+	// Optimistically remove the entire hunk from the view.
+	hunkStart, hunkEnd := m.findHunkRange(idx, m.diffCursor)
+	m.removeDiffLines(idx, hunkStart, hunkEnd)
+	m.stagingInFlight++
+
+	return m, func() tea.Msg {
+		git.StageHunk(repoRoot, filename, fileStatus, patch, lineNo, side, unstage)
+		return stageDoneMsg{}
+	}, true
+}
+
+// removeDiffLines removes diff lines from the view optimistically.
+// Additions are removed entirely; deletions become context lines.
+// If no diff lines remain, the file is removed from the file list.
+func (m *Model) removeDiffLines(fileIdx, start, end int) {
+	if fileIdx >= len(m.fileDiffs) {
+		return
+	}
+	lines := m.fileDiffs[fileIdx]
+	var newLines []components.DiffLine
+	for i, dl := range lines {
+		if i >= start && i <= end {
+			if dl.Type == components.LineAdd || dl.Type == components.LineDel {
+				// Remove staged lines from the view entirely.
+				continue
+			}
+		}
+		newLines = append(newLines, dl)
+	}
+
+	// Check if any actual changes remain in this file.
+	hasChanges := false
+	for _, dl := range newLines {
+		if dl.Type == components.LineAdd || dl.Type == components.LineDel {
+			hasChanges = true
+			break
+		}
+	}
+
+	if !hasChanges {
+		// Remove the file entirely from the view.
+		m.files = append(m.files[:fileIdx], m.files[fileIdx+1:]...)
+		m.fileDiffs = append(m.fileDiffs[:fileIdx], m.fileDiffs[fileIdx+1:]...)
+		m.highlightedFiles = append(m.highlightedFiles[:fileIdx], m.highlightedFiles[fileIdx+1:]...)
+		m.renderedFiles = append(m.renderedFiles[:fileIdx], m.renderedFiles[fileIdx+1:]...)
+		m.fileDiffOffsets = append(m.fileDiffOffsets[:fileIdx], m.fileDiffOffsets[fileIdx+1:]...)
+		m.fileCommentPositions = append(m.fileCommentPositions[:fileIdx], m.fileCommentPositions[fileIdx+1:]...)
+		m.treeEntries = components.BuildFileTree(m.files)
+
+		// Navigate away from the removed file.
+		if len(m.files) == 0 {
+			m.currentFileIdx = -1
+			m.treeCursor = 0
+			m.diffCursor = 0
+		} else if m.currentFileIdx >= len(m.files) {
+			m.currentFileIdx = len(m.files) - 1
+			m.treeCursor = m.treeIndexForFile(m.currentFileIdx)
+			m.diffCursor = m.firstNonHunkLine(m.currentFileIdx)
+			m.formatFile(m.currentFileIdx)
+		} else {
+			m.treeCursor = m.treeIndexForFile(m.currentFileIdx)
+			m.diffCursor = m.firstNonHunkLine(m.currentFileIdx)
+			m.formatFile(m.currentFileIdx)
+		}
+		m.rebuildContent()
+		return
+	}
+
+	m.fileDiffs[fileIdx] = newLines
+
+	// Clamp cursor and skip hunk lines.
+	if m.diffCursor >= len(newLines) {
+		m.diffCursor = len(newLines) - 1
+	}
+	if m.diffCursor < 0 {
+		m.diffCursor = 0
+	}
+	if len(newLines) > 0 && newLines[m.diffCursor].Type == components.LineHunk {
+		m.diffCursor = m.firstNonHunkLine(fileIdx)
+	}
+
+	// Re-format to get correct rendered content and offsets.
+	m.formatFile(fileIdx)
+	m.rebuildContent()
+}
+
+// findHunkRange returns the start and end diff line indices for the hunk
+// containing the given line index.
+func (m Model) findHunkRange(fileIdx, lineIdx int) (start, end int) {
+	lines := m.fileDiffs[fileIdx]
+
+	// Find hunk start — scan backward for the @@ header.
+	start = lineIdx
+	for start > 0 && lines[start].Type != components.LineHunk {
+		start--
+	}
+	// Skip the hunk header itself.
+	if lines[start].Type == components.LineHunk {
+		start++
+	}
+
+	// Find hunk end — scan forward to next @@ or end of file.
+	end = lineIdx
+	for end < len(lines)-1 {
+		if lines[end+1].Type == components.LineHunk {
+			break
+		}
+		end++
+	}
+
+	return start, end
 }
 
 func (m Model) getFullFileDiff(path string) string {

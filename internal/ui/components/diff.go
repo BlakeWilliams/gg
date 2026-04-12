@@ -103,7 +103,26 @@ func HighlightDiffFile(f github.PullRequestFile, fileContent string, chromaStyle
 		return hd
 	}
 	hd.DiffLines = ParsePatchLines(f.Patch)
-	if fileContent != "" {
+
+	// Validate that file content covers all line numbers in the diff.
+	// In branch mode, the working tree file may differ from the committed version,
+	// causing line number mismatches that produce blank rendered lines.
+	fileContentValid := fileContent != ""
+	if fileContentValid {
+		fileLineCount := strings.Count(fileContent, "\n") + 1
+		for _, dl := range hd.DiffLines {
+			if dl.Type == LineAdd && dl.NewLineNo > fileLineCount {
+				fileContentValid = false
+				break
+			}
+			if dl.Type == LineContext && dl.NewLineNo > fileLineCount {
+				fileContentValid = false
+				break
+			}
+		}
+	}
+
+	if fileContentValid {
 		hd.HlLines = highlightFileLines(fileContent, f.Filename, chromaStyle)
 	} else {
 		// Fallback: batch-highlight the diff content.
@@ -284,18 +303,31 @@ func formatDiffLinesFromHL(diffLines []DiffLine, hlLines []string, filename stri
 	// Detect if hlLines are indexed by line number (full file) or sequential (fallback).
 	// Full file mode: hlLines[lineNo-1] gives the highlighted line.
 	// Fallback mode: hlLines are in diff order (including blank for hunks).
+	// Detect if hlLines are from full-file highlighting (indexed by line number)
+	// or from fallback diff-based highlighting (sequential).
+	// Full-file mode: every line number in the diff must be within hlLines range.
+	// If ANY line number exceeds hlLines, it's fallback (sequential) mode.
 	useLineIndex := false
 	if len(diffLines) > 0 && len(hlLines) > 0 {
+		allFit := true
+		hasLines := false
 		for _, dl := range diffLines {
-			if dl.Type == LineAdd && dl.NewLineNo > 0 && dl.NewLineNo <= len(hlLines) {
-				useLineIndex = true
-				break
+			if dl.Type == LineAdd && dl.NewLineNo > 0 {
+				hasLines = true
+				if dl.NewLineNo > len(hlLines) {
+					allFit = false
+					break
+				}
 			}
-			if dl.Type == LineContext && dl.NewLineNo > 0 && dl.NewLineNo <= len(hlLines) {
-				useLineIndex = true
-				break
+			if dl.Type == LineContext && dl.NewLineNo > 0 {
+				hasLines = true
+				if dl.NewLineNo > len(hlLines) {
+					allFit = false
+					break
+				}
 			}
 		}
+		useLineIndex = hasLines && allFit
 	}
 
 	hlIdx := 0

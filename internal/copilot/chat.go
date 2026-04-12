@@ -1,11 +1,10 @@
-package copilotchat
+package copilot
 
 import (
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/blakewilliams/ghq/internal/copilot"
 	"github.com/blakewilliams/ghq/internal/git"
 	"github.com/blakewilliams/ghq/internal/github"
 	"charm.land/bubbles/v2/textarea"
@@ -27,9 +26,11 @@ type DiffContext struct {
 }
 
 type message struct {
-	role    string // "you" or "copilot"
-	content string
-	tools   []toolCall // tool calls shown within this message
+	role          string // "you" or "copilot"
+	content       string
+	tools         []toolCall // tool calls shown within this message
+	renderedLines []string   // cached rendered output
+	lineCount     int        // cached len(renderedLines)
 }
 
 type toolCall struct {
@@ -38,14 +39,16 @@ type toolCall struct {
 }
 
 // Model is the copilot chat modal.
-type Model struct {
+type ChatModel struct {
 	messages    []message
 	input       textarea.Model
-	client      *copilot.Client
+	client      *Client
 	diffCtx     DiffContext
-	streaming   string
-	sending     bool
-	spinnerTick int
+	streaming      string
+	sending        bool
+	spinnerTick    int
+	cachedMaxScroll int
+	maxScrollDirty  bool
 	activeTools []toolCall // tools currently running
 	width       int
 	height      int
@@ -67,7 +70,7 @@ var (
 var spinnerFrames = []string{"◐", "◓", "◑", "◒"}
 
 // New creates a copilot chat model.
-func New(client *copilot.Client, ctx DiffContext, username string, width, height int) Model {
+func NewChat(client *Client, ctx DiffContext, username string, width, height int) ChatModel {
 	ta := textarea.New()
 	ta.Prompt = ""
 	ta.SetWidth(width - 4)
@@ -76,29 +79,32 @@ func New(client *copilot.Client, ctx DiffContext, username string, width, height
 	ta.Focus()
 	ta.Placeholder = "Ask about your changes..."
 
-	return Model{
+	m := ChatModel{
 		messages: []message{
-			{role: "copilot", content: "How can I help with your changes?"},
+			{role: "copilot", content: "How can I help?"},
 		},
-		input:    ta,
-		client:   client,
-		diffCtx:  ctx,
-		width:    width,
-		height:   height,
-		username: username,
+		input:          ta,
+		client:         client,
+		diffCtx:        ctx,
+		width:          width,
+		height:         height,
+		username:       username,
+		maxScrollDirty: true,
 	}
+	m.cacheMessageRender(0)
+	return m
 }
 
 // ResumeCmd returns commands needed to restart animations if the chat
 // is reopened while still waiting for a response.
-func (m Model) ResumeCmd() tea.Cmd {
+func (m ChatModel) ResumeCmd() tea.Cmd {
 	if m.sending {
 		return tea.Tick(150*time.Millisecond, func(time.Time) tea.Msg { return spinnerTickMsg{} })
 	}
 	return nil
 }
 
-func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
+func (m ChatModel) Update(msg tea.Msg) (ChatModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
 		switch msg.String() {
@@ -113,6 +119,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 				return m, nil
 			}
 			m.messages = append(m.messages, message{role: "you", content: body})
+			m.cacheMessageRender(len(m.messages) - 1)
 			m.input.Reset()
 			m.sending = true
 			m.streaming = ""
@@ -144,14 +151,16 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			return m, nil
 		}
 
-	case copilot.ReplyMsg:
+	case ReplyMsg:
 		m.streaming += msg.Content
+		m.maxScrollDirty = true
 		if msg.Done {
 			m.messages = append(m.messages, message{
 				role:    "copilot",
 				content: m.streaming,
 				tools:   m.activeTools,
 			})
+			m.cacheMessageRender(len(m.messages) - 1)
 			m.streaming = ""
 			m.sending = false
 			m.activeTools = nil
@@ -165,7 +174,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 
-	case copilot.ToolMsg:
+	case ToolMsg:
 		if msg.Done {
 			// Mark tool as done.
 			for i := range m.activeTools {
@@ -184,8 +193,9 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 
-	case copilot.ErrorMsg:
+	case ErrorMsg:
 		m.messages = append(m.messages, message{role: "copilot", content: "Error: " + msg.Err.Error()})
+		m.cacheMessageRender(len(m.messages) - 1)
 		m.streaming = ""
 		m.sending = false
 		m.activeTools = nil
@@ -209,14 +219,14 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m Model) View() string {
+func (m ChatModel) View() string {
 	w := m.width
 	msgAreaH := m.height - 5 // input(2) + separator(1) + blank(1) + input label(1)
 
-	// Render all messages.
+	// Render all messages (using cached lines).
 	var rendered []string
-	for _, msg := range m.messages {
-		rendered = append(rendered, m.renderMessage(msg, w)...)
+	for i := range m.messages {
+		rendered = append(rendered, m.getMessageLines(i)...)
 	}
 
 	// Live streaming.
@@ -275,7 +285,26 @@ func (m Model) View() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func (m Model) renderMessage(msg message, width int) []string {
+// cacheMessageRender pre-computes and caches a message's rendered lines.
+func (m *ChatModel) cacheMessageRender(idx int) {
+	msg := &m.messages[idx]
+	if msg.renderedLines == nil {
+		msg.renderedLines = m.renderMessage(*msg, m.width)
+		msg.lineCount = len(msg.renderedLines)
+		m.maxScrollDirty = true
+	}
+}
+
+// getMessageLines returns cached lines for a message.
+func (m ChatModel) getMessageLines(idx int) []string {
+	if m.messages[idx].renderedLines != nil {
+		return m.messages[idx].renderedLines
+	}
+	// Fallback: render on the fly (shouldn't happen if caching is done properly).
+	return m.renderMessage(m.messages[idx], m.width)
+}
+
+func (m ChatModel) renderMessage(msg message, width int) []string {
 	bodyW := width - 2
 	if bodyW < 20 {
 		bodyW = 20
@@ -327,7 +356,7 @@ func (m Model) renderMessage(msg message, width int) []string {
 	return lines
 }
 
-func (m Model) renderLive(width int) []string {
+func (m ChatModel) renderLive(width int) []string {
 	bodyW := width - 2
 	var lines []string
 	lines = append(lines, "")
@@ -455,23 +484,34 @@ func replacePair(s, delim, open, close string) string {
 	return s
 }
 
-func (m Model) maxScroll() int {
+func (m *ChatModel) maxScroll() int {
+	if !m.maxScrollDirty {
+		return m.cachedMaxScroll
+	}
+
 	msgAreaH := m.height - 5
 	total := 0
+	// Use cached line counts for completed messages — O(N) sum, not O(N²) re-render.
 	for _, msg := range m.messages {
-		total += len(m.renderMessage(msg, m.width))
+		if msg.lineCount > 0 {
+			total += msg.lineCount
+		} else {
+			total += len(m.renderMessage(msg, m.width))
+		}
 	}
 	if m.streaming != "" || m.sending {
 		total += len(m.renderLive(m.width))
 	}
 	max := total - msgAreaH
 	if max < 0 {
-		return 0
+		max = 0
 	}
+	m.cachedMaxScroll = max
+	m.maxScrollDirty = false
 	return max
 }
 
-func (m Model) sendTocopilot(body string) tea.Cmd {
+func (m ChatModel) sendTocopilot(body string) tea.Cmd {
 	var ctx strings.Builder
 	ctx.WriteString("You are helping review code changes. Respond concisely.\n\n")
 

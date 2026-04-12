@@ -115,16 +115,52 @@ func computeReviewerAction(pr github.InboxPR) github.ActionReason {
 	return github.ActionNone
 }
 
+// stateChangedAt returns the timestamp most representative of when the PR
+// entered its current action state. Falls back to UpdatedAt when no
+// better signal is available.
+func stateChangedAt(pr github.InboxPR, action github.ActionReason) time.Time {
+	pick := func(candidates ...*time.Time) time.Time {
+		for _, t := range candidates {
+			if t != nil {
+				return *t
+			}
+		}
+		return pr.UpdatedAt
+	}
+
+	switch action {
+	case github.ActionCIFailed, github.ActionCIPending, github.ActionMergeConflicts:
+		return pick(pr.LatestCommitAt)
+	case github.ActionChangesRequested, github.ActionApproved:
+		return pick(pr.LatestReviewAt)
+	case github.ActionReadyToMerge:
+		// Ready to merge once both CI and review pass — use the later of the two.
+		if pr.LatestReviewAt != nil && pr.LatestCommitAt != nil {
+			if pr.LatestReviewAt.After(*pr.LatestCommitAt) {
+				return *pr.LatestReviewAt
+			}
+			return *pr.LatestCommitAt
+		}
+		return pick(pr.LatestReviewAt, pr.LatestCommitAt)
+	case github.ActionReReviewRequested:
+		return pick(pr.LatestCommitAt)
+	case github.ActionDraft, github.ActionWaitingForReview:
+		return pr.CreatedAt
+	default:
+		return pr.UpdatedAt
+	}
+}
+
 // ComputeScore calculates the priority score with time decay.
 // Higher score = higher priority. Pass the current time for testability.
-func ComputeScore(action github.ActionReason, updatedAt time.Time, now time.Time) float64 {
+func ComputeScore(action github.ActionReason, stateChanged time.Time, now time.Time) float64 {
 	cfg, ok := configs[action]
 	if !ok {
 		return 0
 	}
 
 	weight := 100.0 * math.Pow(0.8, float64(cfg.priority))
-	age := now.Sub(updatedAt)
+	age := now.Sub(stateChanged)
 	ageHours := age.Hours()
 	halfLifeHours := cfg.halfLife.Hours()
 
@@ -147,7 +183,8 @@ func ProcessInboxAt(prs []github.InboxPR, username string, now time.Time) []gith
 			continue
 		}
 		prs[i].Action = action
-		prs[i].Score = ComputeScore(action, prs[i].UpdatedAt, now)
+		prs[i].GHQStateChangedAt = stateChangedAt(prs[i], action)
+		prs[i].Score = ComputeScore(action, prs[i].GHQStateChangedAt, now)
 		actionable = append(actionable, prs[i])
 	}
 
@@ -159,8 +196,8 @@ func ProcessInboxAt(prs []github.InboxPR, username string, now time.Time) []gith
 		if diff < -0.01 {
 			return false
 		}
-		if !actionable[i].UpdatedAt.Equal(actionable[j].UpdatedAt) {
-			return actionable[i].UpdatedAt.After(actionable[j].UpdatedAt)
+		if !actionable[i].GHQStateChangedAt.Equal(actionable[j].GHQStateChangedAt) {
+			return actionable[i].GHQStateChangedAt.After(actionable[j].GHQStateChangedAt)
 		}
 		return actionable[i].Number > actionable[j].Number
 	})

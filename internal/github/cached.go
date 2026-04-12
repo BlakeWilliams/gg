@@ -6,27 +6,7 @@ import (
 	"time"
 
 	"github.com/blakewilliams/ghq/internal/cache"
-	tea "charm.land/bubbletea/v2"
 )
-
-// PRsLoadedMsg is sent when pull requests are loaded (from cache or network).
-type PRsLoadedMsg struct {
-	PRs []PullRequest
-}
-
-// PRFilesLoadedMsg is sent when PR files are loaded (from cache or network).
-type PRFilesLoadedMsg struct {
-	Files  []PullRequestFile
-	Number int
-}
-
-// QueryErrMsg is sent when a cached query fails.
-type QueryErrMsg struct {
-	Err error
-}
-
-// GCTickMsg triggers garbage collection of stale cache entries.
-type GCTickMsg struct{}
 
 // CachedClient wraps a Client with TanStack Query-style caching.
 type CachedClient struct {
@@ -53,264 +33,103 @@ func (c *CachedClient) RepoFullName() string {
 	return c.client.RepoFullName()
 }
 
-// ListPullRequests returns a tea.Cmd that fetches PRs with caching.
-// If cached data exists, it's returned immediately. If stale, a background
-// refetch is also triggered.
-func (c *CachedClient) ListPullRequests() tea.Cmd {
+// GCInterval returns the configured GC interval for tick commands.
+func (c *CachedClient) GCInterval() time.Duration {
+	return c.cache.GCInterval()
+}
+
+// GC runs garbage collection on the cache.
+func (c *CachedClient) GC() {
+	c.cache.GC()
+}
+
+// InvalidatePR removes cached data for a specific PR.
+func (c *CachedClient) InvalidatePR(number int) {
+	c.cache.Invalidate(fmt.Sprintf("pull:%d", number))
+	c.cache.Invalidate(fmt.Sprintf("pull-files:%d", number))
+}
+
+// InvalidateAll clears the entire cache.
+func (c *CachedClient) InvalidateAll() {
+	c.cache.InvalidatePrefix("")
+}
+
+// --- Cached query methods ---
+// These return (data, found, refetchFn) from the cache layer.
+// found=true means cached data is available immediately.
+// refetchFn is non-nil when the data needs a fresh fetch (cache miss or stale).
+
+// ListPullRequests returns cached PRs and an optional refetch function.
+func (c *CachedClient) ListPullRequests() (data []PullRequest, found bool, refetch func() ([]PullRequest, error)) {
 	fetchFn := func() ([]PullRequest, error) {
 		return c.client.ListPullRequests(context.Background())
 	}
-
-	data, found, _, refetchFn := cache.Query(c.cache, "pulls", fetchFn)
-
-	var cmds []tea.Cmd
-
-	if found {
-		prs := data
-		cmds = append(cmds, func() tea.Msg {
-			return PRsLoadedMsg{PRs: prs}
-		})
-	}
-
-	if refetchFn != nil {
-		fn := refetchFn
-		cmds = append(cmds, func() tea.Msg {
-			result, err := fn()
-			if err != nil {
-				return QueryErrMsg{Err: err}
-			}
-			return PRsLoadedMsg{PRs: result}
-		})
-	}
-
-	return tea.Batch(cmds...)
+	data, found, _, refetch = cache.Query(c.cache, "pulls", fetchFn)
+	return
 }
 
-// ReviewsLoadedMsg is sent when PR reviews are loaded.
-type ReviewsLoadedMsg struct {
-	Reviews []Review
-	Number  int
-}
-
-// GetReviews returns a tea.Cmd that fetches PR reviews with caching.
-func (c *CachedClient) GetReviews(number int) tea.Cmd {
+// GetReviews returns cached reviews and an optional refetch function.
+func (c *CachedClient) GetReviews(number int) (data []Review, found bool, refetch func() ([]Review, error)) {
 	key := fmt.Sprintf("reviews:%d", number)
 	fetchFn := func() ([]Review, error) {
 		return c.client.GetReviews(context.Background(), number)
 	}
-
-	data, found, _, refetchFn := cache.Query(c.cache, key, fetchFn)
-
-	var cmds []tea.Cmd
-
-	if found {
-		reviews := data
-		cmds = append(cmds, func() tea.Msg {
-			return ReviewsLoadedMsg{Reviews: reviews, Number: number}
-		})
-	}
-
-	if refetchFn != nil {
-		fn := refetchFn
-		cmds = append(cmds, func() tea.Msg {
-			result, err := fn()
-			if err != nil {
-				return QueryErrMsg{Err: err}
-			}
-			return ReviewsLoadedMsg{Reviews: result, Number: number}
-		})
-	}
-
-	return tea.Batch(cmds...)
+	data, found, _, refetch = cache.Query(c.cache, key, fetchFn)
+	return
 }
 
-// CommentsLoadedMsg is sent when PR comments are loaded.
-type CommentsLoadedMsg struct {
-	Comments []IssueComment
-	Number   int
-}
-
-// GetIssueComments returns a tea.Cmd that fetches PR comments with caching.
-func (c *CachedClient) GetIssueComments(number int) tea.Cmd {
+// GetIssueComments returns cached comments and an optional refetch function.
+func (c *CachedClient) GetIssueComments(number int) (data []IssueComment, found bool, refetch func() ([]IssueComment, error)) {
 	key := fmt.Sprintf("comments:%d", number)
 	fetchFn := func() ([]IssueComment, error) {
 		return c.client.GetIssueComments(context.Background(), number)
 	}
-
-	data, found, _, refetchFn := cache.Query(c.cache, key, fetchFn)
-
-	var cmds []tea.Cmd
-
-	if found {
-		comments := data
-		cmds = append(cmds, func() tea.Msg {
-			return CommentsLoadedMsg{Comments: comments, Number: number}
-		})
-	}
-
-	if refetchFn != nil {
-		fn := refetchFn
-		cmds = append(cmds, func() tea.Msg {
-			result, err := fn()
-			if err != nil {
-				return QueryErrMsg{Err: err}
-			}
-			return CommentsLoadedMsg{Comments: result, Number: number}
-		})
-	}
-
-	return tea.Batch(cmds...)
+	data, found, _, refetch = cache.Query(c.cache, key, fetchFn)
+	return
 }
 
-// ReviewCommentsLoadedMsg is sent when PR review comments (inline diff comments) are loaded.
-type ReviewCommentsLoadedMsg struct {
-	Comments []ReviewComment
-	Number   int
-}
-
-// GetReviewComments returns a tea.Cmd that fetches PR review comments with caching.
-func (c *CachedClient) GetReviewComments(number int) tea.Cmd {
+// GetReviewComments returns cached review comments and an optional refetch function.
+func (c *CachedClient) GetReviewComments(number int) (data []ReviewComment, found bool, refetch func() ([]ReviewComment, error)) {
 	key := fmt.Sprintf("review-comments:%d", number)
 	fetchFn := func() ([]ReviewComment, error) {
 		return c.client.GetReviewComments(context.Background(), number)
 	}
-
-	data, found, _, refetchFn := cache.Query(c.cache, key, fetchFn)
-
-	var cmds []tea.Cmd
-
-	if found {
-		comments := data
-		cmds = append(cmds, func() tea.Msg {
-			return ReviewCommentsLoadedMsg{Comments: comments, Number: number}
-		})
-	}
-
-	if refetchFn != nil {
-		fn := refetchFn
-		cmds = append(cmds, func() tea.Msg {
-			result, err := fn()
-			if err != nil {
-				return QueryErrMsg{Err: err}
-			}
-			return ReviewCommentsLoadedMsg{Comments: result, Number: number}
-		})
-	}
-
-	return tea.Batch(cmds...)
+	data, found, _, refetch = cache.Query(c.cache, key, fetchFn)
+	return
 }
 
-// CheckRunsLoadedMsg is sent when check runs are loaded.
-type CheckRunsLoadedMsg struct {
-	CheckRuns []CheckRun
-	Ref       string
-}
-
-// GetCheckRuns returns a tea.Cmd that fetches check runs with caching.
-func (c *CachedClient) GetCheckRuns(ref string) tea.Cmd {
+// GetCheckRuns returns cached check runs and an optional refetch function.
+func (c *CachedClient) GetCheckRuns(ref string) (data []CheckRun, found bool, refetch func() ([]CheckRun, error)) {
 	key := fmt.Sprintf("check-runs:%s", ref)
 	fetchFn := func() ([]CheckRun, error) {
 		return c.client.GetCheckRuns(context.Background(), ref)
 	}
-
-	data, found, _, refetchFn := cache.Query(c.cache, key, fetchFn)
-
-	var cmds []tea.Cmd
-
-	if found {
-		checks := data
-		cmds = append(cmds, func() tea.Msg {
-			return CheckRunsLoadedMsg{CheckRuns: checks, Ref: ref}
-		})
-	}
-
-	if refetchFn != nil {
-		fn := refetchFn
-		cmds = append(cmds, func() tea.Msg {
-			result, err := fn()
-			if err != nil {
-				return QueryErrMsg{Err: err}
-			}
-			return CheckRunsLoadedMsg{CheckRuns: result, Ref: ref}
-		})
-	}
-
-	return tea.Batch(cmds...)
+	data, found, _, refetch = cache.Query(c.cache, key, fetchFn)
+	return
 }
 
-// GetPullRequestFiles returns a tea.Cmd that fetches PR files with caching.
-func (c *CachedClient) GetPullRequestFiles(number int) tea.Cmd {
+// GetPullRequestFiles returns cached PR files and an optional refetch function.
+func (c *CachedClient) GetPullRequestFiles(number int) (data []PullRequestFile, found bool, refetch func() ([]PullRequestFile, error)) {
 	key := fmt.Sprintf("pull-files:%d", number)
 	fetchFn := func() ([]PullRequestFile, error) {
 		return c.client.GetPullRequestFiles(context.Background(), number)
 	}
-
-	data, found, _, refetchFn := cache.Query(c.cache, key, fetchFn)
-
-	var cmds []tea.Cmd
-
-	if found {
-		files := data
-		cmds = append(cmds, func() tea.Msg {
-			return PRFilesLoadedMsg{Files: files, Number: number}
-		})
-	}
-
-	if refetchFn != nil {
-		fn := refetchFn
-		cmds = append(cmds, func() tea.Msg {
-			result, err := fn()
-			if err != nil {
-				return QueryErrMsg{Err: err}
-			}
-			return PRFilesLoadedMsg{Files: result, Number: number}
-		})
-	}
-
-	return tea.Batch(cmds...)
+	data, found, _, refetch = cache.Query(c.cache, key, fetchFn)
+	return
 }
 
-// FileContentLoadedMsg is sent when a file's content is loaded.
-type FileContentLoadedMsg struct {
-	Filename string
-	Content  string
-	Ref      string
-}
-
-// GetFileContent returns a tea.Cmd that fetches a file's content with caching.
-func (c *CachedClient) GetFileContent(filename, ref string) tea.Cmd {
+// GetFileContent returns cached file content and an optional refetch function.
+func (c *CachedClient) GetFileContent(filename, ref string) (data string, found bool, refetch func() (string, error)) {
 	key := fmt.Sprintf("file-content:%s:%s", ref, filename)
 	fetchFn := func() (string, error) {
 		return c.client.GetFileContent(context.Background(), filename, ref)
 	}
-
-	data, found, _, refetchFn := cache.Query(c.cache, key, fetchFn)
-
-	var cmds []tea.Cmd
-
-	if found {
-		content := data
-		cmds = append(cmds, func() tea.Msg {
-			return FileContentLoadedMsg{Filename: filename, Content: content, Ref: ref}
-		})
-	}
-
-	if refetchFn != nil {
-		fn := refetchFn
-		cmds = append(cmds, func() tea.Msg {
-			result, err := fn()
-			if err != nil {
-				return QueryErrMsg{Err: err}
-			}
-			return FileContentLoadedMsg{Filename: filename, Content: result, Ref: ref}
-		})
-	}
-
-	return tea.Batch(cmds...)
+	data, found, _, refetch = cache.Query(c.cache, key, fetchFn)
+	return
 }
 
 // FetchFileContent synchronously fetches file content, using the cache.
-// Intended for use inside a tea.Cmd goroutine.
+// Intended for use inside a goroutine.
 func (c *CachedClient) FetchFileContent(filename, ref string) (string, error) {
 	key := fmt.Sprintf("file-content:%s:%s", ref, filename)
 	fetchFn := func() (string, error) {
@@ -327,124 +146,49 @@ func (c *CachedClient) FetchFileContent(filename, ref string) (string, error) {
 	return "", fmt.Errorf("failed to fetch %s", filename)
 }
 
-// CommentCreatedMsg is sent when a review comment is successfully created.
-type CommentCreatedMsg struct {
-	Comment ReviewComment
-	Number  int
+// --- Direct fetch methods (no caching) ---
+
+// FetchAuthenticatedUser fetches the current user.
+func (c *CachedClient) FetchAuthenticatedUser() (User, error) {
+	return c.client.GetAuthenticatedUser(context.Background())
 }
 
-// CommentErrorMsg is sent when creating a comment fails.
-type CommentErrorMsg struct {
-	Err error
-}
-
-// CreateReviewComment returns a tea.Cmd that posts a new review comment.
-// For multi-line comments, set startLine > 0 and startSide.
-func (c *CachedClient) CreateReviewComment(number int, body, commitID, path string, line int, side string, startLine int, startSide string) tea.Cmd {
-	return func() tea.Msg {
-		comment, err := c.client.CreateReviewComment(context.Background(), number, body, commitID, path, line, side, startLine, startSide)
-		if err != nil {
-			return CommentErrorMsg{Err: err}
-		}
-		// Invalidate review comments cache so next fetch picks up the new comment.
-		c.cache.Invalidate(fmt.Sprintf("review-comments:%d", number))
-		return CommentCreatedMsg{Comment: comment, Number: number}
+// FetchInbox fetches all inbox PRs with GraphQL enrichment.
+func (c *CachedClient) FetchInbox(username, nwo string) ([]InboxPR, error) {
+	prs, err := c.client.FetchInboxPRs(context.Background(), username, nwo)
+	if err != nil {
+		return nil, err
 	}
+	prs, _ = c.client.EnrichPRs(context.Background(), prs, username)
+	return prs, nil
 }
 
-// ReplyToReviewComment returns a tea.Cmd that replies to an existing comment thread.
-func (c *CachedClient) ReplyToReviewComment(number int, commentID int, body string) tea.Cmd {
-	return func() tea.Msg {
-		comment, err := c.client.ReplyToReviewComment(context.Background(), number, commentID, body)
-		if err != nil {
-			return CommentErrorMsg{Err: err}
-		}
-		c.cache.Invalidate(fmt.Sprintf("review-comments:%d", number))
-		return CommentCreatedMsg{Comment: comment, Number: number}
+// FetchPR fetches a single PR by owner/repo/number.
+func (c *CachedClient) FetchPR(owner, repo string, number int) (PullRequest, error) {
+	return c.client.GetPullRequestFromRepo(context.Background(), owner, repo, number)
+}
+
+// FetchPRByBranch finds an open PR for the given branch.
+func (c *CachedClient) FetchPRByBranch(branch string) (PullRequest, error) {
+	return c.client.GetPullRequestByBranch(context.Background(), branch)
+}
+
+// CreateReviewComment posts a new review comment.
+func (c *CachedClient) CreateReviewComment(number int, body, commitID, path string, line int, side string, startLine int, startSide string) (ReviewComment, error) {
+	comment, err := c.client.CreateReviewComment(context.Background(), number, body, commitID, path, line, side, startLine, startSide)
+	if err != nil {
+		return ReviewComment{}, err
 	}
+	c.cache.Invalidate(fmt.Sprintf("review-comments:%d", number))
+	return comment, nil
 }
 
-// InboxLoadedMsg is sent when the inbox PRs are loaded and enriched.
-type InboxLoadedMsg struct {
-	PRs []InboxPR
-}
-
-// UserLoadedMsg is sent when the authenticated user is loaded.
-type UserLoadedMsg struct {
-	User User
-}
-
-// FetchAuthenticatedUser returns a tea.Cmd that fetches the current user.
-func (c *CachedClient) FetchAuthenticatedUser() tea.Cmd {
-	return func() tea.Msg {
-		user, err := c.client.GetAuthenticatedUser(context.Background())
-		if err != nil {
-			return QueryErrMsg{Err: err}
-		}
-		return UserLoadedMsg{User: user}
+// ReplyToReviewComment replies to an existing comment thread.
+func (c *CachedClient) ReplyToReviewComment(number int, commentID int, body string) (ReviewComment, error) {
+	comment, err := c.client.ReplyToReviewComment(context.Background(), number, commentID, body)
+	if err != nil {
+		return ReviewComment{}, err
 	}
-}
-
-// FetchInbox returns a tea.Cmd that fetches all inbox PRs with enrichment.
-func (c *CachedClient) FetchInbox(username, nwo string) tea.Cmd {
-	return func() tea.Msg {
-		prs, err := c.client.FetchInboxPRs(context.Background(), username, nwo)
-		if err != nil {
-			return QueryErrMsg{Err: err}
-		}
-		// Enrich with GraphQL data.
-		prs, _ = c.client.EnrichPRs(context.Background(), prs, username)
-		return InboxLoadedMsg{PRs: prs}
-	}
-}
-
-// FetchPR returns a tea.Cmd that fetches a single PR by owner/repo/number.
-func (c *CachedClient) FetchPR(owner, repo string, number int) tea.Cmd {
-	return func() tea.Msg {
-		// Temporarily create a client scoped to this repo.
-		pr, err := c.client.GetPullRequestFromRepo(context.Background(), owner, repo, number)
-		if err != nil {
-			return QueryErrMsg{Err: err}
-		}
-		return PRLoadedMsg{PR: pr}
-	}
-}
-
-// PRLoadedMsg is sent when a single PR is loaded (for inbox → detail navigation).
-type PRLoadedMsg struct {
-	PR PullRequest
-}
-
-// FetchPRByBranch returns a tea.Cmd that finds an open PR for the given branch.
-func (c *CachedClient) FetchPRByBranch(branch string) tea.Cmd {
-	return func() tea.Msg {
-		pr, err := c.client.GetPullRequestByBranch(context.Background(), branch)
-		if err != nil {
-			return QueryErrMsg{Err: err}
-		}
-		return PRLoadedMsg{PR: pr}
-	}
-}
-
-// InvalidatePR removes cached data for a specific PR.
-func (c *CachedClient) InvalidatePR(number int) {
-	c.cache.Invalidate(fmt.Sprintf("pull:%d", number))
-	c.cache.Invalidate(fmt.Sprintf("pull-files:%d", number))
-}
-
-// InvalidateAll clears the entire cache.
-func (c *CachedClient) InvalidateAll() {
-	c.cache.InvalidatePrefix("")
-}
-
-// GCTickCmd returns a tea.Cmd that periodically triggers cache GC.
-func (c *CachedClient) GCTickCmd() tea.Cmd {
-	return tea.Tick(c.cache.GCInterval(), func(t time.Time) tea.Msg {
-		return GCTickMsg{}
-	})
-}
-
-// GC runs garbage collection on the cache.
-func (c *CachedClient) GC() {
-	c.cache.GC()
+	c.cache.Invalidate(fmt.Sprintf("review-comments:%d", number))
+	return comment, nil
 }

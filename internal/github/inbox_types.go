@@ -87,8 +87,9 @@ type InboxPR struct {
 	LatestReviewAt  *time.Time // date of the most recent review
 
 	// Computed.
-	Action ActionReason
-	Score  float64
+	Action             ActionReason
+	Score              float64
+	GHQStateChangedAt  time.Time
 }
 
 // HasSource returns true if the PR has the given source.

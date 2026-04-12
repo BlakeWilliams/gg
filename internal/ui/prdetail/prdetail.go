@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"regexp"
 	"strings"
 	"time"
 
@@ -21,10 +20,99 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	xansi "github.com/charmbracelet/x/ansi"
-	"charm.land/glamour/v2"
-	"charm.land/glamour/v2/ansi"
 	"charm.land/lipgloss/v2"
 )
+
+// --- GitHub data messages and commands ---
+
+type ReviewsLoadedMsg struct {
+	Reviews []github.Review
+	Number  int
+}
+
+type CommentsLoadedMsg struct {
+	Comments []github.IssueComment
+	Number   int
+}
+
+type ReviewCommentsLoadedMsg struct {
+	Comments []github.ReviewComment
+	Number   int
+}
+
+type CheckRunsLoadedMsg struct {
+	CheckRuns []github.CheckRun
+	Ref       string
+}
+
+type PRFilesLoadedMsg struct {
+	Files  []github.PullRequestFile
+	Number int
+}
+
+type CommentCreatedMsg struct {
+	Comment github.ReviewComment
+	Number  int
+}
+
+type CommentErrorMsg struct {
+	Err error
+}
+
+func fetchPullRequestFiles(c *github.CachedClient, number int) tea.Cmd {
+	data, found, refetch := c.GetPullRequestFiles(number)
+	return uictx.CachedCmd(data, found, refetch, func(files []github.PullRequestFile) tea.Msg {
+		return PRFilesLoadedMsg{Files: files, Number: number}
+	})
+}
+
+func fetchReviews(c *github.CachedClient, number int) tea.Cmd {
+	data, found, refetch := c.GetReviews(number)
+	return uictx.CachedCmd(data, found, refetch, func(reviews []github.Review) tea.Msg {
+		return ReviewsLoadedMsg{Reviews: reviews, Number: number}
+	})
+}
+
+func fetchIssueComments(c *github.CachedClient, number int) tea.Cmd {
+	data, found, refetch := c.GetIssueComments(number)
+	return uictx.CachedCmd(data, found, refetch, func(comments []github.IssueComment) tea.Msg {
+		return CommentsLoadedMsg{Comments: comments, Number: number}
+	})
+}
+
+func fetchReviewComments(c *github.CachedClient, number int) tea.Cmd {
+	data, found, refetch := c.GetReviewComments(number)
+	return uictx.CachedCmd(data, found, refetch, func(comments []github.ReviewComment) tea.Msg {
+		return ReviewCommentsLoadedMsg{Comments: comments, Number: number}
+	})
+}
+
+func fetchCheckRuns(c *github.CachedClient, ref string) tea.Cmd {
+	data, found, refetch := c.GetCheckRuns(ref)
+	return uictx.CachedCmd(data, found, refetch, func(checks []github.CheckRun) tea.Msg {
+		return CheckRunsLoadedMsg{CheckRuns: checks, Ref: ref}
+	})
+}
+
+func createReviewComment(c *github.CachedClient, number int, body, commitID, path string, line int, side string, startLine int, startSide string) tea.Cmd {
+	return func() tea.Msg {
+		comment, err := c.CreateReviewComment(number, body, commitID, path, line, side, startLine, startSide)
+		if err != nil {
+			return CommentErrorMsg{Err: err}
+		}
+		return CommentCreatedMsg{Comment: comment, Number: number}
+	}
+}
+
+func replyToReviewComment(c *github.CachedClient, number int, commentID int, body string) tea.Cmd {
+	return func() tea.Msg {
+		comment, err := c.ReplyToReviewComment(number, commentID, body)
+		if err != nil {
+			return CommentErrorMsg{Err: err}
+		}
+		return CommentCreatedMsg{Comment: comment, Number: number}
+	}
+}
 
 // Nerdfont icon constants.
 const (
@@ -205,7 +293,7 @@ func (m Model) KeyBindings() []uictx.KeyBinding {
 		{Key: "J / K", Description: "Extend selection range"},
 		{Key: "h / l", Description: "Focus left / right pane"},
 		{Key: "f", Description: "Toggle tree focus"},
-		{Key: "p / n", Description: "Previous / next file"},
+		{Key: "ctrl+j / k", Description: "Previous / next file"},
 		{Key: "ctrl+d / u", Description: "Scroll half page down / up"},
 		{Key: "ctrl+f / b", Description: "Scroll full page down / up"},
 		{Key: "g g", Description: "Go to top"},
@@ -228,7 +316,7 @@ func (m Model) StatusHints() (left, right []string) {
 		left = append(left, styles.StatusBarKey.Render("f")+" "+styles.StatusBarHint.Render("focus tree"))
 	}
 	left = append(left, styles.StatusBarKey.Render("h/l")+" "+styles.StatusBarHint.Render("panes"))
-	left = append(left, styles.StatusBarKey.Render("p/n")+" "+styles.StatusBarHint.Render("files"))
+	left = append(left, styles.StatusBarKey.Render("ctrl+j/k")+" "+styles.StatusBarHint.Render("files"))
 	if !m.treeFocused && m.currentFileIdx >= 0 {
 		left = append(left, styles.StatusBarKey.Render("J/K")+" "+styles.StatusBarHint.Render("select range"))
 	}
@@ -262,11 +350,11 @@ func (m Model) Init() tea.Cmd {
 			rendered := renderMarkdown(body, width)
 			return descRenderedMsg{content: rendered, prNumber: prNumber}
 		},
-		m.ctx.Client.GetPullRequestFiles(m.pr.Number),
-		m.ctx.Client.GetReviews(m.pr.Number),
-		m.ctx.Client.GetIssueComments(m.pr.Number),
-		m.ctx.Client.GetReviewComments(m.pr.Number),
-		m.ctx.Client.GetCheckRuns(m.pr.Head.SHA),
+		fetchPullRequestFiles(m.ctx.Client, m.pr.Number),
+		fetchReviews(m.ctx.Client, m.pr.Number),
+		fetchIssueComments(m.ctx.Client, m.pr.Number),
+		fetchReviewComments(m.ctx.Client, m.pr.Number),
+		fetchCheckRuns(m.ctx.Client, m.pr.Head.SHA),
 	}
 	if m.copilotClient != nil {
 		cmds = append(cmds, m.copilotClient.ListenCmd())
@@ -338,14 +426,14 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		}
 		return m, nil
 
-	case github.ReviewsLoadedMsg:
+	case ReviewsLoadedMsg:
 		if msg.Number == m.pr.Number {
 			m.reviews = msg.Reviews
 			m.rebuildSidebar()
 		}
 		return m, nil
 
-	case github.CommentsLoadedMsg:
+	case CommentsLoadedMsg:
 		if msg.Number == m.pr.Number {
 			// Reverse so newest comments appear first.
 			comments := msg.Comments
@@ -357,7 +445,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		}
 		return m, nil
 
-	case github.ReviewCommentsLoadedMsg:
+	case ReviewCommentsLoadedMsg:
 		if msg.Number == m.pr.Number {
 			m.reviewComments = msg.Comments
 			// Re-format files to include comments (cheap, highlights cached).
@@ -368,14 +456,14 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		}
 		return m, nil
 
-	case github.CheckRunsLoadedMsg:
+	case CheckRunsLoadedMsg:
 		if msg.Ref == m.pr.Head.SHA {
 			m.checkRuns = msg.CheckRuns
 			m.rebuildSidebar()
 		}
 		return m, nil
 
-	case github.PRFilesLoadedMsg:
+	case PRFilesLoadedMsg:
 		m.files = msg.Files
 		m.highlightedFiles = make([]components.HighlightedDiff, len(msg.Files))
 		m.renderedFiles = make([]string, len(msg.Files))
@@ -417,7 +505,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		}
 		return m, nil
 
-	case github.CommentCreatedMsg:
+	case CommentCreatedMsg:
 		if msg.Number == m.pr.Number {
 			m.composing = false
 			m.reviewComments = append(m.reviewComments, msg.Comment)
@@ -427,11 +515,11 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		}
 		return m, nil
 
-	case github.CommentErrorMsg:
+	case CommentErrorMsg:
 		// TODO: show error to user
 		return m, nil
 
-	case github.QueryErrMsg:
+	case uictx.QueryErrMsg:
 		return m, nil
 
 	case copilot.ReplyMsg:
@@ -490,10 +578,10 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		// Invalidate and re-fetch PR data.
 		m.ctx.Client.InvalidatePR(m.pr.Number)
 		cmds := []tea.Cmd{
-			m.ctx.Client.GetPullRequestFiles(m.pr.Number),
-			m.ctx.Client.GetReviews(m.pr.Number),
-			m.ctx.Client.GetReviewComments(m.pr.Number),
-			m.ctx.Client.GetCheckRuns(m.pr.Head.SHA),
+			fetchPullRequestFiles(m.ctx.Client, m.pr.Number),
+			fetchReviews(m.ctx.Client, m.pr.Number),
+			fetchReviewComments(m.ctx.Client, m.pr.Number),
+			fetchCheckRuns(m.ctx.Client, m.pr.Head.SHA),
 		}
 		if m.refWatcher != nil {
 			cmds = append(cmds, m.refWatcher.WaitCmd())
@@ -586,10 +674,10 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		// Focus right pane.
 		m.treeFocused = false
 		return m, nil, true
-	case "p", "ctrl+k":
+	case "ctrl+k":
 		m.moveTreeSelection(-1)
 		return m, nil, true
-	case "n", "ctrl+j":
+	case "ctrl+j":
 		m.moveTreeSelection(1)
 		return m, nil, true
 	case "j", "down":
@@ -1028,10 +1116,10 @@ func (m Model) handleCommentKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		m.composing = false
 		var cmd tea.Cmd
 		if m.replyToID != nil {
-			cmd = m.ctx.Client.ReplyToReviewComment(m.pr.Number, *m.replyToID, body)
+			cmd = replyToReviewComment(m.ctx.Client, m.pr.Number, *m.replyToID, body)
 		} else {
-			cmd = m.ctx.Client.CreateReviewComment(
-				m.pr.Number, body, m.pr.Head.SHA,
+			cmd = createReviewComment(
+				m.ctx.Client, m.pr.Number, body, m.pr.Head.SHA,
 				m.commentFile, m.commentLine, m.commentSide,
 				m.commentStartLine, m.commentStartSide,
 			)
@@ -1414,290 +1502,6 @@ func (m *Model) toggleSidebar(st sidebarType) {
 }
 
 var dimStyle = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
-
-func (m Model) View() string {
-	if !m.vpReady {
-		return ""
-	}
-
-	// Right panel content with cursor overlay.
-	rightView := m.vp.View()
-	if m.currentFileIdx >= 0 {
-		rightView = m.overlayDiffCursor(rightView)
-	}
-
-	// Compose: tree | divider | right panel.
-	view := m.renderLayout(rightView)
-
-	// Modal overlay on top.
-	if m.showSidebar {
-		view = m.renderModal(view)
-	}
-	return view
-}
-
-// renderLayout renders the tree + divider + right panel.
-func (m Model) renderLayout(rightView string) string {
-	treeW := m.treeWidth
-	innerTreeW := treeW - 2 // inside the │ side borders
-	innerTreeH := m.height - 2 // inside top/bottom borders
-
-	bc := m.borderStyle()
-	var borderFocused lipgloss.Style
-	if m.treeFocused {
-		borderFocused = lipgloss.NewStyle().Foreground(lipgloss.Yellow)
-	} else {
-		borderFocused = bc
-	}
-
-	// Build tree border frame.
-	titleStr := " " + lipgloss.NewStyle().Bold(true).Render("Files") + " "
-	titleW := lipgloss.Width(titleStr)
-	fillW := treeW - 3 - titleW // ╭─ + title + fill + ╮
-	if fillW < 0 {
-		fillW = 0
-	}
-	topBorder := borderFocused.Render("╭─") + titleStr + borderFocused.Render(strings.Repeat("─", fillW)+"╮")
-	bw := treeW - 2
-	if bw < 0 {
-		bw = 0
-	}
-	bottomBorder := borderFocused.Render("╰" + strings.Repeat("─", bw) + "╯")
-	sideBorderL := borderFocused.Render("│")
-	sideBorderR := borderFocused.Render("│")
-
-	treeContentLines := components.RenderFileTree(m.treeEntries, m.files, m.treeCursor, m.currentFileIdx, innerTreeW, innerTreeH)
-	rightLines := strings.Split(rightView, "\n")
-
-	// Right panel border.
-	rightW := m.rightPanelWidth()
-	innerRightW := rightW - 2
-	var rightBorderStyle lipgloss.Style
-	if !m.treeFocused {
-		rightBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Yellow)
-	} else {
-		rightBorderStyle = bc
-	}
-
-	// Right panel title.
-	var rightTitle string
-	if m.currentFileIdx >= 0 && m.currentFileIdx < len(m.files) {
-		rightTitle = " " + lipgloss.NewStyle().Bold(true).Render(m.files[m.currentFileIdx].Filename) + " "
-	} else {
-		rightTitle = " " + lipgloss.NewStyle().Bold(true).Render("Description") + " "
-	}
-	rtW := lipgloss.Width(rightTitle)
-	rtFill := rightW - 3 - rtW
-	if rtFill < 0 {
-		rtFill = 0
-	}
-	rightTop := rightBorderStyle.Render("╭─") + rightTitle + rightBorderStyle.Render(strings.Repeat("─", rtFill)+"╮")
-	rbw := rightW - 2
-	if rbw < 0 {
-		rbw = 0
-	}
-	rightBottom := rightBorderStyle.Render("╰" + strings.Repeat("─", rbw) + "╯")
-	rightSideL := rightBorderStyle.Render("│")
-	rightSideR := rightBorderStyle.Render("│")
-
-	var b strings.Builder
-	for i := 0; i < m.height; i++ {
-		// Tree column.
-		var treeLine string
-		if i == 0 {
-			treeLine = topBorder
-		} else if i == m.height-1 {
-			treeLine = bottomBorder
-		} else {
-			tIdx := i - 1
-			cl := ""
-			if tIdx < len(treeContentLines) {
-				cl = treeContentLines[tIdx]
-			}
-			treeLine = sideBorderL + cl + sideBorderR
-		}
-
-		// Right column.
-		var rightLine string
-		if i == 0 {
-			rightLine = rightTop
-		} else if i == m.height-1 {
-			rightLine = rightBottom
-		} else {
-			rIdx := i - 1
-			rl := ""
-			if rIdx < len(rightLines) {
-				rl = rightLines[rIdx]
-			}
-			// Pad to inner width.
-			rlW := lipgloss.Width(rl)
-			if rlW < innerRightW {
-				rl += strings.Repeat(" ", innerRightW-rlW)
-			}
-			rightLine = rightSideL + rl + rightSideR
-		}
-
-		b.WriteString(treeLine + rightLine)
-		if i < m.height-1 {
-			b.WriteString("\n")
-		}
-	}
-	return b.String()
-}
-
-// cursorViewportLine returns the line index within the visible viewport
-// that corresponds to the current diff cursor, or -1 if not visible.
-func (m Model) cursorViewportLine() int {
-	fileIdx := m.currentFileIdx
-	if fileIdx < 0 || fileIdx >= len(m.fileDiffOffsets) {
-		return -1
-	}
-	if m.diffCursor >= len(m.fileDiffOffsets[fileIdx]) {
-		return -1
-	}
-	absLine := m.fileDiffOffsets[fileIdx][m.diffCursor]
-	rel := absLine - m.vp.YOffset()
-	if rel < 0 || rel >= m.height {
-		return -1
-	}
-	return rel
-}
-
-// overlayDiffCursor applies the cursor highlight to the one visible line,
-// or highlights all lines in the selection range when shift-selecting.
-func (m Model) overlayDiffCursor(view string) string {
-	if !m.filesListLoaded || !m.hasDiffLines() {
-		return view
-	}
-
-	// When there's a multi-line selection, highlight all lines in the range.
-	if m.selectionAnchor >= 0 && m.selectionAnchor != m.diffCursor {
-		return m.overlaySelectionRange(view)
-	}
-
-	vLine := m.cursorViewportLine()
-	if vLine < 0 {
-		return view
-	}
-	lines := strings.Split(view, "\n")
-	if vLine < len(lines) {
-		lines[vLine] = m.applyCursorHighlight(lines[vLine])
-	}
-	return strings.Join(lines, "\n")
-}
-
-// overlaySelectionRange highlights all diff lines in the selection range
-// that are visible in the viewport.
-func (m Model) overlaySelectionRange(view string) string {
-	fileIdx := m.currentFileIdx
-	if fileIdx < 0 || fileIdx >= len(m.fileDiffOffsets) {
-		return view
-	}
-
-	selStart, selEnd := m.selectionAnchor, m.diffCursor
-	if selStart > selEnd {
-		selStart, selEnd = selEnd, selStart
-	}
-
-	offsets := m.fileDiffOffsets[fileIdx]
-	diffs := m.fileDiffs[fileIdx]
-	vpTop := m.vp.YOffset()
-
-	lines := strings.Split(view, "\n")
-
-	for i := selStart; i <= selEnd; i++ {
-		if i >= len(offsets) || i >= len(diffs) {
-			continue
-		}
-		if diffs[i].Type == components.LineHunk {
-			continue
-		}
-		absLine := offsets[i]
-		rel := absLine - vpTop
-		if rel < 0 || rel >= len(lines) {
-			continue
-		}
-		lines[rel] = m.applySelectionHighlight(lines[rel], diffs[i])
-	}
-
-	return strings.Join(lines, "\n")
-}
-
-// applySelectionHighlight applies the selected background to a line in the
-// selection range. Similar to applyCursorHighlight but takes an explicit DiffLine.
-func (m Model) applySelectionHighlight(line string, dl components.DiffLine) string {
-	if dl.Type == components.LineHunk {
-		return line
-	}
-
-	prefix, inner, suffix := splitDiffBorders(line)
-
-	// Replace the bold +/- gutter marker with > to indicate selection.
-	inner = strings.Replace(inner, "\033[1m+\033[0m", "\033[1m>\033[0m", 1)
-	inner = strings.Replace(inner, "\033[1m-\033[0m", "\033[1m>\033[0m", 1)
-
-	colors := m.ctx.DiffColors
-	var selBg string
-	switch dl.Type {
-	case components.LineAdd:
-		selBg = colors.SelectedAddBg
-	case components.LineDel:
-		selBg = colors.SelectedDelBg
-	default:
-		selBg = colors.SelectedCtxBg
-	}
-
-	if selBg != "" {
-		if colors.AddBg != "" {
-			inner = strings.ReplaceAll(inner, colors.AddBg, selBg)
-		}
-		if colors.DelBg != "" {
-			inner = strings.ReplaceAll(inner, colors.DelBg, selBg)
-		}
-		inner = strings.ReplaceAll(inner, "\033[0m", "\033[0m"+selBg)
-		inner = strings.ReplaceAll(inner, "\033[m", "\033[m"+selBg)
-		inner = selBg + inner + "\033[0m"
-	}
-
-	return prefix + inner + suffix
-}
-
-// splitDiffBorders splits a rendered diff line of the form
-// border + inner + border into its three parts. The border is a styled "│"
-// character whose ANSI byte length varies by terminal color profile, so we
-// locate the "│" characters instead of assuming a fixed byte offset.
-func splitDiffBorders(line string) (prefix, inner, suffix string) {
-	const borderChar = "│"
-
-	firstIdx := strings.Index(line, borderChar)
-	if firstIdx < 0 {
-		return "", line, ""
-	}
-
-	lastIdx := strings.LastIndex(line, borderChar)
-	if lastIdx == firstIdx {
-		return "", line, ""
-	}
-
-	// Prefix ends after the first │ and any trailing ANSI reset sequence.
-	prefixEnd := firstIdx + len(borderChar)
-	if prefixEnd < len(line) && line[prefixEnd] == '\033' {
-		if i := strings.IndexByte(line[prefixEnd:], 'm'); i >= 0 {
-			prefixEnd += i + 1
-		}
-	}
-
-	// Suffix starts at the ESC introducing the last │'s foreground sequence.
-	suffixStart := lastIdx
-	for i := lastIdx - 1; i >= prefixEnd; i-- {
-		if line[i] == '\033' {
-			suffixStart = i
-			break
-		}
-	}
-
-	return line[:prefixEnd], line[prefixEnd:suffixStart], line[suffixStart:]
-}
 
 func (m Model) renderWithLeftSidebarFrom(view string) string {
 	treeW := m.treeWidth
@@ -2098,206 +1902,6 @@ func (m Model) prefetchFiles(n int) []tea.Cmd {
 	return cmds
 }
 
-// --- Comments ---
-
-var authorBadge = lipgloss.NewStyle().
-	Bold(true).
-	Foreground(lipgloss.Black).
-	Background(lipgloss.Yellow)
-
-func (m Model) borderStyle() lipgloss.Style {
-	return lipgloss.NewStyle().Foreground(m.ctx.DiffColors.BorderColor)
-}
-
-func (m Model) roundedBorderStyle() lipgloss.Style {
-	return lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(m.ctx.DiffColors.BorderColor).
-		Padding(0, 1)
-}
-
-// coloredAuthor is a convenience alias for the shared component.
-var coloredAuthor = components.ColoredAuthor
-
-// --- Reviews / Comments ---
-
-func (m Model) hasReviewContent() bool {
-	return len(m.reviews) > 0 || len(m.pr.RequestedReviewers) > 0
-}
-
-var (
-	reviewApproved  = lipgloss.NewStyle().Foreground(lipgloss.Green).Bold(true)
-	reviewChanges   = lipgloss.NewStyle().Foreground(lipgloss.Red).Bold(true)
-	reviewCommented = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
-	reviewPending   = lipgloss.NewStyle().Foreground(lipgloss.Yellow)
-)
-
-func reviewStateIcon(state string) string {
-	switch state {
-	case "APPROVED":
-		return reviewApproved.Render(iconCheckCircle + " approved")
-	case "CHANGES_REQUESTED":
-		return reviewChanges.Render(iconXCircle + " changes requested")
-	case "COMMENTED":
-		return reviewCommented.Render(iconComment + " commented")
-	case "DISMISSED":
-		return reviewCommented.Render(iconSlash + " dismissed")
-	default:
-		return reviewPending.Render(iconClock + " pending")
-	}
-}
-
-// rebuildSidebar rebuilds the right sidebar viewport content.
-func (m *Model) rebuildSidebar() {
-	if !m.showSidebar {
-		return
-	}
-	const pad = 4
-	modalW := m.width - pad*2
-	modalH := m.height - pad*2
-	if modalW < 20 {
-		modalW = 20
-	}
-	if modalH < 5 {
-		modalH = 5
-	}
-	contentPad := 2
-	innerW := modalW - 2 - contentPad*2 // inside borders + padding
-	contentH := modalH - 2              // inside top/bottom borders
-
-	var lines []string
-	switch m.sidebarType {
-	case sidebarComments:
-		lines = m.buildCommentLines(innerW)
-		if len(lines) == 0 {
-			lines = []string{dimStyle.Render("No comments yet.")}
-		}
-	case sidebarReviews:
-		lines = m.buildReviewLines(innerW)
-		if len(lines) == 0 {
-			lines = []string{dimStyle.Render("No reviews yet.")}
-		}
-	case sidebarChecks:
-		lines = m.buildCheckLines()
-		if len(lines) == 0 {
-			lines = []string{dimStyle.Render("No checks yet.")}
-		}
-	}
-
-	sep := m.borderStyle().Render(strings.Repeat("─", innerW))
-	content := strings.Join(lines, "\n"+sep+"\n")
-
-	m.sidebarVP = viewport.New()
-	m.sidebarVP.SetWidth(innerW)
-	m.sidebarVP.SetHeight(contentH)
-	m.sidebarVP.SetContent(content)
-}
-
-// buildReviewLines builds the content lines for the reviews section.
-func (m Model) buildReviewLines(innerW int) []string {
-	// Deduplicate reviews — keep only the latest per user.
-	latestByUser := make(map[string]github.Review)
-	for _, r := range m.reviews {
-		if r.State == "PENDING" {
-			continue
-		}
-		existing, ok := latestByUser[r.User.Login]
-		if !ok || r.SubmittedAt.After(existing.SubmittedAt) {
-			latestByUser[r.User.Login] = r
-		}
-	}
-
-	var lines []string
-	for _, r := range m.reviews {
-		latest, ok := latestByUser[r.User.Login]
-		if !ok || latest.ID != r.ID {
-			continue
-		}
-		delete(latestByUser, r.User.Login)
-
-		author := coloredAuthor(r.User.Login)
-		line := author + " " + reviewStateIcon(r.State)
-		if r.Body != "" {
-			body := renderMarkdown(r.Body, innerW)
-			line += "\n" + body
-		}
-		lines = append(lines, line)
-	}
-
-	// Requested reviewers (haven't reviewed yet).
-	for _, u := range m.pr.RequestedReviewers {
-		if _, reviewed := latestByUser[u.Login]; reviewed {
-			continue
-		}
-		alreadyRendered := false
-		for _, r := range m.reviews {
-			if r.User.Login == u.Login {
-				alreadyRendered = true
-				break
-			}
-		}
-		if alreadyRendered {
-			continue
-		}
-		author := coloredAuthor(u.Login)
-		lines = append(lines, author+" "+reviewPending.Render(iconClock+" awaiting review"))
-	}
-
-	return lines
-}
-
-// buildCommentLines builds the content lines for the comments section.
-func (m Model) buildCommentLines(innerW int) []string {
-	var lines []string
-	for _, c := range m.comments {
-		author := coloredAuthor(c.User.Login)
-		if c.User.Login == m.pr.User.Login {
-			author += " " + authorBadge.Render(" "+iconAuthor+" Author ")
-		}
-		age := dimStyle.Render(relativeTime(c.CreatedAt))
-
-		line := author + " " + age
-		if c.Body != "" {
-			body := renderMarkdown(c.Body, innerW)
-			line += "\n" + body
-		}
-		lines = append(lines, line)
-	}
-	return lines
-}
-
-// buildCheckLines builds the content lines for the checks section.
-func (m Model) buildCheckLines() []string {
-	var lines []string
-	for _, c := range m.checkRuns {
-		var icon string
-		switch {
-		case c.Status != "completed":
-			icon = reviewPending.Render(iconClock + " in progress")
-		case c.Conclusion != nil:
-			switch *c.Conclusion {
-			case "success":
-				icon = reviewApproved.Render(iconCheckCircle + " passed")
-			case "failure":
-				icon = reviewChanges.Render(iconXCircle + " failed")
-			case "cancelled":
-				icon = dimStyle.Render(iconSlash + " cancelled")
-			case "skipped":
-				icon = dimStyle.Render(iconSlash + " skipped")
-			case "neutral":
-				icon = dimStyle.Render(iconCheckCircle + " neutral")
-			default:
-				icon = reviewPending.Render(iconClock + " " + *c.Conclusion)
-			}
-		default:
-			icon = reviewPending.Render(iconClock + " pending")
-		}
-
-		name := lipgloss.NewStyle().Bold(true).Render(c.Name)
-		lines = append(lines, name+" "+icon)
-	}
-	return lines
-}
 
 // --- File Tree ---
 
@@ -2421,155 +2025,3 @@ func relativeTime(t time.Time) string {
 	}
 }
 
-// --- Glamour ---
-
-var markdownStyle = ansi.StyleConfig{
-	Document: ansi.StyleBlock{
-		StylePrimitive: ansi.StylePrimitive{},
-	},
-	Heading: ansi.StyleBlock{
-		StylePrimitive: ansi.StylePrimitive{
-			BlockSuffix: "\n",
-			Color:       stringPtr("5"), // magenta
-			Bold:        boolPtr(true),
-		},
-	},
-	H1: ansi.StyleBlock{
-		StylePrimitive: ansi.StylePrimitive{
-			Bold: boolPtr(true),
-		},
-	},
-	H2: ansi.StyleBlock{
-		StylePrimitive: ansi.StylePrimitive{
-			Prefix: "## ",
-			Bold:   boolPtr(true),
-		},
-	},
-	H3: ansi.StyleBlock{
-		StylePrimitive: ansi.StylePrimitive{
-			Prefix: "### ",
-			Bold:   boolPtr(true),
-		},
-	},
-	Emph: ansi.StylePrimitive{
-		Italic: boolPtr(true),
-	},
-	Strong: ansi.StylePrimitive{
-		Bold: boolPtr(true),
-	},
-	Strikethrough: ansi.StylePrimitive{
-		CrossedOut: boolPtr(true),
-	},
-	HorizontalRule: ansi.StylePrimitive{
-		Color:  stringPtr("8"), // bright black
-		Format: "\n────────\n",
-	},
-	Item: ansi.StylePrimitive{
-		BlockPrefix: "• ",
-	},
-	Enumeration: ansi.StylePrimitive{
-		BlockPrefix: ". ",
-	},
-	Task: ansi.StyleTask{
-		Ticked:   "\U000f0132 ", // 󰄲 nf-md-checkbox_marked
-		Unticked: "\ue640 ",    // nf-seti-checkbox_unchecked
-		StylePrimitive: ansi.StylePrimitive{
-			Color: stringPtr("2"), // green
-		},
-	},
-	Link: ansi.StylePrimitive{
-		// Hide visible URL — link text already has OSC 8 hyperlink.
-		Format: "{{/*hidden*/}}",
-	},
-	LinkText: ansi.StylePrimitive{
-		Color:     stringPtr("4"), // blue
-		Bold:      boolPtr(true),
-		Underline: boolPtr(true),
-	},
-	Code: ansi.StyleBlock{
-		StylePrimitive: ansi.StylePrimitive{
-			Color:  stringPtr("3"), // yellow
-			Prefix: "`",
-			Suffix: "`",
-		},
-	},
-	CodeBlock: ansi.StyleCodeBlock{
-		StyleBlock: ansi.StyleBlock{
-			StylePrimitive: ansi.StylePrimitive{
-				Color: stringPtr("8"), // bright black
-			},
-			Margin: uintPtr(2),
-		},
-	},
-	BlockQuote: ansi.StyleBlock{
-		StylePrimitive: ansi.StylePrimitive{
-			Color:  stringPtr("8"), // bright black
-			Italic: boolPtr(true),
-		},
-		Indent:      uintPtr(1),
-		IndentToken: stringPtr("│ "),
-	},
-	List: ansi.StyleList{
-		StyleBlock: ansi.StyleBlock{
-			Indent: uintPtr(2),
-		},
-		LevelIndent: 4,
-	},
-	Table: ansi.StyleTable{
-		CenterSeparator: stringPtr("│"),
-		ColumnSeparator: stringPtr("│"),
-		RowSeparator:    stringPtr("─"),
-	},
-}
-
-func boolPtr(b bool) *bool       { return &b }
-func stringPtr(s string) *string { return &s }
-func uintPtr(u uint) *uint       { return &u }
-
-var (
-	// reImage matches markdown images: ![alt](url)
-	reImage = regexp.MustCompile(`!\[([^\]]*)\]\(([^)]+)\)`)
-	// reHTMLImg matches <img ...> tags
-	reHTMLImg = regexp.MustCompile(`(?i)<img[^>]*>`)
-	// reHTMLVideo matches <video ...>...</video> and self-closing <video ... />
-	reHTMLVideo = regexp.MustCompile(`(?is)<video[^>]*(?:/>|>.*?</video>)`)
-	// reHTMLPicture matches <picture>...</picture>
-	reHTMLPicture = regexp.MustCompile(`(?is)<picture>.*?</picture>`)
-	// reBareAssetURL matches bare GitHub asset URLs on their own line (video/image embeds).
-	reBareAssetURL = regexp.MustCompile(`(?m)^\s*(https://github\.com/user-attachments/assets/\S+)\s*$`)
-)
-
-func renderMarkdown(body string, width int) string {
-	if width <= 0 || body == "" {
-		return body
-	}
-
-	// Convert markdown images to short links.
-	body = reImage.ReplaceAllStringFunc(body, func(match string) string {
-		sub := reImage.FindStringSubmatch(match)
-		text := sub[1]
-		if text == "" {
-			text = "image"
-		}
-		return "[" + text + "](" + sub[2] + ")"
-	})
-	// Strip HTML media tags.
-	body = reHTMLPicture.ReplaceAllString(body, "")
-	body = reHTMLVideo.ReplaceAllString(body, "")
-	body = reHTMLImg.ReplaceAllString(body, "")
-	// Convert bare GitHub asset URLs (video/image embeds) to short links.
-	body = reBareAssetURL.ReplaceAllString(body, "[attached media]($1)")
-
-	renderer, err := glamour.NewTermRenderer(
-		glamour.WithStyles(markdownStyle),
-		glamour.WithWordWrap(width),
-	)
-	if err != nil {
-		return body
-	}
-	rendered, err := renderer.Render(body)
-	if err != nil {
-		return body
-	}
-	return strings.TrimSpace(rendered)
-}

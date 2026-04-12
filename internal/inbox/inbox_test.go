@@ -312,10 +312,10 @@ func TestProcessInbox_SortsByScore(t *testing.T) {
 }
 
 func TestProcessInbox_StableSort(t *testing.T) {
-	// Two PRs with same action, same update time — should sort by number desc.
+	// Two PRs with same action, same created time — should sort by number desc.
 	prs := []github.InboxPR{
-		{Number: 10, State: "open", Sources: []github.PRSource{github.SourceAuthored}, UpdatedAt: now},
-		{Number: 20, State: "open", Sources: []github.PRSource{github.SourceAuthored}, UpdatedAt: now},
+		{Number: 10, State: "open", Sources: []github.PRSource{github.SourceAuthored}, CreatedAt: now, UpdatedAt: now},
+		{Number: 20, State: "open", Sources: []github.PRSource{github.SourceAuthored}, CreatedAt: now, UpdatedAt: now},
 	}
 	result := ProcessInboxAt(prs, "me", now)
 	if len(result) != 2 {
@@ -329,11 +329,12 @@ func TestProcessInbox_StableSort(t *testing.T) {
 	}
 }
 
-func TestProcessInbox_TiebreakByUpdateTime(t *testing.T) {
-	// Same action, different update times — more recent first.
+func TestProcessInbox_TiebreakByStateChangeTime(t *testing.T) {
+	// Same action, different created times — more recent first.
+	// Both are WaitingForReview, so stateChangedAt uses CreatedAt.
 	prs := []github.InboxPR{
-		{Number: 1, State: "open", Sources: []github.PRSource{github.SourceAuthored}, UpdatedAt: now.Add(-2 * time.Hour)},
-		{Number: 2, State: "open", Sources: []github.PRSource{github.SourceAuthored}, UpdatedAt: now.Add(-1 * time.Hour)},
+		{Number: 1, State: "open", Sources: []github.PRSource{github.SourceAuthored}, CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now.Add(-1 * time.Hour)},
+		{Number: 2, State: "open", Sources: []github.PRSource{github.SourceAuthored}, CreatedAt: now.Add(-1 * time.Hour), UpdatedAt: now.Add(-2 * time.Hour)},
 	}
 	result := ProcessInboxAt(prs, "me", now)
 	if result[0].Number != 2 {
@@ -350,8 +351,8 @@ func TestProcessInbox_Empty(t *testing.T) {
 
 func TestProcessInbox_ClosedAtBottom(t *testing.T) {
 	prs := []github.InboxPR{
-		{Number: 1, State: "closed", Sources: []github.PRSource{github.SourceAuthored}, UpdatedAt: now.Add(-1 * time.Hour)},
-		{Number: 2, State: "open", Sources: []github.PRSource{github.SourceAuthored}, UpdatedAt: now.Add(-1 * time.Hour)},
+		{Number: 1, State: "closed", Sources: []github.PRSource{github.SourceAuthored}, CreatedAt: now.Add(-1 * time.Hour), UpdatedAt: now.Add(-1 * time.Hour)},
+		{Number: 2, State: "open", Sources: []github.PRSource{github.SourceAuthored}, CreatedAt: now.Add(-1 * time.Hour), UpdatedAt: now.Add(-1 * time.Hour)},
 	}
 	result := ProcessInboxAt(prs, "me", now)
 	if len(result) != 2 {

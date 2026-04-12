@@ -12,8 +12,7 @@ import (
 	"github.com/blakewilliams/ghq/internal/terminal"
 	"github.com/blakewilliams/ghq/internal/copilot"
 	"github.com/blakewilliams/ghq/internal/ui/commandbar"
-	"github.com/blakewilliams/ghq/internal/ui/copilotchat"
-	"github.com/blakewilliams/ghq/internal/ui/home"
+		"github.com/blakewilliams/ghq/internal/ui/home"
 	"github.com/blakewilliams/ghq/internal/ui/localdiff"
 	"github.com/blakewilliams/ghq/internal/ui/picker"
 	"github.com/blakewilliams/ghq/internal/ui/prdetail"
@@ -24,6 +23,30 @@ import (
 	xansi "github.com/charmbracelet/x/ansi"
 	"charm.land/lipgloss/v2"
 )
+
+// gcTickMsg triggers garbage collection of stale cache entries.
+type gcTickMsg struct{}
+
+// userLoadedMsg is sent when the authenticated user is loaded.
+type userLoadedMsg struct {
+	User github.User
+}
+
+func fetchAuthenticatedUser(c *github.CachedClient) tea.Cmd {
+	return func() tea.Msg {
+		user, err := c.FetchAuthenticatedUser()
+		if err != nil {
+			return uictx.QueryErrMsg{Err: err}
+		}
+		return userLoadedMsg{User: user}
+	}
+}
+
+func gcTickCmd(c *github.CachedClient) tea.Cmd {
+	return tea.Tick(c.GCInterval(), func(t time.Time) tea.Msg {
+		return gcTickMsg{}
+	})
+}
 
 type inputMode int
 type quitTimeoutMsg struct{}
@@ -47,7 +70,7 @@ type Model struct {
 	commandBar commandbar.Model
 	picker      picker.Model
 	pickerKind  string // "command", "help", "view" — routes ResultMsg
-	copilotChat    copilotchat.Model
+	copilotChat    copilot.ChatModel
 	chatClient     *copilot.Client // shared copilot client for chat
 	chatInitialized bool
 	ctx        *uictx.Context
@@ -78,8 +101,8 @@ func NewApp(client *github.CachedClient, nwo string, repoRoot string) Model {
 
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
-		m.ctx.Client.FetchAuthenticatedUser(),
-		m.ctx.Client.GCTickCmd(),
+		fetchAuthenticatedUser(m.ctx.Client),
+		gcTickCmd(m.ctx.Client),
 		queryPaletteCmd(),
 		tea.RequestBackgroundColor,
 	)
@@ -112,9 +135,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
-	case github.GCTickMsg:
+	case gcTickMsg:
 		m.ctx.Client.GC()
-		return m, m.ctx.Client.GCTickCmd()
+		return m, gcTickCmd(m.ctx.Client)
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -235,7 +258,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case copilotchat.CloseMsg:
+	case copilot.CloseMsg:
 		m.mode = modeNormal
 		return m, nil
 
@@ -301,7 +324,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
-	case github.UserLoadedMsg:
+	case userLoadedMsg:
 		m.ctx.Username = msg.User.Login
 		// Now that we have the username, init the home view.
 		return m, m.activeView.Init()
@@ -309,9 +332,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case home.PRSelectedMsg:
 		m.history = append(m.history, m.activeView)
 		m.forward = nil
-		return m, m.ctx.Client.FetchPR(msg.Owner, msg.Repo, msg.Number)
+		return m, uictx.FetchPR(m.ctx.Client, msg.Owner, msg.Repo, msg.Number)
 
-	case github.PRLoadedMsg:
+	case uictx.PRLoadedMsg:
 		// Scope client to this PR's repo for all subsequent API calls.
 		if owner := msg.PR.RepoOwner(); owner != "" {
 			m.ctx.Client.SetRepo(owner, msg.PR.RepoName())
@@ -382,7 +405,7 @@ func (m Model) handleCommand(msg commandbar.CommandMsg) (tea.Model, tea.Cmd) {
 	case "refresh":
 		if _, ok := m.activeView.(prlist.Model); ok {
 			m.ctx.Client.InvalidateAll()
-			return m, m.ctx.Client.ListPullRequests()
+			return m, prlist.ListPullRequests(m.ctx.Client)
 		}
 		if _, ok := m.activeView.(localdiff.Model); ok {
 			m.activeView = localdiff.New(m.ctx, m.repoRoot, m.width, m.height-chromeHeight)
@@ -423,9 +446,21 @@ func (m Model) handleCommand(msg commandbar.CommandMsg) (tea.Model, tea.Cmd) {
 			if branch != "" {
 				m.history = append(m.history, m.activeView)
 				m.forward = nil
-				return m, m.ctx.Client.FetchPRByBranch(branch)
+				return m, uictx.FetchPRByBranch(m.ctx.Client, branch)
 			}
 		}
+	case "working":
+		var cmd tea.Cmd
+		m.activeView, cmd = m.activeView.Update(localdiff.SwitchModeMsg{Mode: git.DiffWorking})
+		return m, cmd
+	case "staged":
+		var cmd tea.Cmd
+		m.activeView, cmd = m.activeView.Update(localdiff.SwitchModeMsg{Mode: git.DiffStaged})
+		return m, cmd
+	case "branch":
+		var cmd tea.Cmd
+		m.activeView, cmd = m.activeView.Update(localdiff.SwitchModeMsg{Mode: git.DiffBranch})
+		return m, cmd
 	}
 	return m, nil
 }
@@ -465,22 +500,37 @@ func (m Model) View() tea.View {
 func (m Model) renderHeader() string {
 	sep := styles.HeaderSep.Render(" / ")
 
+	// Always show repo name if available.
+	repo := m.ctx.Client.RepoFullName()
 	var crumb string
-	switch m.activeView.(type) {
+
+	switch v := m.activeView.(type) {
 	case home.Model:
-		crumb = " " + styles.HeaderActive.Render("Inbox")
+		if repo != "" {
+			crumb = " " + styles.HeaderRepo.Render(repo) + sep + styles.HeaderActive.Render("Inbox")
+		} else {
+			crumb = " " + styles.HeaderActive.Render("Inbox")
+		}
 	case localdiff.Model:
-		detail := m.activeView.(localdiff.Model)
-		crumb = " " + styles.HeaderActive.Render("Local") + sep + styles.HeaderSection.Render(detail.BranchName()) +
-			sep + styles.HeaderActive.Render(detail.DiffMode().String())
+		dot := styles.HeaderSep.Render(" · ")
+		crumb = " "
+		if repo != "" {
+			crumb += styles.HeaderRepo.Render(repo) + sep
+		}
+		crumb += styles.HeaderActive.Render(v.BranchName()) + dot + styles.HeaderSection.Render(v.DiffMode().String())
+		if pr := v.PR(); pr != nil {
+			prBadge := styles.HeaderSep.Render(fmt.Sprintf(" PR #%d", pr.Number))
+			gap := m.width - lipgloss.Width(crumb) - lipgloss.Width(prBadge) - 1
+			if gap > 0 {
+				crumb += strings.Repeat(" ", gap) + prBadge
+			}
+		}
 	case prlist.Model:
-		repo := styles.HeaderRepo.Render(m.ctx.Client.RepoFullName())
-		crumb = " " + repo + sep + styles.HeaderActive.Render("Pulls")
+		crumb = " " + styles.HeaderRepo.Render(repo) + sep + styles.HeaderActive.Render("Pulls")
 	case prdetail.Model:
-		detail := m.activeView.(prdetail.Model)
-		repo := styles.HeaderRepo.Render(detail.RepoFullName())
-		crumb = " " + repo + sep + styles.HeaderSection.Render("Pulls") +
-			sep + styles.HeaderActive.Render(fmt.Sprintf("#%d %s", detail.PRNumber(), detail.PRTitle()))
+		crumb = " " + styles.HeaderRepo.Render(v.RepoFullName()) + sep +
+			styles.HeaderSection.Render("Pulls") + sep +
+			styles.HeaderActive.Render(fmt.Sprintf("#%d %s", v.PRNumber(), v.PRTitle()))
 	default:
 		crumb = " " + styles.HeaderActive.Render("ghq")
 	}
@@ -596,7 +646,7 @@ func (m Model) openCopilotChat() (tea.Model, tea.Cmd) {
 	}
 
 	// Build diff context from the active view.
-	ctx := copilotchat.DiffContext{
+	ctx := copilot.DiffContext{
 		RepoRoot: m.repoRoot,
 	}
 	switch v := m.activeView.(type) {
@@ -624,7 +674,7 @@ func (m Model) openCopilotChat() (tea.Model, tea.Cmd) {
 	}
 
 	if !m.chatInitialized {
-		m.copilotChat = copilotchat.New(m.chatClient, ctx, m.ctx.Username, chatW-4, chatH)
+		m.copilotChat = copilot.NewChat(m.chatClient, ctx, m.ctx.Username, chatW-4, chatH)
 		m.chatInitialized = true
 	}
 	m.mode = modeCopilotChat
@@ -724,6 +774,19 @@ func (m Model) commandPickerItems() []picker.Item {
 			{Label: "Local Diff", Description: "Local changes view", Value: "local", Keywords: []string{"diff", "changes", "working"}},
 			{Label: "Open PR", Description: "PR for current branch", Value: "pr", Keywords: []string{"pull request", "branch"}},
 		}, items...)
+
+		// Mode switching (available when in localdiff).
+		if _, ok := m.activeView.(localdiff.Model); ok {
+			items = append(items,
+				picker.Item{Label: "Working Tree", Description: "Uncommitted changes", Value: "working", Keywords: []string{"mode", "unstaged"}},
+				picker.Item{Label: "Staged", Description: "Staged changes", Value: "staged", Keywords: []string{"mode", "cached", "index"}},
+			)
+			branch, _ := git.CurrentBranch(m.repoRoot)
+			defaultBranch, _ := git.DefaultBranch(m.repoRoot)
+			if branch != defaultBranch {
+				items = append(items, picker.Item{Label: "Branch Diff", Description: "vs " + defaultBranch, Value: "branch", Keywords: []string{"mode", "compare"}})
+			}
+		}
 	}
 	return items
 }

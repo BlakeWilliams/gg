@@ -24,7 +24,7 @@ const (
 func (m DiffMode) String() string {
 	switch m {
 	case DiffWorking:
-		return "Working Tree"
+		return "Unstaged"
 	case DiffStaged:
 		return "Staged"
 	case DiffBranch:
@@ -114,7 +114,8 @@ func Diff(dir string, mode DiffMode) (string, error) {
 	switch mode {
 	case DiffWorking:
 		if hasCommits {
-			args = []string{"-C", dir, "diff", "HEAD", "--no-color"}
+			// Show only unstaged changes (not yet git add'd).
+			args = []string{"-C", dir, "diff", "--no-color"}
 		} else {
 			// No commits yet — show staged files (everything that's been git add'd).
 			args = []string{"-C", dir, "diff", "--cached", "--no-color"}

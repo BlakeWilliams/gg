@@ -21,6 +21,19 @@ type PRSelectedMsg struct {
 	PR github.PullRequest
 }
 
+// PRsLoadedMsg is sent when pull requests are loaded.
+type PRsLoadedMsg struct {
+	PRs []github.PullRequest
+}
+
+// ListPullRequests returns a tea.Cmd that fetches PRs with caching.
+func ListPullRequests(c *github.CachedClient) tea.Cmd {
+	data, found, refetch := c.ListPullRequests()
+	return uictx.CachedCmd(data, found, refetch, func(prs []github.PullRequest) tea.Msg {
+		return PRsLoadedMsg{PRs: prs}
+	})
+}
+
 type prItem struct {
 	pr github.PullRequest
 }
@@ -154,7 +167,7 @@ func New(ctx *uictx.Context) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.list.StartSpinner(), m.ctx.Client.ListPullRequests())
+	return tea.Batch(m.list.StartSpinner(), ListPullRequests(m.ctx.Client))
 }
 
 func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
@@ -164,7 +177,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		m.height = msg.Height
 		m.list.SetSize(msg.Width, msg.Height-1)
 
-	case github.PRsLoadedMsg:
+	case PRsLoadedMsg:
 		items := make([]list.Item, len(msg.PRs))
 		for i, pr := range msg.PRs {
 			items[i] = prItem{pr: pr}
@@ -173,7 +186,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		m.list.StopSpinner()
 		return m, cmd
 
-	case github.QueryErrMsg:
+	case uictx.QueryErrMsg:
 		m.err = msg.Err
 		m.list.StopSpinner()
 
