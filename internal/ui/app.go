@@ -73,12 +73,20 @@ type Model struct {
 	copilotChat    copilot.ChatModel
 	chatClient     *copilot.Client // shared copilot client for chat
 	chatInitialized bool
-	ctx        *uictx.Context
+	ctx         *uictx.Context
 	quitPending bool // true after first ctrl+c
-	palette    terminal.Palette
-	repoRoot   string // local git repo root, if any
-	width      int
-	height     int
+	palette     terminal.Palette
+	repoRoot    string // local git repo root, if any
+	startupMode string // from CLI arg
+	width       int
+	height      int
+}
+
+func (m Model) nwo() string {
+	if m.ctx.Owner != "" {
+		return m.ctx.Owner + "/" + m.ctx.Repo
+	}
+	return ""
 }
 
 // AppConfig holds the arguments for creating a new App.
@@ -87,36 +95,67 @@ type AppConfig struct {
 	Owner    string
 	Repo     string
 	RepoRoot string // local git repo root, if any
+	Mode     string // "inbox", "pr", "diff", or "" (show picker)
 }
 
 // NewApp creates and returns a new top-level UI model.
 func NewApp(cfg AppConfig) Model {
 	ctx := &uictx.Context{Client: cfg.Client, Owner: cfg.Owner, Repo: cfg.Repo}
-	var initialView uictx.View
-	if cfg.RepoRoot != "" && cfg.Owner == "" {
-		initialView = localdiff.New(ctx, cfg.RepoRoot, 0, 0)
-	} else {
-		nwo := ""
-		if cfg.Owner != "" {
-			nwo = cfg.Owner + "/" + cfg.Repo
+
+	m := Model{
+		commandBar:  commandbar.New(),
+		ctx:         ctx,
+		repoRoot:    cfg.RepoRoot,
+		startupMode: cfg.Mode,
+	}
+
+	// If a mode was specified, open that view directly.
+	switch cfg.Mode {
+	case "diff":
+		if cfg.RepoRoot != "" {
+			m.activeView = localdiff.New(ctx, cfg.RepoRoot, 0, 0)
+		} else {
+			m.activeView = inboxui.New(ctx, m.nwo())
 		}
-		initialView = inboxui.New(ctx, nwo)
+	case "inbox":
+		m.activeView = inboxui.New(ctx, m.nwo())
+	case "pr":
+		// PR mode starts with inbox, then fetches the branch PR in Init.
+		m.activeView = inboxui.New(ctx, m.nwo())
+	default:
+		// No mode specified — will show startup picker after Init.
+		// Default to inbox as the initial view (picker overlays on top).
+		m.activeView = inboxui.New(ctx, m.nwo())
 	}
-	return Model{
-		activeView: initialView,
-		commandBar: commandbar.New(),
-		ctx:        ctx,
-		repoRoot:   cfg.RepoRoot,
-	}
+
+	return m
 }
 
+type startupPickerMsg struct{}
+
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(
+	cmds := []tea.Cmd{
 		fetchAuthenticatedUser(m.ctx.Client),
 		gcTickCmd(m.ctx.Client),
 		queryPaletteCmd(),
 		tea.RequestBackgroundColor,
-	)
+	}
+
+	switch m.startupMode {
+	case "pr":
+		// Fetch the PR for the current branch.
+		if m.repoRoot != "" && m.ctx.Owner != "" {
+			branch, _ := git.CurrentBranch(m.repoRoot)
+			if branch != "" {
+				cmds = append(cmds, uictx.FetchPRByBranch(m.ctx.Client, m.ctx.Owner, m.ctx.Repo, branch))
+			}
+		}
+	case "":
+		// No mode — show startup picker after first render.
+		cmds = append(cmds, func() tea.Msg { return startupPickerMsg{} })
+	}
+
+	return tea.Batch(cmds...)
 }
 
 // queryPaletteCmd sends OSC 4 queries through Bubble Tea's output buffer.
@@ -169,6 +208,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case quitTimeoutMsg:
 		m.quitPending = false
+		return m, nil
+
+	case startupPickerMsg:
+		m.mode = modePicker
+		m.pickerKind = "startup"
+		m.picker = picker.New("Open", m.startupPickerItems(), m.pickerInnerWidth(), m.height-chromeHeight)
 		return m, nil
 
 	case tea.KeyPressMsg:
@@ -262,7 +307,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		switch kind {
-		case "command":
+		case "command", "startup":
 			return m.handleCommand(commandbar.CommandMsg{Command: msg.Value})
 		case "view":
 			return m.handleViewPickerResult(msg.Value)
@@ -757,6 +802,27 @@ func (m Model) renderChatOverlay(bg string, bgHeight int) string {
 	}
 
 	return strings.Join(bgLines, "\n")
+}
+
+func (m Model) startupPickerItems() []picker.Item {
+	var items []picker.Item
+	items = append(items, picker.Item{
+		Label: "Inbox", Description: "PR inbox", Value: "inbox",
+		Keywords: []string{"home", "notifications"},
+	})
+	if m.repoRoot != "" {
+		items = append(items, picker.Item{
+			Label: "Local Diff", Description: "Review local changes", Value: "local",
+			Keywords: []string{"diff", "changes", "working", "staged"},
+		})
+	}
+	if m.ctx.Owner != "" && m.repoRoot != "" {
+		items = append(items, picker.Item{
+			Label: "Pull Request", Description: "Open PR for current branch", Value: "pr",
+			Keywords: []string{"review", "branch"},
+		})
+	}
+	return items
 }
 
 func (m Model) commandPickerItems() []picker.Item {

@@ -19,6 +19,12 @@ func main() {
 	repo := flag.String("repo", "", "repository name")
 	flag.Parse()
 
+	// First positional arg is the mode: inbox, pr, diff
+	mode := ""
+	if flag.NArg() > 0 {
+		mode = flag.Arg(0)
+	}
+
 	// Detect owner/repo from local git remote if not specified.
 	detectedOwner, detectedRepo := *owner, *repo
 	if detectedOwner == "" || detectedRepo == "" {
@@ -47,6 +53,7 @@ func main() {
 		Owner:    detectedOwner,
 		Repo:     detectedRepo,
 		RepoRoot: repoRoot,
+		Mode:     mode,
 	}))
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
