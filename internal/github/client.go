@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	"github.com/cli/go-gh/v2/pkg/api"
 	"github.com/cli/go-gh/v2/pkg/repository"
@@ -23,9 +22,9 @@ func (c *Client) RepoFullName() string {
 	return c.owner + "/" + c.repo
 }
 
-// NewClient creates a GitHub API client. If nwo is empty, it detects the
-// repo from the current directory. Otherwise nwo should be "owner/repo".
-func NewClient(nwo string) (*Client, error) {
+// NewClient creates a GitHub API client scoped to the given owner/repo.
+// If both are empty, it detects the repo from the current directory.
+func NewClient(owner, repo string) (*Client, error) {
 	rest, err := api.DefaultRESTClient()
 	if err != nil {
 		return nil, fmt.Errorf("creating REST client: %w", err)
@@ -36,15 +35,11 @@ func NewClient(nwo string) (*Client, error) {
 		return nil, fmt.Errorf("creating GraphQL client: %w", err)
 	}
 
-	if nwo != "" {
-		parts := strings.SplitN(nwo, "/", 2)
-		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-			return nil, fmt.Errorf("invalid repo format %q, expected owner/repo", nwo)
-		}
-		return &Client{rest: rest, gql: gql, owner: parts[0], repo: parts[1]}, nil
+	if owner != "" && repo != "" {
+		return &Client{rest: rest, gql: gql, owner: owner, repo: repo}, nil
 	}
 
-	repo, err := repository.Current()
+	detected, err := repository.Current()
 	if err != nil {
 		// No repo detected — that's fine for inbox-only mode.
 		return &Client{rest: rest, gql: gql}, nil
@@ -53,8 +48,8 @@ func NewClient(nwo string) (*Client, error) {
 	return &Client{
 		rest:  rest,
 		gql:   gql,
-		owner: repo.Owner,
-		repo:  repo.Name,
+		owner: detected.Owner,
+		repo:  detected.Name,
 	}, nil
 }
 

@@ -14,10 +14,11 @@ import (
 )
 
 func main() {
-	nwo := flag.String("nwo", "", "repository in owner/repo format (defaults to current directory)")
+	owner := flag.String("owner", "", "repository owner")
+	repo := flag.String("repo", "", "repository name")
 	flag.Parse()
 
-	client, err := github.NewClient(*nwo)
+	client, err := github.NewClient(*owner, *repo)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -31,7 +32,7 @@ func main() {
 
 	repoRoot, _ := git.RepoRoot(".")
 
-	p := tea.NewProgram(ui.NewApp(cachedClient, *nwo, repoRoot))
+	p := tea.NewProgram(ui.NewApp(cachedClient, *owner, *repo, repoRoot))
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)

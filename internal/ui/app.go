@@ -82,13 +82,17 @@ type Model struct {
 }
 
 // NewApp creates and returns a new top-level UI model. If repoRoot is non-empty
-// and no GitHub repo (nwo) is specified, it opens directly to the local diff view.
-func NewApp(client *github.CachedClient, nwo string, repoRoot string) Model {
-	ctx := &uictx.Context{Client: client, NWO: nwo}
+// and no owner/repo is specified, it opens directly to the local diff view.
+func NewApp(client *github.CachedClient, owner, repo, repoRoot string) Model {
+	ctx := &uictx.Context{Client: client, Owner: owner, Repo: repo}
 	var initialView uictx.View
-	if repoRoot != "" && nwo == "" {
+	if repoRoot != "" && owner == "" {
 		initialView = localdiff.New(ctx, repoRoot, 0, 0)
 	} else {
+		nwo := ""
+		if owner != "" {
+			nwo = owner + "/" + repo
+		}
 		initialView = home.New(ctx, nwo)
 	}
 	return Model{
@@ -271,9 +275,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case localdiff.SwitchToPRMsg:
 		m.history = append(m.history, m.activeView)
 		m.forward = nil
-		if owner := msg.PR.RepoOwner(); owner != "" {
-			m.ctx.Client.SetRepo(owner, msg.PR.RepoName())
-		}
 		m.activeView = m.newPRDetail(msg.PR)
 		return m, m.activeView.Init()
 
@@ -335,10 +336,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, uictx.FetchPR(m.ctx.Client, msg.Owner, msg.Repo, msg.Number)
 
 	case uictx.PRLoadedMsg:
-		// Scope client to this PR's repo for all subsequent API calls.
-		if owner := msg.PR.RepoOwner(); owner != "" {
-			m.ctx.Client.SetRepo(owner, msg.PR.RepoName())
-		}
 		m.activeView = m.newPRDetail(msg.PR)
 		return m, m.activeView.Init()
 
@@ -363,15 +360,6 @@ func (m Model) navigateBack() (tea.Model, tea.Cmd) {
 	// Restore prList reference if we're going back to the list.
 	if pl, ok := prev.(prlist.Model); ok {
 		m.prList = pl
-	}
-	// Restore repo scope from the NWO flag (or clear it) when leaving PR detail.
-	if m.ctx.NWO != "" {
-		parts := strings.SplitN(m.ctx.NWO, "/", 2)
-		if len(parts) == 2 {
-			m.ctx.Client.SetRepo(parts[0], parts[1])
-		}
-	} else {
-		m.ctx.Client.SetRepo("", "")
 	}
 	resize := tea.WindowSizeMsg{Width: m.width, Height: m.height - chromeHeight}
 	m.activeView, _ = m.activeView.Update(resize)
@@ -428,7 +416,11 @@ func (m Model) handleCommand(msg commandbar.CommandMsg) (tea.Model, tea.Cmd) {
 		if _, ok := m.activeView.(home.Model); !ok {
 			m.history = append(m.history, m.activeView)
 			m.forward = nil
-			h := home.New(m.ctx, m.ctx.NWO)
+			nwo := ""
+			if m.ctx.Owner != "" {
+				nwo = m.ctx.Owner + "/" + m.ctx.Repo
+			}
+			h := home.New(m.ctx, nwo)
 			m.activeView = h
 			resize := tea.WindowSizeMsg{Width: m.width, Height: m.height - chromeHeight}
 			m.activeView, _ = m.activeView.Update(resize)
@@ -621,9 +613,6 @@ func (m Model) handleViewPickerResult(value string) (tea.Model, tea.Cmd) {
 			m.history = append(m.history, m.activeView)
 			m.forward = nil
 			pr := *ld.PR()
-			if owner := pr.RepoOwner(); owner != "" {
-				m.ctx.Client.SetRepo(owner, pr.RepoName())
-			}
 			m.activeView = m.newPRDetail(pr)
 			return m, m.activeView.Init()
 		}

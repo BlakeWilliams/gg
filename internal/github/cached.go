@@ -22,11 +22,25 @@ func NewCachedClient(client *Client, opts cache.Options) *CachedClient {
 	}
 }
 
-// SetRepo changes the active repo scope for API calls.
-func (c *CachedClient) SetRepo(owner, repo string) {
-	c.client.owner = owner
-	c.client.repo = repo
+// Scoped returns a new CachedClient targeting the given owner/repo,
+// sharing the same cache and REST/GraphQL clients.
+func (c *CachedClient) Scoped(owner, repo string) *CachedClient {
+	return &CachedClient{
+		client: &Client{
+			rest:  c.client.rest,
+			gql:   c.client.gql,
+			owner: owner,
+			repo:  repo,
+		},
+		cache: c.cache,
+	}
 }
+
+// Owner returns the repo owner.
+func (c *CachedClient) Owner() string { return c.client.owner }
+
+// Repo returns the repo name.
+func (c *CachedClient) Repo() string { return c.client.repo }
 
 // RepoFullName returns the owner/repo string.
 func (c *CachedClient) RepoFullName() string {

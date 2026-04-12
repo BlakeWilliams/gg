@@ -170,6 +170,7 @@ type prefetchDoneMsg struct{}
 type Model struct {
 	pr     github.PullRequest
 	ctx    *uictx.Context
+	client *github.CachedClient // scoped to this PR's repo
 	width  int
 	height int
 
@@ -240,13 +241,16 @@ type Model struct {
 }
 
 func New(pr github.PullRequest, ctx *uictx.Context, width, height int) Model {
+	client := ctx.Client
 	repoNWO := ""
 	if pr.Base.Repo != nil {
 		repoNWO = pr.Base.Repo.Owner.Login + "/" + pr.Base.Repo.Name
+		client = ctx.Client.Scoped(pr.Base.Repo.Owner.Login, pr.Base.Repo.Name)
 	}
 	return Model{
 		pr:              pr,
 		ctx:             ctx,
+		client:          client,
 		width:           width,
 		height:          height,
 		currentFileIdx:  -1,
@@ -277,7 +281,7 @@ func (m Model) PRTitle() string {
 }
 
 func (m Model) RepoFullName() string {
-	return m.ctx.Client.RepoFullName()
+	return m.client.RepoFullName()
 }
 
 func (m *Model) activeViewport() *viewport.Model {
@@ -350,11 +354,11 @@ func (m Model) Init() tea.Cmd {
 			rendered := renderMarkdown(body, width)
 			return descRenderedMsg{content: rendered, prNumber: prNumber}
 		},
-		fetchPullRequestFiles(m.ctx.Client, m.pr.Number),
-		fetchReviews(m.ctx.Client, m.pr.Number),
-		fetchIssueComments(m.ctx.Client, m.pr.Number),
-		fetchReviewComments(m.ctx.Client, m.pr.Number),
-		fetchCheckRuns(m.ctx.Client, m.pr.Head.SHA),
+		fetchPullRequestFiles(m.client, m.pr.Number),
+		fetchReviews(m.client, m.pr.Number),
+		fetchIssueComments(m.client, m.pr.Number),
+		fetchReviewComments(m.client, m.pr.Number),
+		fetchCheckRuns(m.client, m.pr.Head.SHA),
 	}
 	if m.copilotClient != nil {
 		cmds = append(cmds, m.copilotClient.ListenCmd())
@@ -576,12 +580,12 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 
 	case refetchPRMsg:
 		// Invalidate and re-fetch PR data.
-		m.ctx.Client.InvalidatePR(m.pr.Number)
+		m.client.InvalidatePR(m.pr.Number)
 		cmds := []tea.Cmd{
-			fetchPullRequestFiles(m.ctx.Client, m.pr.Number),
-			fetchReviews(m.ctx.Client, m.pr.Number),
-			fetchReviewComments(m.ctx.Client, m.pr.Number),
-			fetchCheckRuns(m.ctx.Client, m.pr.Head.SHA),
+			fetchPullRequestFiles(m.client, m.pr.Number),
+			fetchReviews(m.client, m.pr.Number),
+			fetchReviewComments(m.client, m.pr.Number),
+			fetchCheckRuns(m.client, m.pr.Head.SHA),
 		}
 		if m.refWatcher != nil {
 			cmds = append(cmds, m.refWatcher.WaitCmd())
@@ -1116,10 +1120,10 @@ func (m Model) handleCommentKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		m.composing = false
 		var cmd tea.Cmd
 		if m.replyToID != nil {
-			cmd = replyToReviewComment(m.ctx.Client, m.pr.Number, *m.replyToID, body)
+			cmd = replyToReviewComment(m.client, m.pr.Number, *m.replyToID, body)
 		} else {
 			cmd = createReviewComment(
-				m.ctx.Client, m.pr.Number, body, m.pr.Head.SHA,
+				m.client, m.pr.Number, body, m.pr.Head.SHA,
 				m.commentFile, m.commentLine, m.commentSide,
 				m.commentStartLine, m.commentStartSide,
 			)
@@ -1697,7 +1701,7 @@ func (m Model) buildOverviewContent(w int) string {
 	content.WriteString("\n" + indent(meta, overviewPad) + "\n")
 
 	// Title.
-	prURL := fmt.Sprintf("https://github.com/%s/pull/%d", m.ctx.Client.RepoFullName(), m.pr.Number)
+	prURL := fmt.Sprintf("https://github.com/%s/pull/%d", m.client.RepoFullName(), m.pr.Number)
 	title := lipgloss.NewStyle().Bold(true).
 		UnderlineStyle(lipgloss.UnderlineDotted).
 		Hyperlink(prURL).
@@ -1776,7 +1780,7 @@ func (m Model) highlightFileCmd(index int) tea.Cmd {
 	f := m.files[index]
 	ref := m.pr.Head.SHA
 	prNumber := m.pr.Number
-	client := m.ctx.Client
+	client := m.client
 	chromaStyle := m.ctx.DiffColors.ChromaStyle
 
 	return func() tea.Msg {
@@ -1886,7 +1890,7 @@ func (m Model) prefetchFiles(n int) []tea.Cmd {
 	}
 
 	ref := m.pr.Head.SHA
-	client := m.ctx.Client
+	client := m.client
 	var cmds []tea.Cmd
 	for i := 0; i < limit; i++ {
 		f := m.files[i]

@@ -67,7 +67,8 @@ type Context struct {
 	Client     *github.CachedClient
 	DiffColors styles.DiffColors
 	Username   string
-	NWO        string // optional repo filter (owner/repo)
+	Owner      string // repo owner (from flag or detected)
+	Repo       string // repo name
 }
 
 // KeyBinding describes a key and what it does, for help display.
