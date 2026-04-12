@@ -24,6 +24,22 @@ type PullRequest struct {
 	RequestedReviewers []User     `json:"requested_reviewers"`
 }
 
+// RepoOwner returns the repository owner for this PR.
+func (pr PullRequest) RepoOwner() string {
+	if pr.Base.Repo != nil {
+		return pr.Base.Repo.Owner.Login
+	}
+	return ""
+}
+
+// RepoName returns the repository name for this PR.
+func (pr PullRequest) RepoName() string {
+	if pr.Base.Repo != nil {
+		return pr.Base.Repo.Name
+	}
+	return ""
+}
+
 type User struct {
 	Login     string `json:"login"`
 	AvatarURL string `json:"avatar_url"`
@@ -31,8 +47,14 @@ type User struct {
 }
 
 type Branch struct {
-	Ref string `json:"ref"`
-	SHA string `json:"sha"`
+	Ref  string      `json:"ref"`
+	SHA  string      `json:"sha"`
+	Repo *BranchRepo `json:"repo,omitempty"`
+}
+
+type BranchRepo struct {
+	Owner User   `json:"owner"`
+	Name  string `json:"name"`
 }
 
 type Label struct {

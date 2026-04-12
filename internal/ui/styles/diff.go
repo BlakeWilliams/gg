@@ -30,10 +30,22 @@ type DiffColors struct {
 	BorderFg string
 	// BorderColor is the border color as a color.Color for use with lipgloss.
 	BorderColor color.Color
+	// HighlightBorderFg is a raw ANSI fg code for highlighted borders (from palette yellow).
+	HighlightBorderFg string
 
 	// ChromaStyle is a chroma style built from the terminal palette,
 	// suitable for syntax highlighting on both normal and tinted backgrounds.
 	ChromaStyle *chroma.Style
+
+	// Palette colors for use with lipgloss (resolved from terminal).
+	PaletteGreen   color.Color
+	PaletteRed     color.Color
+	PaletteYellow  color.Color
+	PaletteCyan    color.Color
+	PaletteMagenta color.Color
+	PaletteBg      color.Color
+	PaletteFg      color.Color // bright white or equivalent
+	PaletteDim     color.Color // mid-gray, safe on light and dark
 }
 
 // ComputeDiffColors derives colors from the terminal's resolved palette.
@@ -68,12 +80,24 @@ func ComputeDiffColors(p terminal.Palette) DiffColors {
 		borderColor = color.RGBA{R: 128, G: 128, B: 128, A: 255}
 	}
 
+	// Compute a safe mid-gray for dimmed badges — ensures contrast on both light/dark.
+	dimColor := blendColor(selectTint, bg, 0.35)
+
 	colors := DiffColors{
 		SelectBg:      colorToBgCode(selectBg),
 		SelectedCtxBg: colorToBgCode(selectBg),
 		SelectColor:   selectBg,
-		BorderFg:      colorToFgCode(borderColor),
-		BorderColor:   borderColor,
+		BorderFg:           colorToFgCode(borderColor),
+		BorderColor:        borderColor,
+		HighlightBorderFg:  colorToFgCode(orDefault(yellow, color.RGBA{R: 200, G: 180, B: 0, A: 255})),
+		PaletteGreen:   orDefault(green, color.RGBA{R: 0, G: 180, B: 0, A: 255}),
+		PaletteRed:     orDefault(red, color.RGBA{R: 220, G: 50, B: 50, A: 255}),
+		PaletteYellow:  orDefault(yellow, color.RGBA{R: 200, G: 180, B: 0, A: 255}),
+		PaletteCyan:    orDefault(cyan, color.RGBA{R: 0, G: 180, B: 200, A: 255}),
+		PaletteMagenta: orDefault(magenta, color.RGBA{R: 180, G: 0, B: 180, A: 255}),
+		PaletteBg:      bg,
+		PaletteFg:      orDefault(white, color.RGBA{R: 255, G: 255, B: 255, A: 255}),
+		PaletteDim:     dimColor,
 	}
 
 	// Subtle bg tints.
@@ -178,6 +202,13 @@ func buildChromaStyle(p terminal.Palette, bg, white, red, green, blue, yellow, c
 		return nil
 	}
 	return style
+}
+
+func orDefault(c color.Color, fallback color.Color) color.Color {
+	if c != nil {
+		return c
+	}
+	return fallback
 }
 
 func pick(preferred, fallback color.Color) color.Color {

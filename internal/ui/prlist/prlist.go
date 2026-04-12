@@ -21,6 +21,19 @@ type PRSelectedMsg struct {
 	PR github.PullRequest
 }
 
+// PRsLoadedMsg is sent when pull requests are loaded.
+type PRsLoadedMsg struct {
+	PRs []github.PullRequest
+}
+
+// ListPullRequests returns a tea.Cmd that fetches PRs with caching.
+func ListPullRequests(c *github.CachedClient, owner, repo string) tea.Cmd {
+	data, found, refetch := c.ListPullRequests(owner, repo)
+	return uictx.CachedCmd(data, found, refetch, func(prs []github.PullRequest) tea.Msg {
+		return PRsLoadedMsg{PRs: prs}
+	})
+}
+
 type prItem struct {
 	pr github.PullRequest
 }
@@ -154,7 +167,7 @@ func New(ctx *uictx.Context) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.list.StartSpinner(), m.ctx.Client.ListPullRequests())
+	return tea.Batch(m.list.StartSpinner(), ListPullRequests(m.ctx.Client, m.ctx.Owner, m.ctx.Repo))
 }
 
 func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
@@ -164,7 +177,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		m.height = msg.Height
 		m.list.SetSize(msg.Width, msg.Height-1)
 
-	case github.PRsLoadedMsg:
+	case PRsLoadedMsg:
 		items := make([]list.Item, len(msg.PRs))
 		for i, pr := range msg.PRs {
 			items[i] = prItem{pr: pr}
@@ -173,7 +186,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		m.list.StopSpinner()
 		return m, cmd
 
-	case github.QueryErrMsg:
+	case uictx.QueryErrMsg:
 		m.err = msg.Err
 		m.list.StopSpinner()
 
@@ -189,6 +202,14 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	var cmd tea.Cmd
 	m.list, cmd = m.list.Update(msg)
 	return m, cmd
+}
+
+func (m Model) KeyBindings() []uictx.KeyBinding {
+	return []uictx.KeyBinding{
+		{Key: "j / k", Description: "Move cursor down / up", Keywords: []string{"navigate"}},
+		{Key: "enter", Description: "Open selected PR"},
+		{Key: "/", Description: "Filter PRs", Keywords: []string{"search"}},
+	}
 }
 
 func (m Model) HandleKey(msg tea.KeyPressMsg) (uictx.View, tea.Cmd, bool) {

@@ -21,6 +21,9 @@ var commands = []string{
 	"quit",
 	"refresh",
 	"back",
+	"inbox",
+	"local",
+	"pr",
 }
 
 type Model struct {
