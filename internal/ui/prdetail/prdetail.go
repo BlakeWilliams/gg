@@ -651,10 +651,10 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 	}
 
 	switch msg.String() {
-	case "f":
-		// Toggle tree focus.
-		m.dv.Tree.Focused = !m.dv.Tree.Focused
-		return m, nil, true
+	case "f", "h", "left", "l", "right":
+		if m.dv.HandleNavKey(msg.String()) == diffviewer.KeyHandled {
+			return m, nil, true
+		}
 	case "c":
 		m.toggleSidebar(sidebarComments)
 		return m, nil, true
@@ -663,14 +663,6 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		return m, nil, true
 	case "s":
 		m.toggleSidebar(sidebarChecks)
-		return m, nil, true
-	case "h", "left":
-		// Focus tree pane.
-		m.dv.Tree.Focused = true
-		return m, nil, true
-	case "l", "right":
-		// Focus right pane.
-		m.dv.Tree.Focused = false
 		return m, nil, true
 	case "ctrl+k":
 		m.dv.Tree.MoveSelection(-1)

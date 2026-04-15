@@ -994,11 +994,20 @@ const (
 	KeyHandled
 )
 
-// HandleNavKey handles common navigation keys (j/k/J/K/ctrl+d/u/f/b/G/gg).
+// HandleNavKey handles common navigation keys (j/k/J/K/ctrl+d/u/f/b/G/gg/f/h/l).
 // Returns KeyHandled if the key was processed, KeyNotHandled otherwise.
 // Caller should check blocked (e.g. sidebar open) before calling.
 func (d *DiffViewer) HandleNavKey(key string) KeyResult {
 	switch key {
+	case "f":
+		d.Tree.Focused = !d.Tree.Focused
+		return KeyHandled
+	case "h", "left":
+		d.Tree.Focused = true
+		return KeyHandled
+	case "l", "right":
+		d.Tree.Focused = false
+		return KeyHandled
 	case "j", "down":
 		if d.Tree.Focused {
 			d.Tree.MoveCursorBy(1)

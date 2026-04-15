@@ -715,9 +715,10 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 	}
 
 	switch msg.String() {
-	case "f":
-		m.dv.Tree.Focused = !m.dv.Tree.Focused
-		return m, nil, true
+	case "f", "h", "left", "l", "right":
+		if m.dv.HandleNavKey(msg.String()) == diffviewer.KeyHandled {
+			return m, nil, true
+		}
 	case "m":
 		// Cycle diff mode: Working → Staged → Branch (skip Branch on default branch).
 		m.saveViewState()
@@ -741,12 +742,6 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		m.savedLineNo = vs.LineNo
 		m.savedSide = vs.Side
 		return m, m.loadDiff(), true
-	case "h", "left":
-		m.dv.Tree.Focused = true
-		return m, nil, true
-	case "l", "right":
-		m.dv.Tree.Focused = false
-		return m, nil, true
 	case "ctrl+k":
 		m.dv.Tree.MoveSelection(-1)
 		cmd := m.selectTreeEntry()
