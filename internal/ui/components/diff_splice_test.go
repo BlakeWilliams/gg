@@ -339,3 +339,146 @@ func TestSplice_MultipleReplies(t *testing.T) {
 		t.Error("spliced content should still contain 'original question'")
 	}
 }
+
+// TestRemoveThread_Single tests removing a single thread.
+func TestRemoveThread_Single(t *testing.T) {
+	patch := makeTestPatch(10)
+	comments := []github.ReviewComment{comment(1, 5, "comment to remove")}
+	result := renderWithComments(patch, comments, 80)
+
+	if len(result.ThreadRanges) != 1 {
+		t.Fatalf("expected 1 thread range, got %d", len(result.ThreadRanges))
+	}
+	if !strings.Contains(result.Content, "comment to remove") {
+		t.Error("content should contain comment before removal")
+	}
+
+	RemoveThread(&result, 0)
+
+	if strings.Contains(result.Content, "comment to remove") {
+		t.Error("content should not contain comment after removal")
+	}
+	if len(result.ThreadRanges) != 0 {
+		t.Errorf("expected 0 thread ranges after removal, got %d", len(result.ThreadRanges))
+	}
+}
+
+// TestRemoveThread_Middle tests removing the middle thread of three.
+func TestRemoveThread_Middle(t *testing.T) {
+	patch := makeTestPatch(20)
+	comments := []github.ReviewComment{
+		comment(1, 3, "first thread"),
+		comment(2, 10, "middle thread"),
+		comment(3, 18, "third thread"),
+	}
+	result := renderWithComments(patch, comments, 80)
+
+	if len(result.ThreadRanges) != 3 {
+		t.Fatalf("expected 3 ranges, got %d", len(result.ThreadRanges))
+	}
+
+	// Save first and third thread content.
+	firstBefore := result.Content[result.ThreadRanges[0].ByteStart:result.ThreadRanges[0].ByteEnd]
+	thirdBefore := result.Content[result.ThreadRanges[2].ByteStart:result.ThreadRanges[2].ByteEnd]
+
+	// Remove middle thread.
+	RemoveThread(&result, 1)
+
+	if len(result.ThreadRanges) != 2 {
+		t.Errorf("expected 2 ranges after removal, got %d", len(result.ThreadRanges))
+	}
+	if strings.Contains(result.Content, "middle thread") {
+		t.Error("content should not contain middle thread after removal")
+	}
+
+	// First thread should be unchanged.
+	firstAfter := result.Content[result.ThreadRanges[0].ByteStart:result.ThreadRanges[0].ByteEnd]
+	if firstAfter != firstBefore {
+		t.Error("first thread should be unchanged after removing middle")
+	}
+
+	// Third thread (now at index 1) content should be the same.
+	thirdAfter := result.Content[result.ThreadRanges[1].ByteStart:result.ThreadRanges[1].ByteEnd]
+	if thirdAfter != thirdBefore {
+		t.Error("third thread content should be unchanged after removing middle")
+	}
+}
+
+// TestRemoveThread_DiffLineOffsets verifies offsets are correct after removal.
+func TestRemoveThread_DiffLineOffsets(t *testing.T) {
+	patch := makeTestPatch(10)
+	comments := []github.ReviewComment{comment(1, 3, "a comment\nwith multiple\nlines")}
+	result := renderWithComments(patch, comments, 80)
+
+	offsetsBefore := make([]int, len(result.DiffLineOffsets))
+	copy(offsetsBefore, result.DiffLineOffsets)
+	threadLineCount := result.ThreadRanges[0].LineCount
+
+	RemoveThread(&result, 0)
+
+	// Lines after the thread should shift up by threadLineCount.
+	for i := 4; i < len(result.DiffLineOffsets); i++ {
+		expected := offsetsBefore[i] - threadLineCount
+		if result.DiffLineOffsets[i] != expected {
+			t.Errorf("offset[%d]: got %d, want %d", i, result.DiffLineOffsets[i], expected)
+		}
+	}
+}
+
+// TestInsertThread_Single tests inserting a thread into content with no threads.
+func TestInsertThread_Single(t *testing.T) {
+	patch := makeTestPatch(10)
+	result := renderWithComments(patch, nil, 80)
+
+	if len(result.ThreadRanges) != 0 {
+		t.Fatalf("expected 0 thread ranges, got %d", len(result.ThreadRanges))
+	}
+
+	// Render thread content.
+	hl := HighlightDiffFile(github.PullRequestFile{Filename: "test.go", Status: "added", Patch: patch}, "", "", nil)
+	gutterW := TotalGutterWidth(GutterColWidth(hl.DiffLines))
+	comments := []github.ReviewComment{comment(1, 5, "new comment")}
+	content := RenderSingleThread(comments, 80, LineAdd, spliceTestColors(), false, 0, nil, gutterW)
+
+	idx := InsertThread(&result, 5, "RIGHT", 5, content)
+	if idx < 0 {
+		t.Fatal("InsertThread returned -1")
+	}
+
+	if len(result.ThreadRanges) != 1 {
+		t.Fatalf("expected 1 thread range, got %d", len(result.ThreadRanges))
+	}
+	if !strings.Contains(result.Content, "new comment") {
+		t.Error("content should contain inserted comment")
+	}
+}
+
+// TestInsertThread_MatchesFullRender verifies insert produces same result as full render.
+func TestInsertThread_MatchesFullRender(t *testing.T) {
+	patch := makeTestPatch(10)
+	comments := []github.ReviewComment{comment(1, 5, "test comment")}
+
+	// Full render with comment.
+	fullResult := renderWithComments(patch, comments, 80)
+
+	// Insert into empty.
+	emptyResult := renderWithComments(patch, nil, 80)
+	hl := HighlightDiffFile(github.PullRequestFile{Filename: "test.go", Status: "added", Patch: patch}, "", "", nil)
+	gutterW := TotalGutterWidth(GutterColWidth(hl.DiffLines))
+	content := RenderSingleThread(comments, 80, LineAdd, spliceTestColors(), false, 0, nil, gutterW)
+	InsertThread(&emptyResult, 5, "RIGHT", 5, content)
+
+	// Compare line by line.
+	fullLines := strings.Split(fullResult.Content, "\n")
+	insertLines := strings.Split(emptyResult.Content, "\n")
+
+	if len(fullLines) != len(insertLines) {
+		t.Errorf("line count differs: full=%d insert=%d", len(fullLines), len(insertLines))
+	}
+
+	for i := 0; i < len(fullLines) && i < len(insertLines); i++ {
+		if fullLines[i] != insertLines[i] {
+			t.Errorf("line %d differs:\n  full:   %q\n  insert: %q", i, fullLines[i], insertLines[i])
+		}
+	}
+}

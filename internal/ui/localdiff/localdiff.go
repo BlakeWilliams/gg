@@ -755,40 +755,8 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		m.dv.Tree.MoveSelection(1)
 		cmd := m.selectTreeEntry()
 		return m, cmd, true
-	case "j", "down":
-		if m.dv.Tree.Focused {
-			m.dv.Tree.MoveCursorBy(1)
-			return m, nil, true
-		}
-		if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			m.dv.SelectionAnchor = -1
-			m.dv.MoveDiffCursor(1)
-			return m, nil, true
-		}
-	case "k", "up":
-		if m.dv.Tree.Focused {
-			m.dv.Tree.MoveCursorBy(-1)
-			return m, nil, true
-		}
-		if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			m.dv.SelectionAnchor = -1
-			m.dv.MoveDiffCursor(-1)
-			return m, nil, true
-		}
-	case "J", "shift+down":
-		if !m.dv.Tree.Focused && m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			if m.dv.SelectionAnchor < 0 {
-				m.dv.SelectionAnchor = m.dv.DiffCursor
-			}
-			m.dv.MoveDiffCursor(1)
-			return m, nil, true
-		}
-	case "K", "shift+up":
-		if !m.dv.Tree.Focused && m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			if m.dv.SelectionAnchor < 0 {
-				m.dv.SelectionAnchor = m.dv.DiffCursor
-			}
-			m.dv.MoveDiffCursor(-1)
+	case "j", "down", "k", "up", "J", "shift+down", "K", "shift+up":
+		if m.dv.HandleNavKey(msg.String()) == diffviewer.KeyHandled {
 			return m, nil, true
 		}
 	case "enter":
@@ -888,46 +856,10 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 				return m.stageHunk(true)
 			}
 		}
-	case "ctrl+d":
-		m.dv.SelectionAnchor = -1
-		if m.dv.Tree.Focused {
-			m.dv.Tree.MoveCursorBy(m.dv.Height / 2)
-		} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			m.dv.ScrollAndSyncCursor(m.dv.Height / 2)
-		} else {
-			m.dv.VP.SetYOffset(m.dv.VP.YOffset() + m.dv.Height/2)
+	case "ctrl+d", "ctrl+u", "ctrl+f", "ctrl+b":
+		if m.dv.HandleNavKey(msg.String()) == diffviewer.KeyHandled {
+			return m, nil, true
 		}
-		return m, nil, true
-	case "ctrl+u":
-		m.dv.SelectionAnchor = -1
-		if m.dv.Tree.Focused {
-			m.dv.Tree.MoveCursorBy(-m.dv.Height / 2)
-		} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			m.dv.ScrollAndSyncCursor(-m.dv.Height / 2)
-		} else {
-			m.dv.VP.SetYOffset(m.dv.VP.YOffset() - m.dv.Height/2)
-		}
-		return m, nil, true
-	case "ctrl+f":
-		m.dv.SelectionAnchor = -1
-		if m.dv.Tree.Focused {
-			m.dv.Tree.MoveCursorBy(m.dv.Height)
-		} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			m.dv.ScrollAndSyncCursor(m.dv.Height)
-		} else {
-			m.dv.VP.SetYOffset(m.dv.VP.YOffset() + m.dv.Height)
-		}
-		return m, nil, true
-	case "ctrl+b":
-		m.dv.SelectionAnchor = -1
-		if m.dv.Tree.Focused {
-			m.dv.Tree.MoveCursorBy(-m.dv.Height)
-		} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			m.dv.ScrollAndSyncCursor(-m.dv.Height)
-		} else {
-			m.dv.VP.SetYOffset(m.dv.VP.YOffset() - m.dv.Height)
-		}
-		return m, nil, true
 	case "G":
 		m.dv.WaitingG = false
 		if m.dv.Tree.Focused {
@@ -1925,9 +1857,18 @@ func (m *Model) toggleResolveAtCursor() bool {
 	for _, c := range m.commentStore.Comments {
 		if c.ID == rootID {
 			m.commentStore.Resolve(rootID, !c.Resolved)
+			// Use splice-based removal for resolved threads (O(content) vs O(n) full re-render).
+			if !c.Resolved {
+				// Thread is being resolved — remove it from rendered content.
+				if m.dv.RemoveThread(m.dv.CurrentFileIdx, side, line) {
+					m.rebuildContentIfChanged()
+					return true
+				}
+			}
 			break
 		}
 	}
+	// Fallback to full re-render (e.g., unresolving brings thread back).
 	m.formatFile(m.dv.CurrentFileIdx)
 	m.rebuildContent()
 	return true

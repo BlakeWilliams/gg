@@ -680,49 +680,11 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		m.dv.Tree.MoveSelection(1)
 		cmd := m.selectTreeEntry()
 		return m, cmd, true
-	case "j", "down":
+	case "j", "down", "k", "up", "J", "shift+down", "K", "shift+up":
 		if m.showSidebar {
 			return m, nil, false // let viewport scroll
 		}
-		if m.dv.Tree.Focused {
-			m.dv.Tree.MoveCursorBy(1)
-			return m, nil, true
-		}
-		// Diff line cursor — clear selection on normal move.
-		if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			m.dv.SelectionAnchor = -1
-			m.dv.MoveDiffCursor(1)
-			return m, nil, true
-		}
-	case "k", "up":
-		if m.showSidebar {
-			return m, nil, false
-		}
-		if m.dv.Tree.Focused {
-			m.dv.Tree.MoveCursorBy(-1)
-			return m, nil, true
-		}
-		if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			m.dv.SelectionAnchor = -1
-			m.dv.MoveDiffCursor(-1)
-			return m, nil, true
-		}
-	case "J", "shift+down":
-		// Extend selection downward.
-		if !m.showSidebar && !m.dv.Tree.Focused && m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			if m.dv.SelectionAnchor < 0 {
-				m.dv.SelectionAnchor = m.dv.DiffCursor
-			}
-			m.dv.MoveDiffCursor(1)
-			return m, nil, true
-		}
-	case "K", "shift+up":
-		// Extend selection upward.
-		if !m.showSidebar && !m.dv.Tree.Focused && m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			if m.dv.SelectionAnchor < 0 {
-				m.dv.SelectionAnchor = m.dv.DiffCursor
-			}
-			m.dv.MoveDiffCursor(-1)
+		if m.dv.HandleNavKey(msg.String()) == diffviewer.KeyHandled {
 			return m, nil, true
 		}
 	case "enter":
@@ -740,46 +702,10 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		if !m.showSidebar && m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
 			return m.openCommentInput()
 		}
-	case "ctrl+d":
-		m.dv.SelectionAnchor = -1
-		if m.dv.Tree.Focused {
-			m.dv.Tree.MoveCursorBy(m.dv.Height / 2)
-		} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			m.dv.MoveDiffCursorBy(m.dv.Height / 2)
-		} else {
-			m.dv.VP.SetYOffset(m.dv.VP.YOffset() + m.dv.Height/2)
+	case "ctrl+d", "ctrl+u", "ctrl+f", "ctrl+b":
+		if m.dv.HandleNavKey(msg.String()) == diffviewer.KeyHandled {
+			return m, nil, true
 		}
-		return m, nil, true
-	case "ctrl+u":
-		m.dv.SelectionAnchor = -1
-		if m.dv.Tree.Focused {
-			m.dv.Tree.MoveCursorBy(-m.dv.Height / 2)
-		} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			m.dv.MoveDiffCursorBy(-m.dv.Height / 2)
-		} else {
-			m.dv.VP.SetYOffset(m.dv.VP.YOffset() - m.dv.Height/2)
-		}
-		return m, nil, true
-	case "ctrl+f":
-		m.dv.SelectionAnchor = -1
-		if m.dv.Tree.Focused {
-			m.dv.Tree.MoveCursorBy(m.dv.Height)
-		} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			m.dv.MoveDiffCursorBy(m.dv.Height)
-		} else {
-			m.dv.VP.SetYOffset(m.dv.VP.YOffset() + m.dv.Height)
-		}
-		return m, nil, true
-	case "ctrl+b":
-		m.dv.SelectionAnchor = -1
-		if m.dv.Tree.Focused {
-			m.dv.Tree.MoveCursorBy(-m.dv.Height)
-		} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			m.dv.MoveDiffCursorBy(-m.dv.Height)
-		} else {
-			m.dv.VP.SetYOffset(m.dv.VP.YOffset() - m.dv.Height)
-		}
-		return m, nil, true
 	case "G":
 		m.dv.WaitingG = false
 		if m.dv.Tree.Focused {

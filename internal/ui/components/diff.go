@@ -344,6 +344,156 @@ func SpliceThread(result *DiffRenderResult, threadIdx int, newContent string) {
 	}
 }
 
+// RemoveThread removes a comment thread entirely from the rendered content.
+// Used when resolving a thread. O(len(Content)) for the string concat.
+func RemoveThread(result *DiffRenderResult, threadIdx int) {
+	if threadIdx < 0 || threadIdx >= len(result.ThreadRanges) {
+		return
+	}
+	tr := result.ThreadRanges[threadIdx]
+
+	// Remove the thread's bytes from content.
+	result.Content = result.Content[:tr.ByteStart] + result.Content[tr.ByteEnd:]
+
+	byteDelta := -(tr.ByteEnd - tr.ByteStart)
+	lineDelta := -tr.LineCount
+
+	// Shift downstream thread ranges and remove this one from the slice.
+	for i := threadIdx + 1; i < len(result.ThreadRanges); i++ {
+		result.ThreadRanges[i].ByteStart += byteDelta
+		result.ThreadRanges[i].ByteEnd += byteDelta
+		result.ThreadRanges[i].LineStart += lineDelta
+	}
+	result.ThreadRanges = append(result.ThreadRanges[:threadIdx], result.ThreadRanges[threadIdx+1:]...)
+
+	// Shift downstream diff line offsets.
+	afterLine := tr.DiffLineIdx + 1
+	for i := afterLine; i < len(result.DiffLineOffsets); i++ {
+		result.DiffLineOffsets[i] += lineDelta
+	}
+
+	// Shift downstream comment positions and remove positions for this thread.
+	newPositions := result.CommentPositions[:0]
+	for _, cp := range result.CommentPositions {
+		if cp.Line == tr.Line && cp.Side == tr.Side {
+			continue // remove positions belonging to this thread
+		}
+		if cp.Offset > tr.LineStart {
+			cp.Offset += lineDelta
+		}
+		newPositions = append(newPositions, cp)
+	}
+	result.CommentPositions = newPositions
+}
+
+// InsertThread inserts a new comment thread into the rendered content.
+// diffLineIdx is the diff line index after which to insert (the line the comment is on).
+// Returns the index of the new thread in ThreadRanges, or -1 on error.
+func InsertThread(result *DiffRenderResult, diffLineIdx int, side string, line int, content string) int {
+	if diffLineIdx < 0 || diffLineIdx >= len(result.DiffLineOffsets) {
+		return -1
+	}
+
+	// Find insertion point: after the diff line, after any existing threads on that line.
+	// The insertion byte position is either:
+	// - End of an existing thread on this diff line, or
+	// - Start of next diff line (if no threads), or
+	// - End of content (if last diff line)
+
+	var insertBytePos int
+	var insertLinePos int
+	insertThreadIdx := len(result.ThreadRanges) // default: append
+
+	// Check if there's an existing thread on this diff line.
+	for i, tr := range result.ThreadRanges {
+		if tr.DiffLineIdx == diffLineIdx {
+			// Insert after this thread.
+			insertBytePos = tr.ByteEnd
+			insertLinePos = tr.LineStart + tr.LineCount
+			insertThreadIdx = i + 1
+		} else if tr.DiffLineIdx > diffLineIdx {
+			// First thread after our line - insert before it.
+			if insertBytePos == 0 {
+				insertBytePos = tr.ByteStart
+				insertLinePos = tr.LineStart
+				insertThreadIdx = i
+			}
+			break
+		}
+	}
+
+	// If no thread found after, calculate position from diff line offsets.
+	if insertBytePos == 0 {
+		if diffLineIdx+1 < len(result.DiffLineOffsets) {
+			// Position is start of next diff line (in bytes, find it by line offset).
+			insertLinePos = result.DiffLineOffsets[diffLineIdx+1]
+		} else {
+			// Last diff line - append to end.
+			insertLinePos = strings.Count(result.Content, "\n") + 1
+		}
+		// Convert line position to byte position.
+		lineCount := 0
+		for i, c := range result.Content {
+			if c == '\n' {
+				lineCount++
+				if lineCount == insertLinePos {
+					insertBytePos = i + 1
+					break
+				}
+			}
+		}
+		if insertBytePos == 0 && lineCount < insertLinePos {
+			insertBytePos = len(result.Content)
+			if len(result.Content) > 0 && result.Content[len(result.Content)-1] != '\n' {
+				content = "\n" + content
+			}
+		}
+	}
+
+	// Insert content.
+	result.Content = result.Content[:insertBytePos] + content + result.Content[insertBytePos:]
+
+	byteDelta := len(content)
+	lineCount := strings.Count(content, "\n")
+
+	// Create new thread range.
+	newRange := ThreadRange{
+		DiffLineIdx: diffLineIdx,
+		Side:        side,
+		Line:        line,
+		ByteStart:   insertBytePos,
+		ByteEnd:     insertBytePos + byteDelta,
+		LineStart:   insertLinePos,
+		LineCount:   lineCount,
+	}
+
+	// Shift downstream thread ranges.
+	for i := insertThreadIdx; i < len(result.ThreadRanges); i++ {
+		result.ThreadRanges[i].ByteStart += byteDelta
+		result.ThreadRanges[i].ByteEnd += byteDelta
+		result.ThreadRanges[i].LineStart += lineCount
+	}
+
+	// Insert new range.
+	result.ThreadRanges = append(result.ThreadRanges, ThreadRange{})
+	copy(result.ThreadRanges[insertThreadIdx+1:], result.ThreadRanges[insertThreadIdx:])
+	result.ThreadRanges[insertThreadIdx] = newRange
+
+	// Shift downstream diff line offsets.
+	for i := diffLineIdx + 1; i < len(result.DiffLineOffsets); i++ {
+		result.DiffLineOffsets[i] += lineCount
+	}
+
+	// Shift downstream comment positions.
+	for i := range result.CommentPositions {
+		if result.CommentPositions[i].Offset >= insertLinePos {
+			result.CommentPositions[i].Offset += lineCount
+		}
+	}
+
+	return insertThreadIdx
+}
+
 // CommentsForThread returns the comments that form the thread at the given side+line.
 func CommentsForThread(allComments []github.ReviewComment, side string, line int) []github.ReviewComment {
 	threads := buildCommentThreads(allComments)

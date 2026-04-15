@@ -87,7 +87,7 @@ type DiffViewer struct {
 	SpinnerActive bool
 
 	// Internal
-	WaitingG    bool
+	WaitingG    bool // true after first "g" keypress, waiting for second "g" to trigger gg (go to top)
 	LastContent string
 }
 
@@ -710,6 +710,65 @@ func (d *DiffViewer) SpliceThreadForComment(fileIdx int, side string, line int) 
 	}
 }
 
+// RemoveThread removes a comment thread from the cached render.
+// Used when resolving a thread. Returns true if the thread was found and removed.
+func (d *DiffViewer) RemoveThread(fileIdx int, side string, line int) bool {
+	if fileIdx < 0 || fileIdx >= len(d.FileRenderCache) || d.FileRenderCache[fileIdx] == nil {
+		return false
+	}
+	rc := d.FileRenderCache[fileIdx]
+	if len(rc.ThreadRanges) == 0 {
+		return false
+	}
+
+	threadIdx := -1
+	for i, tr := range rc.ThreadRanges {
+		if tr.Side == side && tr.Line == line {
+			threadIdx = i
+			break
+		}
+	}
+	if threadIdx < 0 {
+		return false
+	}
+
+	components.RemoveThread(rc, threadIdx)
+
+	d.RenderedFiles[fileIdx] = rc.Content
+	if fileIdx < len(d.FileDiffOffsets) {
+		d.FileDiffOffsets[fileIdx] = rc.DiffLineOffsets
+	}
+	return true
+}
+
+// InsertThread inserts a new comment thread into the cached render.
+// Returns true if the thread was successfully inserted.
+func (d *DiffViewer) InsertThread(fileIdx int, diffLineIdx int, side string, line int, comments []github.ReviewComment) bool {
+	if fileIdx < 0 || fileIdx >= len(d.FileRenderCache) || d.FileRenderCache[fileIdx] == nil {
+		return false
+	}
+	rc := d.FileRenderCache[fileIdx]
+
+	lt := components.LineAdd
+	if diffLineIdx < len(d.FileDiffs[fileIdx]) {
+		lt = d.FileDiffs[fileIdx][diffLineIdx].Type
+	}
+
+	gutterW := components.TotalGutterWidth(components.GutterColWidth(d.FileDiffs[fileIdx]))
+	content := components.RenderSingleThread(comments, d.ContentWidth(), lt, d.Ctx.DiffColors, false, 0, d.RenderBody, gutterW)
+
+	idx := components.InsertThread(rc, diffLineIdx, side, line, content)
+	if idx < 0 {
+		return false
+	}
+
+	d.RenderedFiles[fileIdx] = rc.Content
+	if fileIdx < len(d.FileDiffOffsets) {
+		d.FileDiffOffsets[fileIdx] = rc.DiffLineOffsets
+	}
+	return true
+}
+
 // AppendCopilotPending appends all pending Copilot "Thinking..." comments
 // for the given file to the comment slice.
 func (d DiffViewer) AppendCopilotPending(filename string, fileComments []github.ReviewComment) []github.ReviewComment {
@@ -908,4 +967,97 @@ func SplitDiffBorders(line string) (prefix, inner, suffix string) {
 	}
 
 	return line[:prefixEnd], line[prefixEnd:suffixStart], line[suffixStart:]
+}
+
+// KeyResult is returned by HandleNavKey to indicate what happened.
+type KeyResult int
+
+const (
+	KeyNotHandled KeyResult = iota
+	KeyHandled
+)
+
+// HandleNavKey handles common navigation keys (j/k/J/K/ctrl+d/u/f/b/G/gg).
+// Returns KeyHandled if the key was processed, KeyNotHandled otherwise.
+// Caller should check blocked (e.g. sidebar open) before calling.
+func (d *DiffViewer) HandleNavKey(key string) KeyResult {
+	switch key {
+	case "j", "down":
+		if d.Tree.Focused {
+			d.Tree.MoveCursorBy(1)
+			return KeyHandled
+		}
+		if d.CurrentFileIdx >= 0 && d.HasDiffLines() {
+			d.SelectionAnchor = -1
+			d.MoveDiffCursor(1)
+			return KeyHandled
+		}
+	case "k", "up":
+		if d.Tree.Focused {
+			d.Tree.MoveCursorBy(-1)
+			return KeyHandled
+		}
+		if d.CurrentFileIdx >= 0 && d.HasDiffLines() {
+			d.SelectionAnchor = -1
+			d.MoveDiffCursor(-1)
+			return KeyHandled
+		}
+	case "J", "shift+down":
+		if !d.Tree.Focused && d.CurrentFileIdx >= 0 && d.HasDiffLines() {
+			if d.SelectionAnchor < 0 {
+				d.SelectionAnchor = d.DiffCursor
+			}
+			d.MoveDiffCursor(1)
+			return KeyHandled
+		}
+	case "K", "shift+up":
+		if !d.Tree.Focused && d.CurrentFileIdx >= 0 && d.HasDiffLines() {
+			if d.SelectionAnchor < 0 {
+				d.SelectionAnchor = d.DiffCursor
+			}
+			d.MoveDiffCursor(-1)
+			return KeyHandled
+		}
+	case "ctrl+d":
+		d.SelectionAnchor = -1
+		if d.Tree.Focused {
+			d.Tree.MoveCursorBy(d.Height / 2)
+		} else if d.CurrentFileIdx >= 0 && d.HasDiffLines() {
+			d.ScrollAndSyncCursor(d.Height / 2)
+		} else {
+			d.VP.SetYOffset(d.VP.YOffset() + d.Height/2)
+		}
+		return KeyHandled
+	case "ctrl+u":
+		d.SelectionAnchor = -1
+		if d.Tree.Focused {
+			d.Tree.MoveCursorBy(-d.Height / 2)
+		} else if d.CurrentFileIdx >= 0 && d.HasDiffLines() {
+			d.ScrollAndSyncCursor(-d.Height / 2)
+		} else {
+			d.VP.SetYOffset(d.VP.YOffset() - d.Height/2)
+		}
+		return KeyHandled
+	case "ctrl+f":
+		d.SelectionAnchor = -1
+		if d.Tree.Focused {
+			d.Tree.MoveCursorBy(d.Height)
+		} else if d.CurrentFileIdx >= 0 && d.HasDiffLines() {
+			d.ScrollAndSyncCursor(d.Height)
+		} else {
+			d.VP.SetYOffset(d.VP.YOffset() + d.Height)
+		}
+		return KeyHandled
+	case "ctrl+b":
+		d.SelectionAnchor = -1
+		if d.Tree.Focused {
+			d.Tree.MoveCursorBy(-d.Height)
+		} else if d.CurrentFileIdx >= 0 && d.HasDiffLines() {
+			d.ScrollAndSyncCursor(-d.Height)
+		} else {
+			d.VP.SetYOffset(d.VP.YOffset() - d.Height)
+		}
+		return KeyHandled
+	}
+	return KeyNotHandled
 }
