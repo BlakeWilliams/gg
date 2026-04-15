@@ -16,10 +16,6 @@ var authorBadge = lipgloss.NewStyle().
 	Foreground(lipgloss.Black).
 	Background(lipgloss.Yellow)
 
-func (m Model) borderStyle() lipgloss.Style {
-	return lipgloss.NewStyle().Foreground(m.ctx.DiffColors.BorderColor)
-}
-
 func (m Model) roundedBorderStyle() lipgloss.Style {
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -64,8 +60,8 @@ func (m *Model) rebuildSidebar() {
 		return
 	}
 	const pad = 4
-	modalW := m.width - pad*2
-	modalH := m.height - pad*2
+	modalW := m.dv.Width - pad*2
+	modalH := m.dv.Height - pad*2
 	if modalW < 20 {
 		modalW = 20
 	}
@@ -95,7 +91,7 @@ func (m *Model) rebuildSidebar() {
 		}
 	}
 
-	sep := m.borderStyle().Render(strings.Repeat("─", innerW))
+	sep := m.dv.BorderStyle().Render(strings.Repeat("─", innerW))
 	content := strings.Join(lines, "\n"+sep+"\n")
 
 	m.sidebarVP = viewport.New()

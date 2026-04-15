@@ -2,6 +2,7 @@ package components
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -75,11 +76,24 @@ type CommentPosition struct {
 	Offset int  // rendered line index where this comment's header starts
 }
 
+// ThreadRange tracks the byte range of a comment thread in the rendered content.
+// Used for splice-based partial updates.
+type ThreadRange struct {
+	DiffLineIdx int    // which diff line this thread sits below
+	Side        string // "LEFT" or "RIGHT"
+	Line        int    // source line number
+	ByteStart   int    // byte offset in Content where thread starts
+	ByteEnd     int    // byte offset where thread ends
+	LineStart   int    // rendered line where thread starts
+	LineCount   int    // number of rendered lines in this thread
+}
+
 // DiffRenderResult holds the rendered diff string and metadata about line positions.
 type DiffRenderResult struct {
 	Content          string            // the full rendered string
 	DiffLineOffsets  []int             // rendered line index for each diff line (0-based from start of Content)
 	CommentPositions []CommentPosition // rendered positions of each comment header
+	ThreadRanges     []ThreadRange     // byte ranges for each comment thread (for splice updates)
 }
 
 // HighlightedDiff holds pre-highlighted diff data that is width-independent.
@@ -163,7 +177,13 @@ func FormatDiffFile(hd HighlightedDiff, width int, colors styles.DiffColors, com
 	f := hd.File
 
 	if f.Patch == "" {
-		return DiffRenderResult{Content: styles.SubtitleStyle.Render("(binary or empty)")}
+		msg := "(binary or empty)"
+		if f.Status == "removed" {
+			msg = "(file was deleted)"
+		} else if f.Status == "added" {
+			msg = "(new empty file)"
+		}
+		return DiffRenderResult{Content: styles.SubtitleStyle.Render(msg)}
 	}
 
 	// Make a working copy of diff lines so we don't mutate the cached highlight data.
@@ -185,13 +205,13 @@ func FormatDiffFile(hd HighlightedDiff, width int, colors styles.DiffColors, com
 
 	var b strings.Builder
 	var positions []CommentPosition
+	var threadRanges []ThreadRange
 	renderedLineIdx := 0
 
 	offsets := make([]int, len(diffLines))
 	for i, dl := range diffLines {
 		offsets[i] = renderedLineIdx
 
-		// Wrap the rendered line if it exceeds width.
 		segments := wrapRenderedLine(dl.Rendered, width, dl.Type, colors, gutterW)
 		for _, seg := range segments {
 			b.WriteString(seg)
@@ -212,8 +232,12 @@ func FormatDiffFile(hd HighlightedDiff, width int, colors styles.DiffColors, com
 				if highlighted {
 					hlIdx = opt.HighlightCommentIndex
 				}
+
+				// Track byte range for splice support.
+				threadByteStart := b.Len()
+				threadLineStart := renderedLineIdx
+
 				result := renderCommentThread(threads, width, dl.Type, colors, highlighted, hlIdx, colors.HighlightBorderFg, opt.RenderBody, gutterW)
-				// Record comment positions. Start at 1 to skip the blank line above the thread.
 				lineInThread := 1
 				for ci, cl := range result.commentLines {
 					positions = append(positions, CommentPosition{
@@ -228,10 +252,261 @@ func FormatDiffFile(hd HighlightedDiff, width int, colors styles.DiffColors, com
 					b.WriteString(tl + "\n")
 					renderedLineIdx++
 				}
+
+				threadRanges = append(threadRanges, ThreadRange{
+					DiffLineIdx: i,
+					Side:        ck.Side,
+					Line:        ck.Line,
+					ByteStart:   threadByteStart,
+					ByteEnd:     b.Len(),
+					LineStart:   threadLineStart,
+					LineCount:   renderedLineIdx - threadLineStart,
+				})
 			}
 		}
 	}
-	return DiffRenderResult{Content: strings.TrimRight(b.String(), "\n"), DiffLineOffsets: offsets, CommentPositions: positions}
+	return DiffRenderResult{
+		Content:          strings.TrimRight(b.String(), "\n"),
+		DiffLineOffsets:  offsets,
+		CommentPositions: positions,
+		ThreadRanges:     threadRanges,
+	}
+}
+
+// SpliceThread replaces a comment thread's rendered content in-place.
+// Updates all downstream byte offsets and line offsets. O(len(Content)) for
+// the string concat, but zero rendering of diff lines.
+func SpliceThread(result *DiffRenderResult, threadIdx int, newContent string) {
+	if threadIdx < 0 || threadIdx >= len(result.ThreadRanges) {
+		return
+	}
+	tr := result.ThreadRanges[threadIdx]
+
+	// Replace bytes.
+	result.Content = result.Content[:tr.ByteStart] + newContent + result.Content[tr.ByteEnd:]
+
+	byteDelta := len(newContent) - (tr.ByteEnd - tr.ByteStart)
+	newLineCount := strings.Count(newContent, "\n")
+	lineDelta := newLineCount - tr.LineCount
+
+	// Update this thread's range.
+	result.ThreadRanges[threadIdx].ByteEnd = tr.ByteStart + len(newContent)
+	result.ThreadRanges[threadIdx].LineCount = newLineCount
+
+	// Shift downstream thread ranges.
+	for i := threadIdx + 1; i < len(result.ThreadRanges); i++ {
+		result.ThreadRanges[i].ByteStart += byteDelta
+		result.ThreadRanges[i].ByteEnd += byteDelta
+		result.ThreadRanges[i].LineStart += lineDelta
+	}
+
+	// Shift downstream diff line offsets.
+	afterLine := tr.DiffLineIdx + 1
+	for i := afterLine; i < len(result.DiffLineOffsets); i++ {
+		result.DiffLineOffsets[i] += lineDelta
+	}
+
+	// Shift downstream comment positions.
+	for i := range result.CommentPositions {
+		if result.CommentPositions[i].Offset > tr.LineStart {
+			result.CommentPositions[i].Offset += lineDelta
+		}
+	}
+}
+
+// CommentsForThread returns the comments that form the thread at the given side+line.
+func CommentsForThread(allComments []github.ReviewComment, side string, line int) []github.ReviewComment {
+	threads := buildCommentThreads(allComments)
+	key := commentKey{Side: side, Line: line}
+	return threads[key]
+}
+
+// RenderSingleThread renders a comment thread and returns the raw content string.
+// Used to produce replacement content for SpliceThread.
+func RenderSingleThread(comments []github.ReviewComment, width int, lt LineType, colors styles.DiffColors, highlighted bool, hlIdx int, renderBody func(string, int, string) string, gutterW int) string {
+	result := renderCommentThread(comments, width, lt, colors, highlighted, hlIdx, colors.HighlightBorderFg, renderBody, gutterW)
+	return result.content
+}
+
+type DiffLayout struct {
+	TotalRenderedLines int               // total height when fully rendered
+	DiffLineOffsets    []int             // diff line index → first rendered line
+	RenderedLineCounts []int             // how many rendered lines each diff line produces
+	CommentLineCounts  []int             // rendered lines for comment thread below each diff line (0 if none)
+	CommentPositions   []CommentPosition
+	ColW               int               // gutter column width
+	GutterW            int               // total gutter width
+	CommentsByLine     map[commentKey][]github.ReviewComment // pre-built thread map
+}
+
+// ComputeDiffLayout iterates all diff lines and estimates the rendering layout.
+// O(n) in diff lines but cheap — no rendering, no string building.
+// Comment heights are estimates; RenderLineRange tracks actual positions at render time.
+func ComputeDiffLayout(hd HighlightedDiff, width int, comments []github.ReviewComment, _ ...styles.DiffColors) DiffLayout {
+	if hd.File.Patch == "" {
+		return DiffLayout{}
+	}
+
+	diffLines := hd.DiffLines
+	colW := GutterColWidth(diffLines)
+	gutterW := TotalGutterWidth(colW)
+	commentsByLine := buildCommentThreads(comments)
+
+	layout := DiffLayout{
+		DiffLineOffsets:    make([]int, len(diffLines)),
+		RenderedLineCounts: make([]int, len(diffLines)),
+		CommentLineCounts:  make([]int, len(diffLines)),
+		ColW:               colW,
+		GutterW:            gutterW,
+		CommentsByLine:     commentsByLine,
+	}
+
+	renderedLine := 0
+	for i, dl := range diffLines {
+		layout.DiffLineOffsets[i] = renderedLine
+
+		layout.RenderedLineCounts[i] = 1
+		renderedLine++
+
+		var ck commentKey
+		if dl.Type == LineDel {
+			ck = commentKey{Side: "LEFT", Line: dl.OldLineNo}
+		} else {
+			ck = commentKey{Side: "RIGHT", Line: dl.NewLineNo}
+		}
+		if ck.Line > 0 {
+			if threads, ok := commentsByLine[ck]; ok {
+				// Estimate: blank + per-comment(header + body lines) + border + blank.
+				threadLines := 1
+				for ci, c := range threads {
+					bodyLines := strings.Count(c.Body, "\n") + 1
+					layout.CommentPositions = append(layout.CommentPositions, CommentPosition{
+						Line:   ck.Line,
+						Side:   ck.Side,
+						Idx:    ci,
+						Offset: renderedLine + threadLines,
+					})
+					threadLines += 1 + bodyLines
+				}
+				threadLines += 2
+				layout.CommentLineCounts[i] = threadLines
+				renderedLine += threadLines
+			}
+		}
+	}
+
+	layout.TotalRenderedLines = renderedLine
+	return layout
+}
+
+// RenderLineRange renders only the diff lines that produce rendered output in [startLine, endLine).
+// Returns the rendered lines and the rendered-line offset of the first returned line.
+func RenderLineRange(hd HighlightedDiff, layout DiffLayout, startLine, endLine int, width int, colors styles.DiffColors, comments []github.ReviewComment, opts ...DiffFormatOptions) (lines []string, firstOffset int) {
+	if hd.File.Patch == "" || len(hd.DiffLines) == 0 {
+		return nil, 0
+	}
+
+	if startLine < 0 {
+		startLine = 0
+	}
+	if endLine > layout.TotalRenderedLines {
+		endLine = layout.TotalRenderedLines
+	}
+
+	var opt DiffFormatOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+
+	// Build fresh comment threads from the provided comments (may differ from
+	// layout's cached threads due to streaming copilot replies).
+	freshComments := buildCommentThreads(comments)
+
+	// Binary search for the first diff line that could be visible.
+	approxStart := sort.Search(len(hd.DiffLines), func(i int) bool {
+		return layout.DiffLineOffsets[i]+layout.RenderedLineCounts[i]+layout.CommentLineCounts[i] > startLine
+	})
+	if approxStart >= len(hd.DiffLines) {
+		return nil, startLine
+	}
+
+	// Estimate how many diff lines we need (generous: endLine - startLine + extra for comments).
+	approxEnd := approxStart
+	for approxEnd < len(hd.DiffLines) && layout.DiffLineOffsets[approxEnd] < endLine {
+		approxEnd++
+	}
+	if approxEnd < len(hd.DiffLines) {
+		approxEnd++ // one extra past endLine
+	}
+
+	// Copy and format only the needed range.
+	rangeLen := approxEnd - approxStart
+	diffLines := make([]DiffLine, rangeLen)
+	copy(diffLines, hd.DiffLines[approxStart:approxEnd])
+	formatDiffLinesRangeFromHL(diffLines, approxStart, hd.DiffLines, hd.HlLines, hd.Filename, width, colors, layout.ColW)
+
+	// Render sequentially from approxStart, tracking actual position.
+	renderedLine := layout.DiffLineOffsets[approxStart]
+	firstOffset = -1
+
+	for j := 0; j < rangeLen; j++ {
+		dl := diffLines[j]
+
+		segments := wrapRenderedLine(dl.Rendered, width, dl.Type, colors, layout.GutterW)
+
+		var commentContent string
+		{
+			var ck commentKey
+			if dl.Type == LineDel {
+				ck = commentKey{Side: "LEFT", Line: dl.OldLineNo}
+			} else {
+				ck = commentKey{Side: "RIGHT", Line: dl.NewLineNo}
+			}
+			if threads, ok := freshComments[ck]; ok && ck.Line > 0 {
+				highlighted := ck.Line == opt.HighlightThreadLine && ck.Side == opt.HighlightThreadSide
+				hlIdx := 0
+				if highlighted {
+					hlIdx = opt.HighlightCommentIndex
+				}
+				result := renderCommentThread(threads, width, dl.Type, colors, highlighted, hlIdx, colors.HighlightBorderFg, opt.RenderBody, layout.GutterW)
+				commentContent = result.content
+			}
+		}
+
+		commentLines := 0
+		if commentContent != "" {
+			commentLines = len(strings.Split(strings.TrimRight(commentContent, "\n"), "\n"))
+		}
+		lineEnd := renderedLine + len(segments) + commentLines
+
+		if lineEnd <= startLine {
+			renderedLine = lineEnd
+			continue
+		}
+		if renderedLine >= endLine {
+			break
+		}
+
+		if firstOffset < 0 {
+			firstOffset = renderedLine
+		}
+
+		for _, seg := range segments {
+			lines = append(lines, seg)
+		}
+		if commentContent != "" {
+			for _, tl := range strings.Split(strings.TrimRight(commentContent, "\n"), "\n") {
+				lines = append(lines, tl)
+			}
+		}
+
+		renderedLine = lineEnd
+	}
+
+	if firstOffset < 0 {
+		firstOffset = startLine
+	}
+	return lines, firstOffset
 }
 
 // RenderDiffFile is a convenience that highlights and formats in one call.
@@ -297,6 +572,103 @@ func expandTabs(s string) string {
 		return s
 	}
 	return strings.ReplaceAll(s, "\t", strings.Repeat(" ", tabWidth))
+}
+
+// formatDiffLinesRangeFromHL formats a subset of diff lines starting at globalStart.
+// It uses allDiffLines to compute the hlIdx offset for sequential highlight mode.
+func formatDiffLinesRangeFromHL(diffLines []DiffLine, globalStart int, allDiffLines []DiffLine, hlLines []string, filename string, width int, colors styles.DiffColors, colW int) {
+	useLineIndex := detectUseLineIndex(allDiffLines, hlLines)
+
+	// Compute hlIdx offset: count non-hunk lines before globalStart in sequential mode.
+	hlIdx := 0
+	if !useLineIndex {
+		for i := 0; i < globalStart && i < len(allDiffLines); i++ {
+			if allDiffLines[i].Type != LineHunk {
+				hlIdx++
+			} else {
+				hlIdx++ // hunks also consume a slot in sequential mode
+			}
+		}
+	}
+
+	for i := range diffLines {
+		dl := &diffLines[i]
+		switch dl.Type {
+		case LineHunk:
+			dl.Rendered = renderHunkLine(dl.Content, width, colors)
+			if !useLineIndex {
+				hlIdx++
+			}
+		case LineAdd:
+			var hl string
+			if useLineIndex {
+				hl = getHighlightedLine(hlLines, dl.NewLineNo)
+			} else if hlIdx < len(hlLines) {
+				hl = hlLines[hlIdx]
+				hlIdx++
+			}
+			hl = expandTabs(hl)
+			hl = injectBackground(hl, colors.AddBg)
+			gutter := colors.AddBg + colors.AddFg +
+				padNum(colW) + " " + padNum(colW, dl.NewLineNo) +
+				" " + "\033[1m" + "+" + "\033[0m" + colors.AddBg
+			dl.Rendered = padWithBg(truncateLine(gutter+hl, width), width, colors.AddBg)
+		case LineDel:
+			var hl string
+			if useLineIndex {
+				hl = highlightSnippet(dl.Content, filename, colors.ChromaStyle)
+			} else if hlIdx < len(hlLines) {
+				hl = hlLines[hlIdx]
+				hlIdx++
+			}
+			hl = expandTabs(hl)
+			hl = injectBackground(hl, colors.DelBg)
+			gutter := colors.DelBg + colors.DelFg +
+				padNum(colW, dl.OldLineNo) + " " + padNum(colW) +
+				" " + "\033[1m" + "-" + "\033[0m" + colors.DelBg
+			dl.Rendered = padWithBg(truncateLine(gutter+hl, width), width, colors.DelBg)
+		case LineContext:
+			var hl string
+			if useLineIndex {
+				hl = getHighlightedLine(hlLines, dl.NewLineNo)
+			} else if hlIdx < len(hlLines) {
+				hl = hlLines[hlIdx]
+				hlIdx++
+			}
+			hl = expandTabs(hl)
+			gutter := styles.DiffLineNum.Render(
+				padNum(colW, dl.OldLineNo) + " " + padNum(colW, dl.NewLineNo) + " ",
+			)
+			dl.Rendered = padToWidth(truncateLine(gutter+" "+hl, width), width)
+		}
+	}
+}
+
+// detectUseLineIndex checks if hlLines are indexed by line number (full file)
+// or sequential (fallback diff-based).
+func detectUseLineIndex(diffLines []DiffLine, hlLines []string) bool {
+	if len(diffLines) == 0 || len(hlLines) == 0 {
+		return false
+	}
+	allFit := true
+	hasLines := false
+	for _, dl := range diffLines {
+		if dl.Type == LineAdd && dl.NewLineNo > 0 {
+			hasLines = true
+			if dl.NewLineNo > len(hlLines) {
+				allFit = false
+				break
+			}
+		}
+		if dl.Type == LineContext && dl.NewLineNo > 0 {
+			hasLines = true
+			if dl.NewLineNo > len(hlLines) {
+				allFit = false
+				break
+			}
+		}
+	}
+	return hasLines && allFit
 }
 
 func formatDiffLinesFromHL(diffLines []DiffLine, hlLines []string, filename string, width int, colors styles.DiffColors, colW int) {

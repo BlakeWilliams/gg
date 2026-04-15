@@ -7,6 +7,7 @@ import (
 
 	"github.com/blakewilliams/ghq/internal/github"
 	"github.com/charmbracelet/x/ansi"
+	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 )
 
@@ -264,4 +265,207 @@ func padTo(s string, width int) string {
 		return s + strings.Repeat(" ", width-w)
 	}
 	return s
+}
+// FileSelectedMsg is produced when the user selects a file (or overview) in the tree.
+type FileSelectedMsg struct {
+	FileIndex int // -1 for overview
+}
+
+// FileTree is a Bubble Tea model for a navigable file tree panel.
+type FileTree struct {
+	Entries        []FileTreeEntry
+	Cursor         int
+	Width          int
+	Height         int
+	Focused        bool
+	CurrentFileIdx int // which file is currently being viewed (-1 = overview)
+	Files          []github.PullRequestFile
+}
+
+// SetFiles rebuilds the tree from a new file list and resets the cursor.
+func (t *FileTree) SetFiles(files []github.PullRequestFile) {
+	t.Files = files
+	t.Entries = BuildFileTree(files)
+	t.Cursor = 0
+}
+
+// View renders the file tree panel content (no borders — the parent adds those).
+func (t FileTree) View() []string {
+	return RenderFileTree(t.Entries, t.Files, t.Cursor, t.CurrentFileIdx, t.Width, t.Height)
+}
+
+// HandleKey processes a key press. Returns (updated tree, cmd, handled).
+// Only handles keys when focused. The parent should check handled and
+// fall through to its own key handling if false.
+func (t FileTree) HandleKey(msg tea.KeyPressMsg) (FileTree, tea.Cmd, bool) {
+	if !t.Focused {
+		return t, nil, false
+	}
+	switch msg.String() {
+	case "j", "down":
+		t.MoveCursorBy(1)
+		return t, nil, true
+	case "k", "up":
+		t.MoveCursorBy(-1)
+		return t, nil, true
+	case "ctrl+d":
+		t.MoveCursorBy(t.Height / 2)
+		return t, nil, true
+	case "ctrl+u":
+		t.MoveCursorBy(-t.Height / 2)
+		return t, nil, true
+	case "ctrl+f":
+		t.MoveCursorBy(t.Height)
+		return t, nil, true
+	case "ctrl+b":
+		t.MoveCursorBy(-t.Height)
+		return t, nil, true
+	case "G":
+		t.MoveCursorBy(2 + len(t.Entries))
+		return t, nil, true
+	case "enter":
+		return t, t.selectCmd(), true
+	}
+	return t, nil, false
+}
+
+// Select triggers selection of the current cursor entry.
+// Returns a cmd that produces FileSelectedMsg.
+func (t FileTree) selectCmd() tea.Cmd {
+	idx := t.fileIndexAtCursor()
+	return func() tea.Msg { return FileSelectedMsg{FileIndex: idx} }
+}
+
+// SelectFile moves the cursor to the given file and marks it current.
+func (t *FileTree) SelectFile(fileIdx int) {
+	t.CurrentFileIdx = fileIdx
+	if fileIdx < 0 {
+		t.Cursor = 0
+		return
+	}
+	for i, e := range t.Entries {
+		if !e.IsDir && e.FileIndex == fileIdx {
+			t.Cursor = i + 2
+			return
+		}
+	}
+}
+
+// MoveSelection moves to the next/prev selectable file and produces FileSelectedMsg.
+func (t *FileTree) MoveSelection(delta int) tea.Cmd {
+	totalEntries := 2 + len(t.Entries)
+	newCursor := t.Cursor + delta
+
+	for newCursor >= 0 && newCursor < totalEntries {
+		if newCursor == 0 {
+			break
+		}
+		if newCursor == 1 {
+			newCursor += delta
+			continue
+		}
+		eIdx := newCursor - 2
+		if eIdx >= 0 && eIdx < len(t.Entries) && !t.Entries[eIdx].IsDir {
+			break
+		}
+		newCursor += delta
+	}
+
+	if newCursor < 0 || newCursor >= totalEntries {
+		return nil
+	}
+	t.Cursor = newCursor
+	return t.selectCmd()
+}
+
+// FileIndexAtCursor returns the file index at the current cursor, or -1 for overview.
+func (t FileTree) fileIndexAtCursor() int {
+	if t.Cursor < 2 {
+		return -1
+	}
+	eIdx := t.Cursor - 2
+	if eIdx >= 0 && eIdx < len(t.Entries) {
+		e := t.Entries[eIdx]
+		if !e.IsDir {
+			return e.FileIndex
+		}
+	}
+	return -1
+}
+
+// FileIndex returns the file index of the currently focused tree entry, or -1.
+func (t FileTree) FileIndex() int {
+	return t.fileIndexAtCursor()
+}
+
+// IndexForFile returns the tree cursor position for a given file index.
+func (t FileTree) IndexForFile(fileIdx int) int {
+	for i, e := range t.Entries {
+		if !e.IsDir && e.FileIndex == fileIdx {
+			return i + 2
+		}
+	}
+	return 0
+}
+
+// EntryIndexAtY maps a mouse Y coordinate to a tree entry index.
+func (t FileTree) EntryIndexAtY(y int) (int, bool) {
+	idx := y - 1
+	if idx < 0 {
+		return 0, false
+	}
+	totalEntries := 2 + len(t.Entries)
+	if idx >= totalEntries {
+		return 0, false
+	}
+	return idx, true
+}
+
+// HandleMouseClick processes a click in the tree area.
+// Returns (updated tree, cmd, handled).
+func (t FileTree) HandleMouseClick(msg tea.MouseClickMsg) (FileTree, tea.Cmd, bool) {
+	if msg.X >= t.Width {
+		return t, nil, false
+	}
+	idx, ok := t.EntryIndexAtY(msg.Y)
+	if !ok {
+		return t, nil, false
+	}
+	t.Cursor = idx
+	return t, t.selectCmd(), true
+}
+
+func (t *FileTree) MoveCursorBy(delta int) {
+	totalEntries := 2 + len(t.Entries)
+	newCursor := t.Cursor + delta
+
+	if newCursor < 0 {
+		newCursor = 0
+	}
+	if newCursor >= totalEntries {
+		newCursor = totalEntries - 1
+	}
+
+	dir := 1
+	if delta < 0 {
+		dir = -1
+	}
+	for newCursor >= 0 && newCursor < totalEntries {
+		if newCursor == 0 {
+			break
+		}
+		if newCursor == 1 {
+			newCursor += dir
+			continue
+		}
+		eIdx := newCursor - 2
+		if eIdx >= 0 && eIdx < len(t.Entries) && !t.Entries[eIdx].IsDir {
+			break
+		}
+		newCursor += dir
+	}
+	if newCursor < 0 || newCursor >= totalEntries {
+		return
+	}
+	t.Cursor = newCursor
 }

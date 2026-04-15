@@ -11,6 +11,7 @@ import (
 	"github.com/blakewilliams/ghq/internal/git"
 	"github.com/blakewilliams/ghq/internal/github"
 	"github.com/blakewilliams/ghq/internal/ui/components"
+	"github.com/blakewilliams/ghq/internal/ui/diffviewer"
 	"github.com/blakewilliams/ghq/internal/ui/picker"
 	"github.com/blakewilliams/ghq/internal/ui/styles"
 	"github.com/blakewilliams/ghq/internal/ui/uictx"
@@ -73,60 +74,24 @@ type prDetectFailedMsg struct{}
 var dimStyle = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
 
 type Model struct {
-	ctx    *uictx.Context
-	width  int
-	height int
+	// Embedded diff viewer (shared with prdetail).
+	dv  diffviewer.DiffViewer
+	ctx *uictx.Context // alias for dv.Ctx — avoids m.dv.Ctx everywhere
 
 	// Git state.
 	repoRoot string
 	branch   string
 	mode     git.DiffMode
 
-	// Right panel viewport.
-	vp      viewport.Model
-	vpReady bool
+	// Layout per file (for cursor positioning).
+	fileLayouts []components.DiffLayout
 
-	// Files.
-	files            []github.PullRequestFile
-	highlightedFiles []components.HighlightedDiff
-	renderedFiles    []string
-	filesHighlighted int
-	filesLoading     bool
-	currentFileIdx   int // -1 = overview
-
-	// File tree.
-	treeEntries []components.FileTreeEntry
-	treeCursor  int
-	treeWidth   int
-	treeFocused bool
-
-	// Diff cursor.
-	diffCursor      int
-	selectionAnchor int
-	fileDiffs            [][]components.DiffLine
-	fileDiffOffsets      [][]int
-	fileCommentPositions [][]components.CommentPosition
-
-	// Copilot.
-	copilot            *copilot.Client
-	copilotReplyBuf    map[string]string // commentID -> accumulated reply content
-	copilotPendingFor  string            // commentID that copilot is currently replying to
-	copilotPendingPath string            // file path of pending reply
-	copilotPendingLine int               // line number of pending reply
-	copilotPendingSide string            // side of pending reply
-	copilotDots        int               // animation frame (0-3)
+	// Render cache per file (for splice-based updates).
+	fileRenderCache []*components.DiffRenderResult
 
 	// Comments.
-	commentStore     *comments.CommentStore
-	composing        bool
-	commentInput     textarea.Model
-	commentFile      string
-	commentLine      int
-	commentSide      string
-	commentStartLine int
-	commentStartSide string
-	replyToID        string
-
+	commentStore *comments.CommentStore
+	replyToID    string
 
 	// File watcher.
 	watcher *watcher.Watcher
@@ -142,22 +107,15 @@ type Model struct {
 	// Fast filename->index lookup (rebuilt on diff load).
 	filePathIndex map[string]int
 
-	// Comment thread navigation: when > 0, cursor is inside a thread.
-	// 0 = on the diff line itself, 1 = first comment, 2 = second, etc.
-	threadCursor int
-
 	// PR detection.
 	pr       *github.PullRequest // nil if no PR for this branch
 	prLoaded bool                // true once checked
 
 	// Render cache.
-	lastContent          string
 	lastFormattedStreamLen int // length of copilot reply buffer at last formatFile
 
-	// Shared.
-	filesListLoaded  bool
-	waitingG         bool
-	stagingInFlight  int // number of staging ops in progress
+	// Staging ops counter.
+	stagingInFlight int // number of staging ops in progress
 }
 
 func New(ctx *uictx.Context, repoRoot string, width, height int) Model {
@@ -167,50 +125,49 @@ func New(ctx *uictx.Context, repoRoot string, width, height int) Model {
 	active := comments.LoadActiveState(repoRoot, branch)
 	vs := comments.LoadViewState(repoRoot, branch, active.Mode)
 	return Model{
-		ctx:              ctx,
-		repoRoot:         repoRoot,
-		branch:           branch,
-		mode:             active.Mode,
-		width:            width,
-		height:           height,
-		currentFileIdx:   -1,
-		selectionAnchor:  -1,
-		treeWidth:        35,
-		treeFocused:      true,
-		watcher:          w,
-		commentStore:     comments.LoadComments(repoRoot),
-		copilot:          cp,
-		copilotReplyBuf:  make(map[string]string),
-		fileCursors:      make(map[string]int),
-		filePathIndex:    make(map[string]int),
-		savedFilename:    vs.Filename,
-		savedLineNo:      vs.LineNo,
-		savedSide:        vs.Side,
+		ctx: ctx,
+		dv: diffviewer.DiffViewer{
+			Ctx:             ctx,
+			Width:           width,
+			Height:          height,
+			CurrentFileIdx:  -1,
+			SelectionAnchor: -1,
+			Tree: components.FileTree{
+				Width:   35,
+				Height:  height - 2,
+				Focused: true,
+			},
+			Copilot:         cp,
+			CopilotReplyBuf: make(map[string]string),
+		},
+		repoRoot:      repoRoot,
+		branch:        branch,
+		mode:          active.Mode,
+		watcher:       w,
+		commentStore:  comments.LoadComments(repoRoot),
+		fileCursors:   make(map[string]int),
+		filePathIndex: make(map[string]int),
+		savedFilename: vs.Filename,
+		savedLineNo:   vs.LineNo,
+		savedSide:     vs.Side,
 	}
 }
 
 func (m Model) BranchName() string              { return m.branch }
 func (m Model) DiffMode() git.DiffMode          { return m.mode }
 func (m Model) PR() *github.PullRequest         { return m.pr }
-func (m Model) Files() []github.PullRequestFile { return m.files }
-
-func (m Model) authorName() string {
-	if m.ctx.Username != "" {
-		return m.ctx.Username
-	}
-	return "you"
-}
+func (m Model) Files() []github.PullRequestFile { return m.dv.Files }
 
 // restoreSavedPosition finds the saved file by name and restores cursor
 // to the diff line matching the saved source line number.
 func (m *Model) restoreSavedPosition() {
-	for i, f := range m.files {
+	for i, f := range m.dv.Files {
 		if f.Filename == m.savedFilename {
-			m.currentFileIdx = i
-			m.diffCursor = m.findDiffLineBySourceLine(i, m.savedLineNo, m.savedSide)
+			m.dv.CurrentFileIdx = i
+			m.dv.DiffCursor = m.findDiffLineBySourceLine(i, m.savedLineNo, m.savedSide)
 			// Set tree cursor to match the file.
-			m.treeCursor = m.treeIndexForFile(i)
-			m.treeFocused = false
+			m.dv.Tree.Cursor = m.dv.Tree.IndexForFile(i)
+			m.dv.Tree.Focused = false
 			break
 		}
 	}
@@ -222,10 +179,10 @@ func (m *Model) restoreSavedPosition() {
 // source line number. This is stable across code changes — if line 42 moves
 // to diff index 15 instead of 12, we still land on line 42.
 func (m Model) findDiffLineBySourceLine(fileIdx, lineNo int, side string) int {
-	if fileIdx >= len(m.fileDiffs) || lineNo == 0 {
+	if fileIdx >= len(m.dv.FileDiffs) || lineNo == 0 {
 		return 0
 	}
-	lines := m.fileDiffs[fileIdx]
+	lines := m.dv.FileDiffs[fileIdx]
 	best := 0
 	bestDist := -1
 	for i, dl := range lines {
@@ -250,41 +207,16 @@ func (m Model) findDiffLineBySourceLine(fileIdx, lineNo int, side string) int {
 	return best
 }
 
-// treeFileIndex returns the file index for the file under the tree cursor, or -1.
-func (m Model) treeFileIndex() int {
-	if m.treeCursor < 2 {
-		return -1 // Overview or separator
-	}
-	eIdx := m.treeCursor - 2
-	if eIdx >= 0 && eIdx < len(m.treeEntries) {
-		e := m.treeEntries[eIdx]
-		if !e.IsDir && e.FileIndex >= 0 {
-			return e.FileIndex
-		}
-	}
-	return -1
-}
-
-// treeIndexForFile returns the tree cursor index for a given file index.
-func (m Model) treeIndexForFile(fileIdx int) int {
-	for i, e := range m.treeEntries {
-		if e.FileIndex == fileIdx && !e.IsDir {
-			return i + 2 // +2 for Overview + separator
-		}
-	}
-	return 0
-}
-
 // saveViewState persists the current position for next session.
 // Stores the source line number at the cursor (not diff index) so
 // the position survives code changes that shift diff lines.
 func (m Model) saveViewState() {
 	var filename, side string
 	var lineNo int
-	if m.currentFileIdx >= 0 && m.currentFileIdx < len(m.files) {
-		filename = m.files[m.currentFileIdx].Filename
-		if m.currentFileIdx < len(m.fileDiffs) && m.diffCursor < len(m.fileDiffs[m.currentFileIdx]) {
-			dl := m.fileDiffs[m.currentFileIdx][m.diffCursor]
+	if m.dv.CurrentFileIdx >= 0 && m.dv.CurrentFileIdx < len(m.dv.Files) {
+		filename = m.dv.Files[m.dv.CurrentFileIdx].Filename
+		if m.dv.CurrentFileIdx < len(m.dv.FileDiffs) && m.dv.DiffCursor < len(m.dv.FileDiffs[m.dv.CurrentFileIdx]) {
+			dl := m.dv.FileDiffs[m.dv.CurrentFileIdx][m.dv.DiffCursor]
 			if dl.Type == components.LineDel {
 				lineNo = dl.OldLineNo
 				side = "LEFT"
@@ -307,8 +239,8 @@ func (m Model) Init() tea.Cmd {
 	if m.watcher != nil {
 		cmds = append(cmds, m.watcher.WaitCmd())
 	}
-	if m.copilot != nil {
-		cmds = append(cmds, m.copilot.ListenCmd())
+	if m.dv.Copilot != nil {
+		cmds = append(cmds, m.dv.Copilot.ListenCmd())
 	}
 	// Auto-detect PR for this branch (uses internal msg type so app doesn't intercept).
 	if !m.prLoaded {
@@ -349,32 +281,34 @@ func (m Model) loadDiff() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		if m.filesListLoaded && m.filesHighlighted > 0 {
+		m.dv.Width = msg.Width
+		m.dv.Height = msg.Height
+		m.dv.Tree.Height = msg.Height - 2
+		// Width changed — layouts need recomputing.
+		if m.dv.FilesListLoaded {
 			m.reformatAllFiles()
-			m.rebuildContent()
 		}
+		m.rebuildContent()
 		return m, nil
 
 	case tea.MouseClickMsg:
-		if msg.X < m.treeWidth {
-			if idx, ok := m.treeEntryIndexAtY(msg.Y); ok {
+		if msg.X < m.dv.Tree.Width {
+			if idx, ok := m.dv.Tree.EntryIndexAtY(msg.Y); ok {
 				if idx == 0 {
-					m.treeCursor = 0
-					m.currentFileIdx = -1
+					m.dv.Tree.Cursor = 0
+					m.dv.CurrentFileIdx = -1
 					m.rebuildContent()
-					m.vp.GotoTop()
+					m.dv.VP.GotoTop()
 					m.saveViewState()
 				} else if idx >= 2 {
 					eIdx := idx - 2
-					if eIdx >= 0 && eIdx < len(m.treeEntries) {
-						e := m.treeEntries[eIdx]
+					if eIdx >= 0 && eIdx < len(m.dv.Tree.Entries) {
+						e := m.dv.Tree.Entries[eIdx]
 						if !e.IsDir && e.FileIndex >= 0 {
-							m.treeCursor = idx
-							m.currentFileIdx = e.FileIndex
+							m.dv.Tree.Cursor = idx
+							m.dv.CurrentFileIdx = e.FileIndex
 							m.rebuildContent()
-							m.vp.GotoTop()
+							m.dv.VP.GotoTop()
 							m.saveViewState()
 						}
 					}
@@ -385,49 +319,51 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 
 	case diffLoadedMsg:
 		// Build index of old patches by filename for incremental updates.
-		oldPatches := make(map[string]string, len(m.files))
+		oldPatches := make(map[string]string, len(m.dv.Files))
 		oldHighlights := make(map[string]components.HighlightedDiff)
 		oldRendered := make(map[string]string)
-		for i, f := range m.files {
+		for i, f := range m.dv.Files {
 			oldPatches[f.Filename] = f.Patch
-			if i < len(m.highlightedFiles) && m.highlightedFiles[i].File.Filename != "" {
-				oldHighlights[f.Filename] = m.highlightedFiles[i]
+			if i < len(m.dv.HighlightedFiles) && m.dv.HighlightedFiles[i].File.Filename != "" {
+				oldHighlights[f.Filename] = m.dv.HighlightedFiles[i]
 			}
-			if i < len(m.renderedFiles) {
-				oldRendered[f.Filename] = m.renderedFiles[i]
+			if i < len(m.dv.RenderedFiles) {
+				oldRendered[f.Filename] = m.dv.RenderedFiles[i]
 			}
 		}
 
-		m.files = msg.files
-		m.highlightedFiles = make([]components.HighlightedDiff, len(msg.files))
-		m.renderedFiles = make([]string, len(msg.files))
-		m.fileDiffs = make([][]components.DiffLine, len(msg.files))
-		m.fileDiffOffsets = make([][]int, len(msg.files))
-		m.fileCommentPositions = make([][]components.CommentPosition, len(msg.files))
+		m.dv.Files = msg.files
+		m.dv.HighlightedFiles = make([]components.HighlightedDiff, len(msg.files))
+		m.dv.RenderedFiles = make([]string, len(msg.files))
+		m.dv.FileDiffs = make([][]components.DiffLine, len(msg.files))
+		m.dv.FileDiffOffsets = make([][]int, len(msg.files))
+		m.dv.FileCommentPositions = make([][]components.CommentPosition, len(msg.files))
+		m.fileLayouts = make([]components.DiffLayout, len(msg.files))
+		m.fileRenderCache = make([]*components.DiffRenderResult, len(msg.files))
 		m.rebuildFilePathIndex()
-		m.filesListLoaded = true
+		m.dv.FilesListLoaded = true
 
 		// Reuse cached highlights for files whose patch hasn't changed.
 		var needHighlight []int
 		for i, f := range msg.files {
-			m.fileDiffs[i] = components.ParsePatchLines(f.Patch)
+			m.dv.FileDiffs[i] = components.ParsePatchLines(f.Patch)
 			if old, ok := oldPatches[f.Filename]; ok && old == f.Patch {
 				if hl, ok := oldHighlights[f.Filename]; ok {
-					m.highlightedFiles[i] = hl
-					m.renderedFiles[i] = oldRendered[f.Filename]
+					m.dv.HighlightedFiles[i] = hl
+					m.dv.RenderedFiles[i] = oldRendered[f.Filename]
 					continue
 				}
 			}
 			// Keep stale rendered content so the viewport doesn't flash
 			// a skeleton while the new highlight is in progress.
 			if rendered, ok := oldRendered[f.Filename]; ok {
-				m.renderedFiles[i] = rendered
+				m.dv.RenderedFiles[i] = rendered
 			}
 			needHighlight = append(needHighlight, i)
 		}
 
-		m.filesHighlighted = len(msg.files) - len(needHighlight)
-		m.treeEntries = components.BuildFileTree(m.files)
+		m.dv.FilesHighlighted = len(msg.files) - len(needHighlight)
+		m.dv.Tree.SetFiles(m.dv.Files)
 
 		// Update watcher to cover directories with changed files.
 		if m.watcher != nil {
@@ -439,41 +375,41 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		}
 
 		// Restore saved position from previous session.
-		savedOffset := m.vp.YOffset()
+		savedOffset := m.dv.VP.YOffset()
 		if m.savedFilename != "" {
 			m.restoreSavedPosition()
-		} else if m.currentFileIdx >= len(m.files) {
-			m.currentFileIdx = -1
-			m.treeCursor = 0
+		} else if m.dv.CurrentFileIdx >= len(m.dv.Files) {
+			m.dv.CurrentFileIdx = -1
+			m.dv.Tree.Cursor = 0
 		}
 
 		// Only re-format the current file if it kept its highlights.
 		// Other files will be formatted lazily when navigated to.
-		if m.currentFileIdx >= 0 && m.currentFileIdx < len(msg.files) {
-			f := msg.files[m.currentFileIdx]
+		if m.dv.CurrentFileIdx >= 0 && m.dv.CurrentFileIdx < len(msg.files) {
+			f := msg.files[m.dv.CurrentFileIdx]
 			if _, ok := oldHighlights[f.Filename]; ok && oldPatches[f.Filename] == f.Patch {
-				m.formatFile(m.currentFileIdx)
+				m.formatFile(m.dv.CurrentFileIdx)
 			}
 		}
 
 		m.rebuildContentIfChanged()
 		// Preserve scroll position on file-watcher reloads (not initial load).
 		if m.savedFilename == "" && savedOffset > 0 {
-			m.vp.SetYOffset(savedOffset)
+			m.dv.VP.SetYOffset(savedOffset)
 		}
 
 		// Only highlight files that actually changed.
 		if len(needHighlight) > 0 {
 			// Prioritize the current file if it needs highlighting.
 			for i, idx := range needHighlight {
-				if idx == m.currentFileIdx {
+				if idx == m.dv.CurrentFileIdx {
 					needHighlight[0], needHighlight[i] = needHighlight[i], needHighlight[0]
 					break
 				}
 			}
 			return m, m.highlightFileCmd(needHighlight[0])
 		}
-		m.filesLoading = false
+		m.dv.FilesLoading = false
 		return m, nil
 
 	case diffErrorMsg:
@@ -482,11 +418,11 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	case SwitchModeMsg:
 		m.saveViewState()
 		m.mode = msg.Mode
-		m.filesListLoaded = false
-		m.filesHighlighted = 0
-		m.filesLoading = true
-		m.currentFileIdx = -1
-		m.treeCursor = 0
+		m.dv.FilesListLoaded = false
+		m.dv.FilesHighlighted = 0
+		m.dv.FilesLoading = true
+		m.dv.CurrentFileIdx = -1
+		m.dv.Tree.Cursor = 0
 		m.fileCursors = make(map[string]int)
 		vs := comments.LoadViewState(m.repoRoot, m.branch, m.mode)
 		m.savedFilename = vs.Filename
@@ -529,31 +465,32 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case fileHighlightedMsg:
-		if msg.index >= len(m.highlightedFiles) {
+		if msg.index >= len(m.dv.HighlightedFiles) {
 			return m, nil
 		}
-		m.highlightedFiles[msg.index] = msg.highlight
-		m.formatFile(msg.index)
-		// Only rebuild viewport if this is the file we're currently viewing.
-		if msg.index == m.currentFileIdx || m.currentFileIdx == -1 {
+		m.dv.HighlightedFiles[msg.index] = msg.highlight
+		m.dv.FilesHighlighted++
+		// Only render the current file synchronously. Others render on access.
+		if msg.index == m.dv.CurrentFileIdx || m.dv.CurrentFileIdx == -1 {
+			m.formatFile(msg.index)
 			m.rebuildContent()
 		}
 		// Find the next file that needs highlighting.
-		for next := msg.index + 1; next < len(m.files); next++ {
-			if m.highlightedFiles[next].File.Filename == "" {
+		for next := msg.index + 1; next < len(m.dv.Files); next++ {
+			if m.dv.HighlightedFiles[next].File.Filename == "" {
 				return m, m.highlightFileCmd(next)
 			}
 		}
-		m.filesLoading = false
+		m.dv.FilesLoading = false
 		return m, nil
 
 	case copilot.ReplyMsg:
-		m.copilotReplyBuf[msg.CommentID] += msg.Content
+		m.dv.CopilotReplyBuf[msg.CommentID] += msg.Content
 		if msg.Done {
-			body := m.copilotReplyBuf[msg.CommentID]
-			delete(m.copilotReplyBuf, msg.CommentID)
-			pendingPath := m.copilotPendingPath
-			m.copilotPendingFor = ""
+			body := m.dv.CopilotReplyBuf[msg.CommentID]
+			delete(m.dv.CopilotReplyBuf, msg.CommentID)
+			pendingPath := m.dv.CopilotPendingPath(msg.CommentID)
+			m.dv.ClearCopilotPending(msg.CommentID)
 			if body != "" {
 				for _, c := range m.commentStore.Comments {
 					if c.ID == msg.CommentID {
@@ -576,18 +513,17 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 			if fileIdx := m.fileIndexForPath(pendingPath); fileIdx >= 0 {
 				m.formatFile(fileIdx)
 				// Only rebuild viewport if we're looking at this file.
-				if fileIdx == m.currentFileIdx {
+				if fileIdx == m.dv.CurrentFileIdx {
 					m.rebuildContent()
 				}
 			}
-		} else if fileIdx := m.fileIndexForPath(m.copilotPendingPath); fileIdx >= 0 && fileIdx == m.currentFileIdx {
-			// Streaming delta — only re-render if we're looking at this file.
-			m.lastFormattedStreamLen = len(m.copilotReplyBuf[msg.CommentID])
-			m.formatFile(fileIdx)
+		} else if fileIdx := m.fileIndexForPath(m.dv.CopilotPendingPath(msg.CommentID)); fileIdx >= 0 && fileIdx == m.dv.CurrentFileIdx {
+			// Streaming delta — splice only the affected thread (O(thread), not O(n)).
+			m.spliceThreadForComment(fileIdx, msg.CommentID)
 			m.rebuildContentIfChanged()
 		}
-		cmds := []tea.Cmd{m.copilot.ListenCmd()}
-		if m.copilotPendingFor != "" {
+		cmds := []tea.Cmd{m.dv.Copilot.ListenCmd()}
+		if m.dv.HasCopilotPending() {
 			cmds = append(cmds, tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg {
 				return copilotTickMsg{}
 			}))
@@ -595,38 +531,37 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case copilot.ErrorMsg:
-		m.copilotPendingFor = ""
+		pendingPath := m.dv.CopilotPendingPath(msg.CommentID)
+		m.dv.ClearCopilotPending(msg.CommentID)
 		// Only re-render the affected file.
-		if fileIdx := m.fileIndexForPath(m.copilotPendingPath); fileIdx >= 0 {
+		if fileIdx := m.fileIndexForPath(pendingPath); fileIdx >= 0 {
 			m.formatFile(fileIdx)
 		}
 		m.rebuildContent()
 		cmds := []tea.Cmd{}
-		if m.copilot != nil {
-			cmds = append(cmds, m.copilot.ListenCmd())
+		if m.dv.Copilot != nil {
+			cmds = append(cmds, m.dv.Copilot.ListenCmd())
 		}
 		return m, tea.Batch(cmds...)
 
 	case copilotTickMsg:
-		if m.copilotPendingFor != "" {
-			m.copilotDots = (m.copilotDots + 1) % 4
-			// Only re-format if new streaming content arrived since last format.
-			streamLen := len(m.copilotReplyBuf[m.copilotPendingFor])
-			if fileIdx := m.fileIndexForPath(m.copilotPendingPath); fileIdx >= 0 && fileIdx == m.currentFileIdx {
-				if streamLen != m.lastFormattedStreamLen {
-					m.lastFormattedStreamLen = streamLen
-					m.formatFile(fileIdx)
-					m.rebuildContentIfChanged()
-				}
-			}
-			return m, tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg {
-				return copilotTickMsg{}
-			})
+		if !m.dv.HasCopilotPending() {
+			return m, nil
 		}
-		return m, nil
+		m.dv.CopilotDots = (m.dv.CopilotDots + 1) % 4
+		// Splice pending threads in the current file (O(thread), not O(n)).
+		for commentID, info := range m.dv.CopilotPending {
+			if fileIdx := m.fileIndexForPath(info.Path); fileIdx >= 0 && fileIdx == m.dv.CurrentFileIdx {
+				m.spliceThreadForComment(fileIdx, commentID)
+			}
+		}
+		m.rebuildContentIfChanged()
+		return m, tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg {
+			return copilotTickMsg{}
+		})
 
 	case GoToLineMsg:
-		if m.currentFileIdx >= 0 && m.hasDiffLines() {
+		if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
 			m.goToSourceLine(msg.Line)
 		}
 		return m, nil
@@ -641,18 +576,18 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	}
 
 	// When composing, delegate non-key messages to textarea.
-	if m.composing {
+	if m.dv.Composing {
 		var cmd tea.Cmd
-		m.commentInput, cmd = m.commentInput.Update(msg)
+		m.dv.CommentInput, cmd = m.dv.CommentInput.Update(msg)
 		return m, cmd
 	}
 
 	// Viewport updates.
-	if m.vpReady {
-		prevOffset := m.vp.YOffset()
+	if m.dv.VPReady {
+		prevOffset := m.dv.VP.YOffset()
 		var cmd tea.Cmd
-		m.vp, cmd = m.vp.Update(msg)
-		if m.vp.YOffset() != prevOffset && m.currentFileIdx >= 0 {
+		m.dv.VP, cmd = m.dv.VP.Update(msg)
+		if m.dv.VP.YOffset() != prevOffset && m.dv.CurrentFileIdx >= 0 {
 			m.syncDiffCursorToViewport()
 		}
 		return m, cmd
@@ -666,23 +601,23 @@ func (m Model) HandleKey(msg tea.KeyPressMsg) (uictx.View, tea.Cmd, bool) {
 
 func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 	// When composing a comment, handle textarea keys.
-	if m.composing {
+	if m.dv.Composing {
 		return m.handleCommentKey(msg)
 	}
 
 	// Thread navigation mode.
-	if m.threadCursor > 0 {
+	if m.dv.ThreadCursor > 0 {
 		switch msg.String() {
 		case "j", "down":
 			// Scroll within a long comment before moving to the next one.
 			if m.commentExtendsBelow() {
-				m.vp.SetYOffset(m.vp.YOffset() + 1)
+				m.dv.VP.SetYOffset(m.dv.VP.YOffset() + 1)
 				return m, nil, true
 			}
 			count := m.threadCommentCount()
-			if m.threadCursor < count {
-				m.threadCursor++
-				m.formatFile(m.currentFileIdx)
+			if m.dv.ThreadCursor < count {
+				m.dv.ThreadCursor++
+				m.formatFile(m.dv.CurrentFileIdx)
 				m.rebuildContent()
 				m.scrollToThreadCursor()
 			}
@@ -690,46 +625,46 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		case "k", "up":
 			// Scroll within a long comment before moving to the previous one.
 			if m.commentExtendsAbove() {
-				m.vp.SetYOffset(m.vp.YOffset() - 1)
+				m.dv.VP.SetYOffset(m.dv.VP.YOffset() - 1)
 				return m, nil, true
 			}
-			if m.threadCursor > 1 {
-				m.threadCursor--
-				m.formatFile(m.currentFileIdx)
+			if m.dv.ThreadCursor > 1 {
+				m.dv.ThreadCursor--
+				m.formatFile(m.dv.CurrentFileIdx)
 				m.rebuildContent()
 				m.scrollToThreadCursorBottom()
 			} else {
-				m.threadCursor = 0
-				m.formatFile(m.currentFileIdx)
+				m.dv.ThreadCursor = 0
+				m.formatFile(m.dv.CurrentFileIdx)
 				m.rebuildContent()
 				m.scrollToDiffCursor()
 			}
 			return m, nil, true
 		case "ctrl+d":
-			m.vp.SetYOffset(m.vp.YOffset() + m.height/2)
+			m.dv.VP.SetYOffset(m.dv.VP.YOffset() + m.dv.Height/2)
 			return m, nil, true
 		case "ctrl+u":
-			m.vp.SetYOffset(m.vp.YOffset() - m.height/2)
+			m.dv.VP.SetYOffset(m.dv.VP.YOffset() - m.dv.Height/2)
 			return m, nil, true
 		case "esc":
-			m.threadCursor = 0
-			m.formatFile(m.currentFileIdx)
+			m.dv.ThreadCursor = 0
+			m.formatFile(m.dv.CurrentFileIdx)
 			m.rebuildContent()
 			m.scrollToDiffCursor()
 			return m, nil, true
 		case "r":
 			if cmd := m.replyToThreadAtCursor(); cmd != nil {
-				m.threadCursor = 0
+				m.dv.ThreadCursor = 0
 				return m, cmd, true
 			}
 			return m, nil, true
 		case "x":
 			m.toggleResolveAtCursor()
-			m.threadCursor = 0
+			m.dv.ThreadCursor = 0
 			return m, nil, true
 		case "enter":
-			m.threadCursor = 0
-			m.formatFile(m.currentFileIdx)
+			m.dv.ThreadCursor = 0
+			m.formatFile(m.dv.CurrentFileIdx)
 			m.rebuildContent()
 			m.scrollToDiffCursor()
 			return m, nil, true
@@ -738,14 +673,14 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 	}
 
 	// Clear selection on esc.
-	if msg.String() == "esc" && m.selectionAnchor >= 0 {
-		m.selectionAnchor = -1
+	if msg.String() == "esc" && m.dv.SelectionAnchor >= 0 {
+		m.dv.SelectionAnchor = -1
 		return m, nil, true
 	}
 
 	switch msg.String() {
 	case "f":
-		m.treeFocused = !m.treeFocused
+		m.dv.Tree.Focused = !m.dv.Tree.Focused
 		return m, nil, true
 	case "m":
 		// Cycle diff mode: Working → Staged → Branch (skip Branch on default branch).
@@ -760,118 +695,120 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		} else {
 			m.mode = (m.mode + 1) % 3
 		}
-		m.filesListLoaded = false
-		m.filesHighlighted = 0
-		m.filesLoading = true
-		m.currentFileIdx = -1
-		m.treeCursor = 0
+		m.dv.FilesListLoaded = false
+		m.dv.FilesHighlighted = 0
+		m.dv.FilesLoading = true
+		m.dv.CurrentFileIdx = -1
+		m.dv.Tree.Cursor = 0
 		vs := comments.LoadViewState(m.repoRoot, m.branch, m.mode)
 		m.savedFilename = vs.Filename
 		m.savedLineNo = vs.LineNo
 		m.savedSide = vs.Side
 		return m, m.loadDiff(), true
 	case "h", "left":
-		m.treeFocused = true
+		m.dv.Tree.Focused = true
 		return m, nil, true
 	case "l", "right":
-		m.treeFocused = false
+		m.dv.Tree.Focused = false
 		return m, nil, true
 	case "ctrl+k":
-		m.moveTreeSelection(-1)
+		m.dv.Tree.MoveSelection(-1)
+		m.selectTreeEntry()
 		return m, nil, true
 	case "ctrl+j":
-		m.moveTreeSelection(1)
+		m.dv.Tree.MoveSelection(1)
+		m.selectTreeEntry()
 		return m, nil, true
 	case "j", "down":
-		if m.treeFocused {
-			m.moveTreeCursorBy(1)
+		if m.dv.Tree.Focused {
+			m.dv.Tree.MoveCursorBy(1)
 			return m, nil, true
 		}
-		if m.currentFileIdx >= 0 && m.hasDiffLines() {
-			m.selectionAnchor = -1
+		if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
+			m.dv.SelectionAnchor = -1
 			m.moveDiffCursor(1)
 			return m, nil, true
 		}
 	case "k", "up":
-		if m.treeFocused {
-			m.moveTreeCursorBy(-1)
+		if m.dv.Tree.Focused {
+			m.dv.Tree.MoveCursorBy(-1)
 			return m, nil, true
 		}
-		if m.currentFileIdx >= 0 && m.hasDiffLines() {
-			m.selectionAnchor = -1
+		if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
+			m.dv.SelectionAnchor = -1
 			m.moveDiffCursor(-1)
 			return m, nil, true
 		}
 	case "J", "shift+down":
-		if !m.treeFocused && m.currentFileIdx >= 0 && m.hasDiffLines() {
-			if m.selectionAnchor < 0 {
-				m.selectionAnchor = m.diffCursor
+		if !m.dv.Tree.Focused && m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
+			if m.dv.SelectionAnchor < 0 {
+				m.dv.SelectionAnchor = m.dv.DiffCursor
 			}
 			m.moveDiffCursor(1)
 			return m, nil, true
 		}
 	case "K", "shift+up":
-		if !m.treeFocused && m.currentFileIdx >= 0 && m.hasDiffLines() {
-			if m.selectionAnchor < 0 {
-				m.selectionAnchor = m.diffCursor
+		if !m.dv.Tree.Focused && m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
+			if m.dv.SelectionAnchor < 0 {
+				m.dv.SelectionAnchor = m.dv.DiffCursor
 			}
 			m.moveDiffCursor(-1)
 			return m, nil, true
 		}
 	case "enter":
-		if m.treeFocused {
+		if m.dv.Tree.Focused {
 			m.selectTreeEntry()
-			m.treeFocused = false
+			m.dv.Tree.Focused = false
 			return m, nil, true
 		}
 		// If inside a thread, exit thread mode.
-		if m.threadCursor > 0 {
-			m.threadCursor = 0
-			m.formatFile(m.currentFileIdx)
+		if m.dv.ThreadCursor > 0 {
+			m.dv.ThreadCursor = 0
+			m.formatFile(m.dv.CurrentFileIdx)
 			m.rebuildContent()
 			m.scrollToDiffCursor()
 			return m, nil, true
 		}
 		// If on a line with comments, enter thread navigation.
-		if m.currentFileIdx >= 0 && m.hasDiffLines() && m.cursorHasThread() {
-			m.threadCursor = 1
-			m.formatFile(m.currentFileIdx)
+		if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() && m.cursorHasThread() {
+			m.dv.ThreadCursor = 1
+			m.formatFile(m.dv.CurrentFileIdx)
 			m.rebuildContent()
 			m.scrollToThreadCursor()
 			return m, nil, true
 		}
 		// Otherwise open comment input.
-		if m.currentFileIdx >= 0 && m.hasDiffLines() {
+		if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
 			return m.openCommentInput()
 		}
 	case "a":
-		if m.currentFileIdx >= 0 && m.hasDiffLines() {
+		if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
 			return m.openCommentInput()
 		}
 	case "r":
 		// Reply to comment thread on current line.
-		if !m.treeFocused && m.currentFileIdx >= 0 && m.hasDiffLines() {
+		if !m.dv.Tree.Focused && m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
 			if cmd := m.replyToThreadAtCursor(); cmd != nil {
 				return m, cmd, true
 			}
 		}
 	case "x":
 		// Resolve/unresolve comment thread on current line.
-		if !m.treeFocused && m.currentFileIdx >= 0 && m.hasDiffLines() {
+		if !m.dv.Tree.Focused && m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
 			if m.toggleResolveAtCursor() {
 				return m, nil, true
 			}
 		}
 	case "s":
 		if m.mode == git.DiffWorking {
-			if m.treeFocused {
+			if m.dv.Tree.Focused {
 				// Stage the whole file under the tree cursor.
-				if fileIdx := m.treeFileIndex(); fileIdx >= 0 {
-					m.currentFileIdx = fileIdx
+				if fileIdx := m.dv.Tree.FileIndex(); fileIdx >= 0 {
+					m.dv.CurrentFileIdx = fileIdx
 					return m.stageWholeFile(false)
 				}
-			} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
-				status := m.files[m.currentFileIdx].Status
+			} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
+				status := m.dv.Files[m.dv.CurrentFileIdx].Status
 				if status == "removed" || status == "renamed" {
 					return m.stageWholeFile(false)
 				}
@@ -880,24 +817,24 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		}
 	case "u":
 		if m.mode == git.DiffStaged {
-			if m.treeFocused {
-				if fileIdx := m.treeFileIndex(); fileIdx >= 0 {
-					m.currentFileIdx = fileIdx
+			if m.dv.Tree.Focused {
+				if fileIdx := m.dv.Tree.FileIndex(); fileIdx >= 0 {
+					m.dv.CurrentFileIdx = fileIdx
 					return m.stageWholeFile(true)
 				}
-			} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
+			} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
 				return m.stageSelection(true)
 			}
 		}
 	case "S":
 		if m.mode == git.DiffWorking {
-			if m.treeFocused {
-				if fileIdx := m.treeFileIndex(); fileIdx >= 0 {
-					m.currentFileIdx = fileIdx
+			if m.dv.Tree.Focused {
+				if fileIdx := m.dv.Tree.FileIndex(); fileIdx >= 0 {
+					m.dv.CurrentFileIdx = fileIdx
 					return m.stageWholeFile(false)
 				}
-			} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
-				status := m.files[m.currentFileIdx].Status
+			} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
+				status := m.dv.Files[m.dv.CurrentFileIdx].Status
 				if status == "removed" || status == "renamed" {
 					return m.stageWholeFile(false)
 				}
@@ -906,84 +843,84 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		}
 	case "U":
 		if m.mode == git.DiffStaged {
-			if m.treeFocused {
-				if fileIdx := m.treeFileIndex(); fileIdx >= 0 {
-					m.currentFileIdx = fileIdx
+			if m.dv.Tree.Focused {
+				if fileIdx := m.dv.Tree.FileIndex(); fileIdx >= 0 {
+					m.dv.CurrentFileIdx = fileIdx
 					return m.stageWholeFile(true)
 				}
-			} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
+			} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
 				return m.stageHunk(true)
 			}
 		}
 	case "ctrl+d":
-		m.selectionAnchor = -1
-		if m.treeFocused {
-			m.moveTreeCursorBy(m.height / 2)
-		} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
-			m.scrollAndSyncCursor(m.height / 2)
+		m.dv.SelectionAnchor = -1
+		if m.dv.Tree.Focused {
+			m.dv.Tree.MoveCursorBy(m.dv.Height / 2)
+		} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
+			m.scrollAndSyncCursor(m.dv.Height / 2)
 		} else {
-			m.vp.SetYOffset(m.vp.YOffset() + m.height/2)
+			m.dv.VP.SetYOffset(m.dv.VP.YOffset() + m.dv.Height/2)
 		}
 		return m, nil, true
 	case "ctrl+u":
-		m.selectionAnchor = -1
-		if m.treeFocused {
-			m.moveTreeCursorBy(-m.height / 2)
-		} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
-			m.scrollAndSyncCursor(-m.height / 2)
+		m.dv.SelectionAnchor = -1
+		if m.dv.Tree.Focused {
+			m.dv.Tree.MoveCursorBy(-m.dv.Height / 2)
+		} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
+			m.scrollAndSyncCursor(-m.dv.Height / 2)
 		} else {
-			m.vp.SetYOffset(m.vp.YOffset() - m.height/2)
+			m.dv.VP.SetYOffset(m.dv.VP.YOffset() - m.dv.Height/2)
 		}
 		return m, nil, true
 	case "ctrl+f":
-		m.selectionAnchor = -1
-		if m.treeFocused {
-			m.moveTreeCursorBy(m.height)
-		} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
-			m.scrollAndSyncCursor(m.height)
+		m.dv.SelectionAnchor = -1
+		if m.dv.Tree.Focused {
+			m.dv.Tree.MoveCursorBy(m.dv.Height)
+		} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
+			m.scrollAndSyncCursor(m.dv.Height)
 		} else {
-			m.vp.SetYOffset(m.vp.YOffset() + m.height)
+			m.dv.VP.SetYOffset(m.dv.VP.YOffset() + m.dv.Height)
 		}
 		return m, nil, true
 	case "ctrl+b":
-		m.selectionAnchor = -1
-		if m.treeFocused {
-			m.moveTreeCursorBy(-m.height)
-		} else if m.currentFileIdx >= 0 && m.hasDiffLines() {
-			m.scrollAndSyncCursor(-m.height)
+		m.dv.SelectionAnchor = -1
+		if m.dv.Tree.Focused {
+			m.dv.Tree.MoveCursorBy(-m.dv.Height)
+		} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
+			m.scrollAndSyncCursor(-m.dv.Height)
 		} else {
-			m.vp.SetYOffset(m.vp.YOffset() - m.height)
+			m.dv.VP.SetYOffset(m.dv.VP.YOffset() - m.dv.Height)
 		}
 		return m, nil, true
 	case "G":
-		m.waitingG = false
-		if m.treeFocused {
-			totalEntries := 2 + len(m.treeEntries)
-			m.moveTreeCursorBy(totalEntries)
+		m.dv.WaitingG = false
+		if m.dv.Tree.Focused {
+			totalEntries := 2 + len(m.dv.Tree.Entries)
+			m.dv.Tree.MoveCursorBy(totalEntries)
 		} else {
-			m.vp.GotoBottom()
-			if m.currentFileIdx >= 0 && m.hasDiffLines() {
+			m.dv.VP.GotoBottom()
+			if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
 				m.syncDiffCursorToViewport()
 			}
 		}
 		return m, nil, true
 	case "g":
-		if m.waitingG {
-			m.waitingG = false
-			if m.treeFocused {
-				m.moveTreeCursorBy(-2 - len(m.treeEntries))
+		if m.dv.WaitingG {
+			m.dv.WaitingG = false
+			if m.dv.Tree.Focused {
+				m.dv.Tree.MoveCursorBy(-2 - len(m.dv.Tree.Entries))
 			} else {
-				m.vp.GotoTop()
-				if m.currentFileIdx >= 0 && m.hasDiffLines() {
+				m.dv.VP.GotoTop()
+				if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
 					m.syncDiffCursorToViewport()
 				}
 			}
 			return m, nil, true
 		}
-		m.waitingG = true
+		m.dv.WaitingG = true
 		return m, nil, true
 	default:
-		m.waitingG = false
+		m.dv.WaitingG = false
 	}
 	return m, nil, false
 }
@@ -1015,23 +952,23 @@ func (m Model) KeyBindings() []uictx.KeyBinding {
 }
 
 func (m Model) StatusHints() (left, right []string) {
-	if m.composing {
+	if m.dv.Composing {
 		left = append(left, styles.StatusBarKey.Render("esc")+" "+styles.StatusBarHint.Render("cancel"))
 		right = append(right, styles.StatusBarKey.Render("enter")+" "+styles.StatusBarHint.Render("submit"))
 		return
 	}
-	if m.treeFocused {
+	if m.dv.Tree.Focused {
 		left = append(left, styles.StatusBarKey.Render("f")+" "+styles.StatusBarHint.Render("unfocus tree"))
 	} else {
 		left = append(left, styles.StatusBarKey.Render("f")+" "+styles.StatusBarHint.Render("focus tree"))
 	}
 	left = append(left, styles.StatusBarKey.Render("h/l")+" "+styles.StatusBarHint.Render("panes"))
 	left = append(left, styles.StatusBarKey.Render("ctrl+j/k")+" "+styles.StatusBarHint.Render("files"))
-	if !m.treeFocused && m.currentFileIdx >= 0 {
+	if !m.dv.Tree.Focused && m.dv.CurrentFileIdx >= 0 {
 		left = append(left, styles.StatusBarKey.Render("J/K")+" "+styles.StatusBarHint.Render("select range"))
-		if m.threadCursor > 0 {
+		if m.dv.ThreadCursor > 0 {
 			count := m.threadCommentCount()
-			left = append(left, styles.StatusBarHint.Render(fmt.Sprintf("comment %d/%d", m.threadCursor, count)))
+			left = append(left, styles.StatusBarHint.Render(fmt.Sprintf("comment %d/%d", m.dv.ThreadCursor, count)))
 			left = append(left, styles.StatusBarKey.Render("r")+" "+styles.StatusBarHint.Render("reply"))
 			left = append(left, styles.StatusBarKey.Render("x")+" "+styles.StatusBarHint.Render("resolve"))
 		} else if m.cursorHasThread() {
@@ -1059,167 +996,72 @@ func (m Model) cursorHasThread() bool {
 // --- View ---
 
 func (m Model) View() string {
-	if !m.vpReady {
+	if !m.dv.VPReady {
 		return ""
 	}
 
-	rightView := m.vp.View()
-	if m.currentFileIdx >= 0 {
-		rightView = m.overlayDiffCursor(rightView)
+	rightView := m.dv.VP.View()
+	if m.dv.CurrentFileIdx >= 0 {
+		rightView = m.dv.OverlayDiffCursor(rightView)
 	}
 
 	return m.renderLayout(rightView)
 }
 
 func (m Model) renderLayout(rightView string) string {
-	treeW := m.treeWidth
-	innerTreeW := treeW - 2
-	innerTreeH := m.height - 2
-
-	bc := m.borderStyle()
-	var treeBorderStyle lipgloss.Style
-	if m.treeFocused {
-		treeBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Yellow)
-	} else {
-		treeBorderStyle = bc
-	}
-
-	// Tree border.
-	titleStr := " " + lipgloss.NewStyle().Bold(true).Render("Files") + " "
-	titleW := lipgloss.Width(titleStr)
-	fillW := treeW - 3 - titleW
-	if fillW < 0 {
-		fillW = 0
-	}
-	topBorder := treeBorderStyle.Render("╭─") + titleStr + treeBorderStyle.Render(strings.Repeat("─", fillW)+"╮")
-	bw := treeW - 2
-	if bw < 0 {
-		bw = 0
-	}
-	bottomBorder := treeBorderStyle.Render("╰" + strings.Repeat("─", bw) + "╯")
-	sideBorderL := treeBorderStyle.Render("│")
-	sideBorderR := treeBorderStyle.Render("│")
-
-	treeContentLines := components.RenderFileTree(m.treeEntries, m.files, m.treeCursor, m.currentFileIdx, innerTreeW, innerTreeH)
-	rightLines := strings.Split(rightView, "\n")
-
-	// Right panel border.
-	rightW := m.rightPanelWidth()
-	innerRightW := rightW - 2
-	var rightBorderStyle lipgloss.Style
-	if !m.treeFocused {
-		rightBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Yellow)
-	} else {
-		rightBorderStyle = bc
-	}
-
-	// Right panel title.
 	var rightTitle string
-	if m.currentFileIdx >= 0 && m.currentFileIdx < len(m.files) {
-		rightTitle = " " + lipgloss.NewStyle().Bold(true).Render(m.files[m.currentFileIdx].Filename) + " "
+	if m.dv.CurrentFileIdx >= 0 && m.dv.CurrentFileIdx < len(m.dv.Files) {
+		rightTitle = m.dv.Files[m.dv.CurrentFileIdx].Filename
 	} else {
-		rightTitle = " " + lipgloss.NewStyle().Bold(true).Render("Overview") + " "
+		rightTitle = "Overview"
 	}
-	rtW := lipgloss.Width(rightTitle)
-	rtFill := rightW - 3 - rtW
-	if rtFill < 0 {
-		rtFill = 0
-	}
-	rightTop := rightBorderStyle.Render("╭─") + rightTitle + rightBorderStyle.Render(strings.Repeat("─", rtFill)+"╮")
-	rbw := rightW - 2
-	if rbw < 0 {
-		rbw = 0
-	}
-	rightBottom := rightBorderStyle.Render("╰" + strings.Repeat("─", rbw) + "╯")
-	rightSideL := rightBorderStyle.Render("│")
-	rightSideR := rightBorderStyle.Render("│")
-
-	var b strings.Builder
-	for i := 0; i < m.height; i++ {
-		var treeLine string
-		if i == 0 {
-			treeLine = topBorder
-		} else if i == m.height-1 {
-			treeLine = bottomBorder
-		} else {
-			tIdx := i - 1
-			cl := ""
-			if tIdx < len(treeContentLines) {
-				cl = treeContentLines[tIdx]
-			}
-			treeLine = sideBorderL + cl + sideBorderR
-		}
-
-		var rightLine string
-		if i == 0 {
-			rightLine = rightTop
-		} else if i == m.height-1 {
-			rightLine = rightBottom
-		} else {
-			rIdx := i - 1
-			rl := ""
-			if rIdx < len(rightLines) {
-				rl = rightLines[rIdx]
-			}
-			rlW := lipgloss.Width(rl)
-			if rlW < innerRightW {
-				rl += strings.Repeat(" ", innerRightW-rlW)
-			}
-			rightLine = rightSideL + rl + rightSideR
-		}
-
-		b.WriteString(treeLine + rightLine)
-		if i < m.height-1 {
-			b.WriteString("\n")
-		}
-	}
-	return b.String()
+	return m.dv.RenderLayout(rightView, rightTitle)
 }
 
 // --- Content building ---
 
 func (m *Model) rebuildContent() {
-	innerW := m.rightPanelInnerWidth()
-	innerH := m.height - 2
+	innerW := m.dv.RightPanelInnerWidth()
+	innerH := m.dv.Height - 2
 
-	if !m.vpReady {
-		m.vp = viewport.New()
-		m.vpReady = true
+	if !m.dv.VPReady {
+		m.dv.VP = viewport.New()
+		m.dv.VPReady = true
 	}
-	m.vp.SetWidth(innerW)
-	m.vp.SetHeight(innerH)
+	m.dv.VP.SetWidth(innerW)
+	m.dv.VP.SetHeight(innerH)
 
 	var newContent string
-	if m.currentFileIdx == -1 {
+	if m.dv.CurrentFileIdx == -1 {
 		newContent = m.buildOverviewContent(innerW)
 	} else {
 		newContent = m.buildFileContent(innerW)
 	}
-	m.vp.SetContent(newContent)
+	m.dv.VP.SetContent(newContent)
 }
 
 // rebuildContentIfChanged only updates the viewport if the content actually changed.
 // Use this for paths where the content might not have changed (timer ticks, etc.)
 func (m *Model) rebuildContentIfChanged() {
-	innerW := m.rightPanelInnerWidth()
-	innerH := m.height - 2
+	innerW := m.dv.RightPanelInnerWidth()
+	innerH := m.dv.Height - 2
 
-	if !m.vpReady {
-		m.vp = viewport.New()
-		m.vpReady = true
+	if !m.dv.VPReady {
+		m.dv.VP = viewport.New()
+		m.dv.VPReady = true
 	}
-	m.vp.SetWidth(innerW)
-	m.vp.SetHeight(innerH)
+	m.dv.VP.SetWidth(innerW)
+	m.dv.VP.SetHeight(innerH)
 
 	var newContent string
-	if m.currentFileIdx == -1 {
+	if m.dv.CurrentFileIdx == -1 {
 		newContent = m.buildOverviewContent(innerW)
 	} else {
 		newContent = m.buildFileContent(innerW)
 	}
-	if newContent != m.lastContent {
-		m.lastContent = newContent
-		m.vp.SetContent(newContent)
+	if newContent != m.dv.LastContent {
+		m.dv.LastContent = newContent
+		m.dv.VP.SetContent(newContent)
 	}
 }
 
@@ -1231,8 +1073,8 @@ func (m Model) buildOverviewContent(w int) string {
 	modeStr := dimStyle.Render("(" + m.mode.String() + ")")
 	content.WriteString("\n  " + branchStr + " " + modeStr + "\n")
 
-	if len(m.files) == 0 {
-		if m.filesListLoaded {
+	if len(m.dv.Files) == 0 {
+		if m.dv.FilesListLoaded {
 			content.WriteString("\n  " + dimStyle.Render("No changes") + "\n")
 		} else {
 			content.WriteString("\n  " + dimStyle.Render("Loading...") + "\n")
@@ -1241,8 +1083,8 @@ func (m Model) buildOverviewContent(w int) string {
 	}
 
 	// Stats summary.
-	adds, dels := git.FilesAddedDeletedStats(m.files)
-	statsStr := fmt.Sprintf("%d files changed", len(m.files))
+	adds, dels := git.FilesAddedDeletedStats(m.dv.Files)
+	statsStr := fmt.Sprintf("%d files changed", len(m.dv.Files))
 	if adds > 0 {
 		statsStr += fmt.Sprintf(", %d insertions(+)", adds)
 	}
@@ -1253,7 +1095,7 @@ func (m Model) buildOverviewContent(w int) string {
 
 	// File list.
 	content.WriteString("\n")
-	for _, f := range m.files {
+	for _, f := range m.dv.Files {
 		icon := "≈"
 		switch f.Status {
 		case "added":
@@ -1275,20 +1117,26 @@ func (m Model) buildOverviewContent(w int) string {
 }
 
 func (m *Model) buildFileContent(w int) string {
-	idx := m.currentFileIdx
-	if idx < 0 || idx >= len(m.files) {
+	idx := m.dv.CurrentFileIdx
+	if idx < 0 || idx >= len(m.dv.Files) {
 		return ""
 	}
 
+	// Use virtualized rendering if layout is available.
+	if idx < len(m.fileLayouts) && idx < len(m.dv.HighlightedFiles) &&
+		m.fileLayouts[idx].TotalRenderedLines > 0 && m.dv.HighlightedFiles[idx].File.Filename != "" {
+		return m.buildVirtualFileContent(idx, w)
+	}
+
+	// Fallback: full render or skeleton.
 	var content strings.Builder
-	if m.renderedFiles[idx] != "" {
-		rendered := m.renderedFiles[idx]
-		if m.composing && m.hasDiffLines() {
+	if m.dv.RenderedFiles[idx] != "" {
+		rendered := m.dv.RenderedFiles[idx]
+		if m.dv.Composing && m.dv.HasDiffLines() {
 			rendered = m.insertCommentBox(rendered, idx)
 		}
 		content.WriteString(rendered)
 	} else {
-		// Skeleton.
 		for i := 0; i < 20; i++ {
 			gutter := dimStyle.Render(strings.Repeat("─", components.TotalGutterWidth(components.DefaultGutterColWidth)))
 			lineW := 15 + (i*7)%25
@@ -1299,14 +1147,111 @@ func (m *Model) buildFileContent(w int) string {
 			content.WriteString(gutter + " " + code + "\n")
 		}
 	}
-	content.WriteString("\n" + strings.Repeat("\n", m.height/2))
+	content.WriteString("\n" + strings.Repeat("\n", m.dv.Height/2))
 	return content.String()
+}
+
+func (m *Model) buildVirtualFileContent(idx, w int) string {
+	// Use cached rendered content. Recomputed by formatFile on comment/width changes.
+	rendered := m.dv.RenderedFiles[idx]
+	if rendered == "" {
+		// Not yet rendered — render now and cache.
+		m.renderAndCacheFile(idx, w)
+		rendered = m.dv.RenderedFiles[idx]
+	}
+
+	if m.dv.Composing && m.dv.HasDiffLines() {
+		rendered = m.insertCommentBox(rendered, idx)
+	}
+
+	return rendered + "\n" + strings.Repeat("\n", m.dv.Height/2)
+}
+
+// spliceThreadForComment re-renders a single comment thread and splices it
+// into the cached render. O(thread) instead of O(n) for the whole file.
+func (m *Model) spliceThreadForComment(fileIdx int, commentID string) {
+	if fileIdx < 0 || fileIdx >= len(m.fileRenderCache) || m.fileRenderCache[fileIdx] == nil {
+		// No cache — fall back to full render.
+		m.formatFile(fileIdx)
+		return
+	}
+	rc := m.fileRenderCache[fileIdx]
+	if len(rc.ThreadRanges) == 0 {
+		m.formatFile(fileIdx)
+		return
+	}
+
+	// Find which thread this comment belongs to.
+	// The pending copilot comment is a reply, so find the thread by its anchor line.
+	info, ok := m.dv.CopilotPending[commentID]
+	if !ok {
+		m.formatFile(fileIdx)
+		return
+	}
+	threadIdx := -1
+	for i, tr := range rc.ThreadRanges {
+		if tr.Side == info.Side && tr.Line == info.Line {
+			threadIdx = i
+			break
+		}
+	}
+	if threadIdx < 0 {
+		// Thread not in cache (new thread since last full render) — full render.
+		m.formatFile(fileIdx)
+		return
+	}
+
+	// Get the diff line type for this thread's anchor.
+	diffLineIdx := rc.ThreadRanges[threadIdx].DiffLineIdx
+	lt := components.LineAdd
+	if diffLineIdx < len(m.dv.FileDiffs[fileIdx]) {
+		lt = m.dv.FileDiffs[fileIdx][diffLineIdx].Type
+	}
+
+	// Gather thread comments for the affected line.
+	fileComments := m.commentsForFile(fileIdx)
+	threadComments := components.CommentsForThread(fileComments, info.Side, info.Line)
+
+	gutterW := components.TotalGutterWidth(components.GutterColWidth(m.dv.FileDiffs[fileIdx]))
+	newContent := components.RenderSingleThread(threadComments, m.dv.ContentWidth(), lt, m.ctx.DiffColors, false, 0, func(body string, width int, bg string) string {
+		return renderMarkdownBody(body, width, bg)
+	}, gutterW)
+
+	components.SpliceThread(rc, threadIdx, newContent)
+	m.dv.RenderedFiles[fileIdx] = rc.Content
+	if fileIdx < len(m.dv.FileDiffOffsets) {
+		m.dv.FileDiffOffsets[fileIdx] = rc.DiffLineOffsets
+	}
+}
+
+// renderAndCacheFile runs FormatDiffFile and caches the result.
+func (m *Model) renderAndCacheFile(idx, w int) {
+	hl := m.dv.HighlightedFiles[idx]
+	colors := m.ctx.DiffColors
+	fileComments := m.commentsForFile(idx)
+
+	var opts components.DiffFormatOptions
+	opts.RenderBody = func(body string, width int, bg string) string {
+		return renderMarkdownBody(body, width, bg)
+	}
+
+	result := components.FormatDiffFile(hl, w, colors, fileComments, opts)
+	m.dv.RenderedFiles[idx] = result.Content
+	if idx < len(m.dv.FileDiffOffsets) {
+		m.dv.FileDiffOffsets[idx] = result.DiffLineOffsets
+	}
+	if idx < len(m.dv.FileCommentPositions) {
+		m.dv.FileCommentPositions[idx] = result.CommentPositions
+	}
+	if idx < len(m.fileRenderCache) {
+		m.fileRenderCache[idx] = &result
+	}
 }
 
 // --- File rendering pipeline ---
 
 func (m Model) highlightFileCmd(index int) tea.Cmd {
-	f := m.files[index]
+	f := m.dv.Files[index]
 	repoRoot := m.repoRoot
 	chromaStyle := m.ctx.DiffColors.ChromaStyle
 
@@ -1323,66 +1268,28 @@ func (m Model) highlightFileCmd(index int) tea.Cmd {
 }
 
 func (m *Model) formatFile(index int) {
-	if index >= len(m.highlightedFiles) {
+	if index >= len(m.dv.HighlightedFiles) {
 		return
 	}
-	hl := m.highlightedFiles[index]
-	width := m.contentWidth()
-	colors := m.ctx.DiffColors
-	fileComments := m.commentsForFile(index)
-
-	// Highlight the comment thread under the cursor.
-	var opts components.DiffFormatOptions
-	if index == m.currentFileIdx && m.hasDiffLines() &&
-		m.diffCursor < len(m.fileDiffs[index]) {
-		dl := m.fileDiffs[index][m.diffCursor]
-		if dl.Type == components.LineDel {
-			opts.HighlightThreadLine = dl.OldLineNo
-			opts.HighlightThreadSide = "LEFT"
-		} else if dl.Type != components.LineHunk {
-			opts.HighlightThreadLine = dl.NewLineNo
-			opts.HighlightThreadSide = "RIGHT"
-		}
-		// Only highlight when inside a thread (threadCursor > 0).
-		// threadCursor=0 means cursor is on the diff line, no comment highlighted.
-		if m.threadCursor > 0 {
-			opts.HighlightCommentIndex = m.threadCursor
-		} else {
-			// Not in thread mode — don't highlight any comments.
-			opts.HighlightThreadLine = 0
-			opts.HighlightThreadSide = ""
-		}
-	}
-	// Render copilot bodies as markdown with the correct diff background.
-	opts.RenderBody = func(body string, width int, bg string) string {
-		return renderMarkdownBody(body, width, bg)
-	}
-
-	result := components.FormatDiffFile(hl, width, colors, fileComments, opts)
-	m.renderedFiles[index] = result.Content
-	if index < len(m.fileDiffOffsets) {
-		m.fileDiffOffsets[index] = result.DiffLineOffsets
-	}
-	if index < len(m.fileCommentPositions) {
-		m.fileCommentPositions[index] = result.CommentPositions
-	}
+	// Re-render and cache.
+	m.renderAndCacheFile(index, m.dv.ContentWidth())
 }
 
 func (m Model) commentsForFile(fileIdx int) []github.ReviewComment {
-	if m.commentStore == nil || fileIdx < 0 || fileIdx >= len(m.files) {
+	if m.commentStore == nil || fileIdx < 0 || fileIdx >= len(m.dv.Files) {
 		return nil
 	}
-	filename := m.files[fileIdx].Filename
+	filename := m.dv.Files[fileIdx].Filename
 	fileComments := m.commentStore.ForFile(filename)
 
 	// Wrap width for comment bodies inside the thread box.
 	var gutterW int
-	if fileIdx < len(m.fileDiffs) {
-		gutterW = components.TotalGutterWidth(components.GutterColWidth(m.fileDiffs[fileIdx]))
+	if fileIdx < len(m.dv.FileDiffs) {
+		gutterW = components.TotalGutterWidth(components.GutterColWidth(m.dv.FileDiffs[fileIdx]))
 	} else {
 		gutterW = components.TotalGutterWidth(components.DefaultGutterColWidth)
 	}
-	wrapW := m.contentWidth() - gutterW - 4 // gutter + "│ " + " │"
+	wrapW := m.dv.ContentWidth() - gutterW - 4 // gutter + "│ " + " │"
 	if wrapW < 20 {
 		wrapW = 20
 	}
@@ -1390,31 +1297,8 @@ func (m Model) commentsForFile(fileIdx int) []github.ReviewComment {
 	// Don't pre-render markdown here — it's done in commentsForFileWithBg
 	// at render time when we know the diff line's background color.
 
-	// Add pending copilot reply as a temporary comment so it renders inline.
-	if m.copilotPendingFor != "" && m.copilotPendingPath == filename {
-		dots := strings.Repeat(".", m.copilotDots+1)
-		body := m.copilotReplyBuf[m.copilotPendingFor]
-		if body == "" {
-			body = "Thinking" + dots
-		} else {
-			body = body + dots
-		}
-		line := m.copilotPendingLine
-		replyToInt := comments.IDToInt(m.copilotPendingFor)
-		pending := github.ReviewComment{
-			ID:           0,
-			Body:         body,
-			Path:         filename,
-			Line:         &line,
-			OriginalLine: &line,
-			Side:         m.copilotPendingSide,
-			InReplyToID:  &replyToInt,
-			User:         github.User{Login: "copilot"},
-			CreatedAt:    time.Now(),
-			UpdatedAt:    time.Now(),
-		}
-		fileComments = append(fileComments, pending)
-	}
+	// Add pending copilot replies as temporary comments so they render inline.
+	fileComments = m.dv.AppendCopilotPending(filename, fileComments)
 
 	return fileComments
 }
@@ -1527,126 +1411,48 @@ func replaceMarkdownPair(s, delim, open, close string) string {
 	return s
 }
 
+// reformatAllFiles invalidates all file layouts so they get recomputed
+// on next access. Only the current file is reformatted immediately.
 func (m *Model) reformatAllFiles() {
-	for i := 0; i < len(m.files); i++ {
-		if i < len(m.highlightedFiles) && m.highlightedFiles[i].File.Filename != "" {
-			m.formatFile(i)
-		}
+	for i := range m.fileLayouts {
+		m.fileLayouts[i] = components.DiffLayout{}
+	}
+	if m.dv.CurrentFileIdx >= 0 {
+		m.formatFile(m.dv.CurrentFileIdx)
 	}
 }
 
-// --- Layout helpers ---
-
-func (m Model) rightPanelWidth() int {
-	return m.width - m.treeWidth
-}
-
-func (m Model) rightPanelInnerWidth() int {
-	return m.rightPanelWidth() - 2
-}
-
-func (m Model) contentWidth() int {
-	return m.rightPanelInnerWidth()
-}
-
-// viewportHeight returns the actual visible height of the viewport (inside borders).
-func (m Model) viewportHeight() int {
-	return m.height - 2
-}
-
-func (m Model) borderStyle() lipgloss.Style {
-	return lipgloss.NewStyle().Foreground(m.ctx.DiffColors.BorderColor)
-}
-
-// --- Tree navigation ---
-
-func (m *Model) moveTreeSelection(delta int) {
-	totalEntries := 2 + len(m.treeEntries)
-	newCursor := m.treeCursor + delta
-
-	for newCursor >= 0 && newCursor < totalEntries {
-		if newCursor == 0 {
-			break
-		}
-		if newCursor == 1 {
-			newCursor += delta
-			continue
-		}
-		eIdx := newCursor - 2
-		if eIdx >= 0 && eIdx < len(m.treeEntries) && !m.treeEntries[eIdx].IsDir {
-			break
-		}
-		newCursor += delta
-	}
-
-	if newCursor < 0 || newCursor >= totalEntries {
-		return
-	}
-	m.treeCursor = newCursor
-	m.selectTreeEntry()
-}
-
-func (m *Model) moveTreeCursorBy(delta int) {
-	totalEntries := 2 + len(m.treeEntries)
-	newCursor := m.treeCursor + delta
-
-	if newCursor < 0 {
-		newCursor = 0
-	}
-	if newCursor >= totalEntries {
-		newCursor = totalEntries - 1
-	}
-
-	dir := 1
-	if delta < 0 {
-		dir = -1
-	}
-	for newCursor >= 0 && newCursor < totalEntries {
-		if newCursor == 0 {
-			break
-		}
-		if newCursor == 1 {
-			newCursor += dir
-			continue
-		}
-		eIdx := newCursor - 2
-		if eIdx >= 0 && eIdx < len(m.treeEntries) && !m.treeEntries[eIdx].IsDir {
-			break
-		}
-		newCursor += dir
-	}
-	if newCursor < 0 || newCursor >= totalEntries {
-		return
-	}
-	m.treeCursor = newCursor
-}
+// needsRenderBufferUpdate returns true if the viewport scrolled outside
+// the pre-rendered buffer and needs a fresh render.
 
 func (m *Model) selectTreeEntry() {
-	m.selectionAnchor = -1
+	m.dv.SelectionAnchor = -1
 	// Save cursor position for the file we're leaving.
-	if m.currentFileIdx >= 0 && m.currentFileIdx < len(m.files) {
-		m.fileCursors[m.files[m.currentFileIdx].Filename] = m.diffCursor
+	if m.dv.CurrentFileIdx >= 0 && m.dv.CurrentFileIdx < len(m.dv.Files) {
+		m.fileCursors[m.dv.Files[m.dv.CurrentFileIdx].Filename] = m.dv.DiffCursor
 	}
-	m.threadCursor = 0
-	if m.treeCursor == 0 {
-		m.currentFileIdx = -1
+	m.dv.ThreadCursor = 0
+	if m.dv.Tree.Cursor == 0 {
+		m.dv.CurrentFileIdx = -1
 		m.rebuildContent()
-		m.vp.GotoTop()
+		m.dv.VP.GotoTop()
 		m.saveViewState()
 		return
 	}
-	eIdx := m.treeCursor - 2
-	if eIdx >= 0 && eIdx < len(m.treeEntries) {
-		e := m.treeEntries[eIdx]
-		if !e.IsDir && e.FileIndex >= 0 && e.FileIndex < len(m.files) && e.FileIndex < len(m.fileDiffs) {
-			m.currentFileIdx = e.FileIndex
-			// Restore cursor if we've been here before, otherwise start at top.
-			if saved, ok := m.fileCursors[m.files[e.FileIndex].Filename]; ok && saved < len(m.fileDiffs[e.FileIndex]) {
-				m.diffCursor = saved
+	eIdx := m.dv.Tree.Cursor - 2
+	if eIdx >= 0 && eIdx < len(m.dv.Tree.Entries) {
+		e := m.dv.Tree.Entries[eIdx]
+		if !e.IsDir && e.FileIndex >= 0 && e.FileIndex < len(m.dv.Files) && e.FileIndex < len(m.dv.FileDiffs) {
+			m.dv.CurrentFileIdx = e.FileIndex
+			if saved, ok := m.fileCursors[m.dv.Files[e.FileIndex].Filename]; ok && saved < len(m.dv.FileDiffs[e.FileIndex]) {
+				m.dv.DiffCursor = saved
 			} else {
-				m.diffCursor = m.firstNonHunkLine(e.FileIndex)
+				m.dv.DiffCursor = m.dv.FirstNonHunkLine(e.FileIndex)
 			}
-			m.formatFile(e.FileIndex)
+			// Use cached render if available (instant). Otherwise render now.
+			if m.dv.RenderedFiles[e.FileIndex] == "" {
+				m.formatFile(e.FileIndex)
+			}
 			m.rebuildContent()
 			m.scrollToDiffCursor()
 			m.saveViewState()
@@ -1654,34 +1460,15 @@ func (m *Model) selectTreeEntry() {
 	}
 }
 
-func (m Model) treeEntryIndexAtY(y int) (int, bool) {
-	// y == 0 is the top border, so content starts at y == 1.
-	idx := y - 1 // into content lines
-	if idx < 0 {
-		return 0, false
-	}
-	totalEntries := 2 + len(m.treeEntries)
-	if idx >= totalEntries {
-		return 0, false
-	}
-	return idx, true
-}
-
 // --- Diff cursor ---
 
-func (m Model) hasDiffLines() bool {
-	idx := m.currentFileIdx
-	return idx >= 0 && idx < len(m.fileDiffs) && len(m.fileDiffs[idx]) > 0
-}
-
 func (m *Model) moveDiffCursor(delta int) {
-	if m.currentFileIdx < 0 || m.currentFileIdx >= len(m.fileDiffs) {
+	if m.dv.CurrentFileIdx < 0 || m.dv.CurrentFileIdx >= len(m.dv.FileDiffs) {
 		return
 	}
-	m.threadCursor = 0
-	lines := m.fileDiffs[m.currentFileIdx]
-	oldPos := m.diffCursor
-	newPos := m.diffCursor + delta
+	m.dv.ThreadCursor = 0
+	lines := m.dv.FileDiffs[m.dv.CurrentFileIdx]
+	newPos := m.dv.DiffCursor + delta
 
 	for newPos >= 0 && newPos < len(lines) && lines[newPos].Type == components.LineHunk {
 		newPos += delta
@@ -1690,27 +1477,21 @@ func (m *Model) moveDiffCursor(delta int) {
 	if newPos < 0 || newPos >= len(lines) {
 		return
 	}
-	m.diffCursor = newPos
-
-	// Only re-format if moving to/from a line with comments (for highlight update).
-	if m.lineHasComments(oldPos) || m.lineHasComments(newPos) {
-		m.formatFile(m.currentFileIdx)
-		m.rebuildContent()
-	}
+	m.dv.DiffCursor = newPos
 	m.scrollToDiffCursor()
 }
 
 // lineHasComments returns true if the diff line at the given index has a comment thread.
 func (m Model) lineHasComments(diffIdx int) bool {
-	idx := m.currentFileIdx
-	if idx < 0 || idx >= len(m.fileDiffs) || diffIdx < 0 || diffIdx >= len(m.fileDiffs[idx]) {
+	idx := m.dv.CurrentFileIdx
+	if idx < 0 || idx >= len(m.dv.FileDiffs) || diffIdx < 0 || diffIdx >= len(m.dv.FileDiffs[idx]) {
 		return false
 	}
-	dl := m.fileDiffs[idx][diffIdx]
+	dl := m.dv.FileDiffs[idx][diffIdx]
 	if dl.Type == components.LineHunk {
 		return false
 	}
-	path := m.files[idx].Filename
+	path := m.dv.Files[idx].Filename
 	var line int
 	var side string
 	if dl.Type == components.LineDel {
@@ -1724,12 +1505,12 @@ func (m Model) lineHasComments(diffIdx int) bool {
 }
 
 func (m *Model) moveDiffCursorBy(delta int) {
-	if m.currentFileIdx < 0 || m.currentFileIdx >= len(m.fileDiffs) {
+	if m.dv.CurrentFileIdx < 0 || m.dv.CurrentFileIdx >= len(m.dv.FileDiffs) {
 		return
 	}
-	m.threadCursor = 0
-	lines := m.fileDiffs[m.currentFileIdx]
-	newPos := m.diffCursor + delta
+	m.dv.ThreadCursor = 0
+	lines := m.dv.FileDiffs[m.dv.CurrentFileIdx]
+	newPos := m.dv.DiffCursor + delta
 
 	if newPos < 0 {
 		newPos = 0
@@ -1765,25 +1546,20 @@ func (m *Model) moveDiffCursorBy(delta int) {
 		}
 	}
 
-	oldPos := m.diffCursor
-	m.diffCursor = newPos
-	if m.lineHasComments(oldPos) || m.lineHasComments(newPos) {
-		m.formatFile(m.currentFileIdx)
-		m.rebuildContent()
-	}
+	m.dv.DiffCursor = newPos
 	m.scrollToDiffCursor()
 }
 
 // goToSourceLine jumps the diff cursor to the line closest to the given
 // source line number (new side preferred, falls back to old side).
 func (m *Model) goToSourceLine(lineNo int) {
-	idx := m.currentFileIdx
-	if idx < 0 || idx >= len(m.fileDiffs) {
+	idx := m.dv.CurrentFileIdx
+	if idx < 0 || idx >= len(m.dv.FileDiffs) {
 		return
 	}
 	best := m.findDiffLineBySourceLine(idx, lineNo, "RIGHT")
-	m.diffCursor = best
-	m.selectionAnchor = -1
+	m.dv.DiffCursor = best
+	m.dv.SelectionAnchor = -1
 	m.formatFile(idx)
 	m.rebuildContent()
 	m.scrollToDiffCursor()
@@ -1796,13 +1572,13 @@ func (m Model) threadCommentCount() int {
 	if !ok {
 		return 0
 	}
-	idx := m.currentFileIdx
-	if idx < 0 || idx >= len(m.fileCommentPositions) {
+	idx := m.dv.CurrentFileIdx
+	if idx < 0 || idx >= len(m.dv.FileCommentPositions) {
 		return 0
 	}
 	// Count from the rendered comment positions — this is the source of truth.
 	count := 0
-	for _, cp := range m.fileCommentPositions[idx] {
+	for _, cp := range m.dv.FileCommentPositions[idx] {
 		if cp.Line == line && cp.Side == side {
 			count++
 		}
@@ -1814,8 +1590,8 @@ func (m Model) threadCommentCount() int {
 // scrollToThreadCursor scrolls the viewport to show the selected comment
 // using the exact rendered positions tracked by CommentPositions.
 func (m *Model) scrollToThreadCursor() {
-	idx := m.currentFileIdx
-	if idx < 0 || idx >= len(m.fileCommentPositions) {
+	idx := m.dv.CurrentFileIdx
+	if idx < 0 || idx >= len(m.dv.FileCommentPositions) {
 		return
 	}
 
@@ -1826,8 +1602,8 @@ func (m *Model) scrollToThreadCursor() {
 	}
 
 	targetLine := -1
-	for _, cp := range m.fileCommentPositions[idx] {
-		if cp.Line == line && cp.Side == side && cp.Idx == m.threadCursor-1 {
+	for _, cp := range m.dv.FileCommentPositions[idx] {
+		if cp.Line == line && cp.Side == side && cp.Idx == m.dv.ThreadCursor-1 {
 			targetLine = cp.Offset
 			break
 		}
@@ -1837,8 +1613,8 @@ func (m *Model) scrollToThreadCursor() {
 		return
 	}
 
-	vpH := m.viewportHeight()
-	top := m.vp.YOffset()
+	vpH := m.dv.ViewportHeight()
+	top := m.dv.VP.YOffset()
 	bottom := top + vpH - 1
 
 	if targetLine < top+scrollMargin {
@@ -1846,17 +1622,17 @@ func (m *Model) scrollToThreadCursor() {
 		if target < 0 {
 			target = 0
 		}
-		m.vp.SetYOffset(target)
+		m.dv.VP.SetYOffset(target)
 	} else if targetLine > bottom-scrollMargin {
-		m.vp.SetYOffset(targetLine - vpH + scrollMargin + 1)
+		m.dv.VP.SetYOffset(targetLine - vpH + scrollMargin + 1)
 	}
 }
 
 // currentCommentRange returns the start and end rendered line offsets for
 // the currently selected comment (threadCursor). Returns (-1,-1) if unknown.
 func (m Model) currentCommentRange() (start, end int) {
-	idx := m.currentFileIdx
-	if idx < 0 || idx >= len(m.fileCommentPositions) {
+	idx := m.dv.CurrentFileIdx
+	if idx < 0 || idx >= len(m.dv.FileCommentPositions) {
 		return -1, -1
 	}
 	_, line, side, ok := m.cursorThreadInfo()
@@ -1866,13 +1642,13 @@ func (m Model) currentCommentRange() (start, end int) {
 
 	// Find all positions for this thread.
 	var threadPositions []components.CommentPosition
-	for _, cp := range m.fileCommentPositions[idx] {
+	for _, cp := range m.dv.FileCommentPositions[idx] {
 		if cp.Line == line && cp.Side == side {
 			threadPositions = append(threadPositions, cp)
 		}
 	}
 
-	ci := m.threadCursor - 1
+	ci := m.dv.ThreadCursor - 1
 	if ci < 0 || ci >= len(threadPositions) {
 		return -1, -1
 	}
@@ -1884,8 +1660,8 @@ func (m Model) currentCommentRange() (start, end int) {
 	} else {
 		// Last comment in thread — find where the thread ends.
 		// Use the next diff line's offset as the boundary.
-		if m.diffCursor+1 < len(m.fileDiffOffsets[idx]) {
-			end = m.fileDiffOffsets[idx][m.diffCursor+1] - 1
+		if m.dv.DiffCursor+1 < len(m.dv.FileDiffOffsets[idx]) {
+			end = m.dv.FileDiffOffsets[idx][m.dv.DiffCursor+1] - 1
 		} else {
 			// Last diff line — estimate generously.
 			end = start + 50
@@ -1901,8 +1677,8 @@ func (m Model) commentExtendsBelow() bool {
 	if end < 0 {
 		return false
 	}
-	vpH := m.viewportHeight()
-	bottom := m.vp.YOffset() + vpH - 1
+	vpH := m.dv.ViewportHeight()
+	bottom := m.dv.VP.YOffset() + vpH - 1
 	return end > bottom
 }
 
@@ -1913,7 +1689,7 @@ func (m Model) commentExtendsAbove() bool {
 	if start < 0 {
 		return false
 	}
-	return start < m.vp.YOffset()
+	return start < m.dv.VP.YOffset()
 }
 
 // scrollToThreadCursorBottom scrolls so the bottom of the comment is visible
@@ -1924,14 +1700,14 @@ func (m *Model) scrollToThreadCursorBottom() {
 		m.scrollToThreadCursor()
 		return
 	}
-	vpH := m.viewportHeight()
-	bottom := m.vp.YOffset() + vpH - 1
+	vpH := m.dv.ViewportHeight()
+	bottom := m.dv.VP.YOffset() + vpH - 1
 	if end > bottom {
-		m.vp.SetYOffset(end - vpH + scrollMargin + 1)
+		m.dv.VP.SetYOffset(end - vpH + scrollMargin + 1)
 	}
 	// Also make sure the header is visible if the comment fits.
 	start, _ := m.currentCommentRange()
-	if start >= 0 && start < m.vp.YOffset() {
+	if start >= 0 && start < m.dv.VP.YOffset() {
 		commentH := end - start + 1
 		if commentH <= vpH-scrollMargin*2 {
 			m.scrollToThreadCursor()
@@ -1942,42 +1718,33 @@ func (m *Model) scrollToThreadCursorBottom() {
 // scrollCommentBoxIntoView scrolls the viewport so the comment input box
 // (which is inserted after the cursor line) is fully visible.
 func (m *Model) scrollCommentBoxIntoView() {
-	idx := m.currentFileIdx
-	if idx < 0 || idx >= len(m.fileDiffOffsets) || m.diffCursor >= len(m.fileDiffOffsets[idx]) {
+	idx := m.dv.CurrentFileIdx
+	if idx < 0 || idx >= len(m.dv.FileDiffOffsets) || m.dv.DiffCursor >= len(m.dv.FileDiffOffsets[idx]) {
 		return
 	}
-	vpH := m.viewportHeight()
-	cursorLine := m.fileDiffOffsets[idx][m.diffCursor]
+	vpH := m.dv.ViewportHeight()
+	cursorLine := m.dv.FileDiffOffsets[idx][m.dv.DiffCursor]
 	// The comment box is ~8 lines (border + textarea + hints) inserted after the cursor line.
 	boxBottom := cursorLine + 10
-	bottom := m.vp.YOffset() + vpH - 1
+	bottom := m.dv.VP.YOffset() + vpH - 1
 	if boxBottom > bottom {
-		m.vp.SetYOffset(boxBottom - vpH + 1)
+		m.dv.VP.SetYOffset(boxBottom - vpH + 1)
 	}
-}
-
-func (m Model) firstNonHunkLine(fileIdx int) int {
-	for i, dl := range m.fileDiffs[fileIdx] {
-		if dl.Type != components.LineHunk {
-			return i
-		}
-	}
-	return 0
 }
 
 const scrollMargin = 5
 
 func (m *Model) scrollToDiffCursor() {
-	idx := m.currentFileIdx
-	if idx < 0 || idx >= len(m.fileDiffOffsets) {
+	idx := m.dv.CurrentFileIdx
+	if idx < 0 || idx >= len(m.dv.FileDiffOffsets) {
 		return
 	}
-	if m.diffCursor >= len(m.fileDiffOffsets[idx]) {
+	if m.dv.DiffCursor >= len(m.dv.FileDiffOffsets[idx]) {
 		return
 	}
-	vpH := m.viewportHeight()
-	absLine := m.fileDiffOffsets[idx][m.diffCursor]
-	top := m.vp.YOffset()
+	vpH := m.dv.ViewportHeight()
+	absLine := m.dv.FileDiffOffsets[idx][m.dv.DiffCursor]
+	top := m.dv.VP.YOffset()
 	bottom := top + vpH - 1
 
 	if absLine < top+scrollMargin {
@@ -1985,9 +1752,9 @@ func (m *Model) scrollToDiffCursor() {
 		if target < 0 {
 			target = 0
 		}
-		m.vp.SetYOffset(target)
+		m.dv.VP.SetYOffset(target)
 	} else if absLine > bottom-scrollMargin {
-		m.vp.SetYOffset(absLine - vpH + scrollMargin + 1)
+		m.dv.VP.SetYOffset(absLine - vpH + scrollMargin + 1)
 	}
 }
 
@@ -1995,29 +1762,51 @@ func (m *Model) scrollToDiffCursor() {
 // the diff cursor to the diff line at the same screen-relative position.
 // This keeps the cursor visually stable (vim ctrl+d/u behavior).
 func (m *Model) scrollAndSyncCursor(delta int) {
-	m.threadCursor = 0
-	idx := m.currentFileIdx
-	if idx < 0 || idx >= len(m.fileDiffOffsets) {
+	m.dv.ThreadCursor = 0
+	idx := m.dv.CurrentFileIdx
+	if idx < 0 || idx >= len(m.dv.FileDiffOffsets) {
 		return
 	}
 
+	prevOffset := m.dv.VP.YOffset()
+
 	// Remember cursor's screen-relative position.
 	cursorAbs := 0
-	if m.diffCursor < len(m.fileDiffOffsets[idx]) {
-		cursorAbs = m.fileDiffOffsets[idx][m.diffCursor]
+	if m.dv.DiffCursor < len(m.dv.FileDiffOffsets[idx]) {
+		cursorAbs = m.dv.FileDiffOffsets[idx][m.dv.DiffCursor]
 	}
-	relPos := cursorAbs - m.vp.YOffset()
+	relPos := cursorAbs - prevOffset
 
 	// Scroll viewport.
-	m.vp.SetYOffset(m.vp.YOffset() + delta)
+	m.dv.VP.SetYOffset(prevOffset + delta)
 
-	// Find the diff line closest to the same screen position.
-	targetAbs := m.vp.YOffset() + relPos
-	offsets := m.fileDiffOffsets[idx]
-	diffs := m.fileDiffs[idx]
+	// Skip if viewport didn't actually move.
+	if m.dv.VP.YOffset() == prevOffset {
+		return
+	}
+
+	// Binary search for the closest non-hunk diff line to the target position.
+	targetAbs := m.dv.VP.YOffset() + relPos
+	offsets := m.dv.FileDiffOffsets[idx]
+	diffs := m.dv.FileDiffs[idx]
+
+	// Binary search: find the first offset >= targetAbs.
+	lo, hi := 0, len(offsets)-1
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if offsets[mid] < targetAbs {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	// Check lo and neighbors for closest non-hunk line.
 	best := -1
 	bestDist := 0
-	for i := 0; i < len(offsets); i++ {
+	for _, i := range []int{lo - 1, lo, lo + 1} {
+		if i < 0 || i >= len(offsets) {
+			continue
+		}
 		if i < len(diffs) && diffs[i].Type == components.LineHunk {
 			continue
 		}
@@ -2031,31 +1820,34 @@ func (m *Model) scrollAndSyncCursor(delta int) {
 		}
 	}
 	if best >= 0 {
-		oldCursor := m.diffCursor
-		m.diffCursor = best
-		// Only reformat if cursor moved to/from a commented line.
-		if m.lineHasComments(oldCursor) || m.lineHasComments(best) {
-			m.formatFile(idx)
-			m.rebuildContent()
-		}
+		m.dv.DiffCursor = best
 	}
 }
 
-func (m *Model) syncDiffCursorToViewport() {
-	idx := m.currentFileIdx
-	if idx < 0 || idx >= len(m.fileDiffOffsets) || len(m.fileDiffOffsets[idx]) == 0 {
-		return
+// findClosestDiffLine binary-searches for the non-hunk diff line closest to targetOffset.
+func findClosestDiffLine(offsets []int, diffs []components.DiffLine, targetOffset int) int {
+	if len(offsets) == 0 {
+		return -1
 	}
-	center := m.vp.YOffset() + m.viewportHeight()/2
-	offsets := m.fileDiffOffsets[idx]
-	diffs := m.fileDiffs[idx]
+	lo, hi := 0, len(offsets)-1
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if offsets[mid] < targetOffset {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
 	best := -1
 	bestDist := 0
-	for i := 0; i < len(offsets); i++ {
+	for _, i := range []int{lo - 1, lo, lo + 1} {
+		if i < 0 || i >= len(offsets) {
+			continue
+		}
 		if i < len(diffs) && diffs[i].Type == components.LineHunk {
 			continue
 		}
-		dist := offsets[i] - center
+		dist := offsets[i] - targetOffset
 		if dist < 0 {
 			dist = -dist
 		}
@@ -2064,159 +1856,19 @@ func (m *Model) syncDiffCursorToViewport() {
 			bestDist = dist
 		}
 	}
+	return best
+}
+
+func (m *Model) syncDiffCursorToViewport() {
+	idx := m.dv.CurrentFileIdx
+	if idx < 0 || idx >= len(m.dv.FileDiffOffsets) || len(m.dv.FileDiffOffsets[idx]) == 0 {
+		return
+	}
+	target := m.dv.VP.YOffset() + m.dv.ViewportHeight()/2
+	best := findClosestDiffLine(m.dv.FileDiffOffsets[idx], m.dv.FileDiffs[idx], target)
 	if best >= 0 {
-		m.diffCursor = best
+		m.dv.DiffCursor = best
 	}
-}
-
-// --- Cursor overlay ---
-
-func (m Model) overlayDiffCursor(view string) string {
-	if !m.filesListLoaded || !m.hasDiffLines() {
-		return view
-	}
-
-	if m.selectionAnchor >= 0 && m.selectionAnchor != m.diffCursor {
-		return m.overlaySelectionRange(view)
-	}
-
-	vLine := m.cursorViewportLine()
-	if vLine < 0 {
-		return view
-	}
-	lines := strings.Split(view, "\n")
-	if vLine < len(lines) {
-		lines[vLine] = m.applyCursorHighlight(lines[vLine])
-	}
-	return strings.Join(lines, "\n")
-}
-
-func (m Model) cursorViewportLine() int {
-	fileIdx := m.currentFileIdx
-	if fileIdx < 0 || fileIdx >= len(m.fileDiffOffsets) {
-		return -1
-	}
-	if m.diffCursor >= len(m.fileDiffOffsets[fileIdx]) {
-		return -1
-	}
-	absLine := m.fileDiffOffsets[fileIdx][m.diffCursor]
-	rel := absLine - m.vp.YOffset()
-	if rel < 0 || rel >= m.viewportHeight() {
-		return -1
-	}
-	return rel
-}
-
-func (m Model) applyCursorHighlight(line string) string {
-	fileIdx := m.currentFileIdx
-	if fileIdx >= len(m.fileDiffs) || m.diffCursor >= len(m.fileDiffs[fileIdx]) {
-		return line
-	}
-	dl := m.fileDiffs[fileIdx][m.diffCursor]
-	if dl.Type == components.LineHunk {
-		return line
-	}
-
-	prefix, inner, suffix := splitDiffBorders(line)
-
-	inner = strings.Replace(inner, "\033[1m+\033[0m", "\033[1m>\033[0m", 1)
-	inner = strings.Replace(inner, "\033[1m-\033[0m", "\033[1m>\033[0m", 1)
-
-	colors := m.ctx.DiffColors
-	var selBg string
-	switch dl.Type {
-	case components.LineAdd:
-		selBg = colors.SelectedAddBg
-	case components.LineDel:
-		selBg = colors.SelectedDelBg
-	default:
-		selBg = colors.SelectedCtxBg
-	}
-
-	if selBg != "" {
-		if colors.AddBg != "" {
-			inner = strings.ReplaceAll(inner, colors.AddBg, selBg)
-		}
-		if colors.DelBg != "" {
-			inner = strings.ReplaceAll(inner, colors.DelBg, selBg)
-		}
-		inner = strings.ReplaceAll(inner, "\033[0m", "\033[0m"+selBg)
-		inner = strings.ReplaceAll(inner, "\033[m", "\033[m"+selBg)
-		inner = selBg + inner + "\033[0m"
-	}
-
-	return prefix + inner + suffix
-}
-
-func (m Model) overlaySelectionRange(view string) string {
-	fileIdx := m.currentFileIdx
-	if fileIdx < 0 || fileIdx >= len(m.fileDiffOffsets) {
-		return view
-	}
-
-	selStart, selEnd := m.selectionAnchor, m.diffCursor
-	if selStart > selEnd {
-		selStart, selEnd = selEnd, selStart
-	}
-
-	offsets := m.fileDiffOffsets[fileIdx]
-	diffs := m.fileDiffs[fileIdx]
-	vpTop := m.vp.YOffset()
-
-	lines := strings.Split(view, "\n")
-
-	for i := selStart; i <= selEnd; i++ {
-		if i >= len(offsets) || i >= len(diffs) {
-			continue
-		}
-		if diffs[i].Type == components.LineHunk {
-			continue
-		}
-		absLine := offsets[i]
-		rel := absLine - vpTop
-		if rel < 0 || rel >= len(lines) {
-			continue
-		}
-		lines[rel] = m.applySelectionHighlight(lines[rel], diffs[i])
-	}
-
-	return strings.Join(lines, "\n")
-}
-
-func (m Model) applySelectionHighlight(line string, dl components.DiffLine) string {
-	if dl.Type == components.LineHunk {
-		return line
-	}
-
-	prefix, inner, suffix := splitDiffBorders(line)
-
-	inner = strings.Replace(inner, "\033[1m+\033[0m", "\033[1m>\033[0m", 1)
-	inner = strings.Replace(inner, "\033[1m-\033[0m", "\033[1m>\033[0m", 1)
-
-	colors := m.ctx.DiffColors
-	var selBg string
-	switch dl.Type {
-	case components.LineAdd:
-		selBg = colors.SelectedAddBg
-	case components.LineDel:
-		selBg = colors.SelectedDelBg
-	default:
-		selBg = colors.SelectedCtxBg
-	}
-
-	if selBg != "" {
-		if colors.AddBg != "" {
-			inner = strings.ReplaceAll(inner, colors.AddBg, selBg)
-		}
-		if colors.DelBg != "" {
-			inner = strings.ReplaceAll(inner, colors.DelBg, selBg)
-		}
-		inner = strings.ReplaceAll(inner, "\033[0m", "\033[0m"+selBg)
-		inner = strings.ReplaceAll(inner, "\033[m", "\033[m"+selBg)
-		inner = selBg + inner + "\033[0m"
-	}
-
-	return prefix + inner + suffix
 }
 
 // --- Comment composition ---
@@ -2224,34 +1876,34 @@ func (m Model) applySelectionHighlight(line string, dl components.DiffLine) stri
 func (m Model) handleCommentKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 	switch msg.String() {
 	case "esc":
-		m.composing = false
-		m.selectionAnchor = -1
+		m.dv.Composing = false
+		m.dv.SelectionAnchor = -1
 		m.rebuildContent()
 		return m, nil, true
 	case "shift+enter":
 		// Insert newline.
-		m.commentInput.InsertString("\n")
+		m.dv.CommentInput.InsertString("\n")
 		m.rebuildContent()
 		return m, nil, true
 	case "enter":
-		body := strings.TrimSpace(m.commentInput.Value())
+		body := strings.TrimSpace(m.dv.CommentInput.Value())
 		if body == "" {
-			m.composing = false
-			m.selectionAnchor = -1
+			m.dv.Composing = false
+			m.dv.SelectionAnchor = -1
 			m.rebuildContent()
 			return m, nil, true
 		}
-		m.composing = false
+		m.dv.Composing = false
 
 		comment := comments.LocalComment{
 			ID:        uuid.New().String(),
 			Body:      body,
-			Path:      m.commentFile,
-			Line:      m.commentLine,
-			Side:      m.commentSide,
-			StartLine: m.commentStartLine,
-			StartSide: m.commentStartSide,
-			Author:    m.authorName(),
+			Path:      m.dv.CommentFile,
+			Line:      m.dv.CommentLine,
+			Side:      m.dv.CommentSide,
+			StartLine: m.dv.CommentStartLine,
+			StartSide: m.dv.CommentStartSide,
+			Author:    m.dv.AuthorName(),
 			CreatedAt: time.Now(),
 		}
 		if m.replyToID != "" {
@@ -2259,23 +1911,25 @@ func (m Model) handleCommentKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		}
 
 		m.commentStore.Add(comment)
-		m.selectionAnchor = -1
-		m.reformatAllFiles()
+		m.dv.SelectionAnchor = -1
+
+		// Set copilot pending state BEFORE rebuild so "Thinking..." shows immediately.
+		if m.dv.Copilot != nil {
+			m.dv.SetCopilotPending(comment.ID, comment.Path, comment.Line, comment.Side)
+			m.dv.CopilotDots = 0
+		}
+
+		m.formatFile(m.dv.CurrentFileIdx)
 		m.rebuildContent()
 
-		// Send to Copilot for AI review.
-		if m.copilot != nil {
-			m.copilotPendingFor = comment.ID
-			m.copilotPendingPath = comment.Path
-			m.copilotPendingLine = comment.Line
-			m.copilotPendingSide = comment.Side
-			m.copilotDots = 0
+		if m.dv.Copilot != nil {
+			// Gather copilot context before returning — these are cheap in-memory lookups.
 			diffHunk := m.getDiffHunkForComment(comment)
 			threadHistory := m.getThreadHistory(comment)
 			fileContent, _ := git.FileContent(m.repoRoot, comment.Path)
 			fullDiff := m.getFullFileDiff(comment.Path)
 			return m, tea.Batch(
-				m.copilot.SendComment(comment.ID, body, comment.Path, fileContent, fullDiff, diffHunk, threadHistory),
+				m.dv.Copilot.SendComment(comment.ID, body, comment.Path, fileContent, fullDiff, diffHunk, threadHistory),
 				tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg { return copilotTickMsg{} }),
 			), true
 		}
@@ -2284,31 +1938,31 @@ func (m Model) handleCommentKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 
 	// Delegate to textarea.
 	var cmd tea.Cmd
-	m.commentInput, cmd = m.commentInput.Update(msg)
+	m.dv.CommentInput, cmd = m.dv.CommentInput.Update(msg)
 	m.rebuildContent()
 	return m, cmd, true
 }
 
 func (m Model) openCommentInput() (Model, tea.Cmd, bool) {
-	idx := m.currentFileIdx
-	if idx < 0 || idx >= len(m.fileDiffs) || idx >= len(m.files) {
+	idx := m.dv.CurrentFileIdx
+	if idx < 0 || idx >= len(m.dv.FileDiffs) || idx >= len(m.dv.Files) {
 		return m, nil, false
 	}
-	lines := m.fileDiffs[idx]
-	if m.diffCursor >= len(lines) {
+	lines := m.dv.FileDiffs[idx]
+	if m.dv.DiffCursor >= len(lines) {
 		return m, nil, false
 	}
-	dl := lines[m.diffCursor]
+	dl := lines[m.dv.DiffCursor]
 	if dl.Type == components.LineHunk {
 		return m, nil, false
 	}
 
-	m.commentFile = m.files[idx].Filename
-	m.commentStartLine = 0
-	m.commentStartSide = ""
+	m.dv.CommentFile = m.dv.Files[idx].Filename
+	m.dv.CommentStartLine = 0
+	m.dv.CommentStartSide = ""
 
-	if m.selectionAnchor >= 0 && m.selectionAnchor != m.diffCursor {
-		selStart, selEnd := m.selectionAnchor, m.diffCursor
+	if m.dv.SelectionAnchor >= 0 && m.dv.SelectionAnchor != m.dv.DiffCursor {
+		selStart, selEnd := m.dv.SelectionAnchor, m.dv.DiffCursor
 		if selStart > selEnd {
 			selStart, selEnd = selEnd, selStart
 		}
@@ -2318,38 +1972,38 @@ func (m Model) openCommentInput() (Model, tea.Cmd, bool) {
 			return m, nil, false
 		}
 		if endDL.Type == components.LineDel {
-			m.commentLine = endDL.OldLineNo
-			m.commentSide = "LEFT"
+			m.dv.CommentLine = endDL.OldLineNo
+			m.dv.CommentSide = "LEFT"
 		} else {
-			m.commentLine = endDL.NewLineNo
-			m.commentSide = "RIGHT"
+			m.dv.CommentLine = endDL.NewLineNo
+			m.dv.CommentSide = "RIGHT"
 		}
 		if startDL.Type == components.LineDel {
-			m.commentStartLine = startDL.OldLineNo
-			m.commentStartSide = "LEFT"
+			m.dv.CommentStartLine = startDL.OldLineNo
+			m.dv.CommentStartSide = "LEFT"
 		} else {
-			m.commentStartLine = startDL.NewLineNo
-			m.commentStartSide = "RIGHT"
+			m.dv.CommentStartLine = startDL.NewLineNo
+			m.dv.CommentStartSide = "RIGHT"
 		}
 	} else {
 		if dl.Type == components.LineDel {
-			m.commentLine = dl.OldLineNo
-			m.commentSide = "LEFT"
+			m.dv.CommentLine = dl.OldLineNo
+			m.dv.CommentSide = "LEFT"
 		} else {
-			m.commentLine = dl.NewLineNo
-			m.commentSide = "RIGHT"
+			m.dv.CommentLine = dl.NewLineNo
+			m.dv.CommentSide = "RIGHT"
 		}
 	}
 
 	// Check for existing thread to reply to.
-	if m.commentStartLine > 0 {
+	if m.dv.CommentStartLine > 0 {
 		m.replyToID = ""
 	} else {
-		m.replyToID = m.commentStore.FindThreadRoot(m.commentFile, m.commentLine, m.commentSide)
+		m.replyToID = m.commentStore.FindThreadRoot(m.dv.CommentFile, m.dv.CommentLine, m.dv.CommentSide)
 	}
 
 	ta := textarea.New()
-	ta.SetWidth(m.contentWidth() - 10 - 6)
+	ta.SetWidth(m.dv.ContentWidth() - 10 - 6)
 	ta.SetHeight(5)
 	ta.ShowLineNumbers = false
 	ta.Prompt = ""
@@ -2359,8 +2013,8 @@ func (m Model) openCommentInput() (Model, tea.Cmd, bool) {
 	} else {
 		ta.Placeholder = "Add a comment..."
 	}
-	m.commentInput = ta
-	m.composing = true
+	m.dv.CommentInput = ta
+	m.dv.Composing = true
 	m.rebuildContent()
 	m.scrollCommentBoxIntoView()
 	return m, ta.Focus(), true
@@ -2369,8 +2023,8 @@ func (m Model) openCommentInput() (Model, tea.Cmd, bool) {
 func (m Model) insertCommentBox(rendered string, fileIdx int) string {
 	lines := strings.Split(rendered, "\n")
 	cursorRenderedLine := -1
-	if fileIdx < len(m.fileDiffOffsets) && m.diffCursor < len(m.fileDiffOffsets[fileIdx]) {
-		cursorRenderedLine = m.fileDiffOffsets[fileIdx][m.diffCursor]
+	if fileIdx < len(m.dv.FileDiffOffsets) && m.dv.DiffCursor < len(m.dv.FileDiffOffsets[fileIdx]) {
+		cursorRenderedLine = m.dv.FileDiffOffsets[fileIdx][m.dv.DiffCursor]
 	}
 	if cursorRenderedLine < 0 || cursorRenderedLine >= len(lines) {
 		return rendered
@@ -2404,14 +2058,14 @@ func (m Model) insertCommentBox(rendered string, fileIdx int) string {
 }
 
 func (m Model) renderCommentBox() string {
-	gutter := components.TotalGutterWidth(components.GutterColWidth(m.fileDiffs[m.currentFileIdx]))
+	gutter := components.TotalGutterWidth(components.GutterColWidth(m.dv.FileDiffs[m.dv.CurrentFileIdx]))
 	indent := strings.Repeat(" ", gutter)
-	boxW := m.contentWidth() - gutter - 2
+	boxW := m.dv.ContentWidth() - gutter - 2
 
-	taView := m.commentInput.View()
+	taView := m.dv.CommentInput.View()
 
 	isReply := m.replyToID != ""
-	bc := m.borderStyle()
+	bc := m.dv.BorderStyle()
 	// Use highlighted border color for the reply box.
 	hlStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(m.ctx.DiffColors.HighlightBorderFg))
 	borderRender := bc.Render
@@ -2481,15 +2135,15 @@ func (m Model) renderCommentBox() string {
 
 // cursorThreadInfo returns the path/line/side for the comment thread at the cursor.
 func (m Model) cursorThreadInfo() (path string, line int, side string, ok bool) {
-	idx := m.currentFileIdx
-	if idx >= len(m.fileDiffs) || m.diffCursor >= len(m.fileDiffs[idx]) {
+	idx := m.dv.CurrentFileIdx
+	if idx >= len(m.dv.FileDiffs) || m.dv.DiffCursor >= len(m.dv.FileDiffs[idx]) {
 		return
 	}
-	dl := m.fileDiffs[idx][m.diffCursor]
+	dl := m.dv.FileDiffs[idx][m.dv.DiffCursor]
 	if dl.Type == components.LineHunk {
 		return
 	}
-	path = m.files[idx].Filename
+	path = m.dv.Files[idx].Filename
 	if dl.Type == components.LineDel {
 		line = dl.OldLineNo
 		side = "LEFT"
@@ -2513,20 +2167,20 @@ func (m *Model) replyToThreadAtCursor() tea.Cmd {
 		return nil
 	}
 	m.replyToID = rootID
-	m.commentFile = path
-	m.commentLine = line
-	m.commentSide = side
-	m.commentStartLine = 0
-	m.commentStartSide = ""
+	m.dv.CommentFile = path
+	m.dv.CommentLine = line
+	m.dv.CommentSide = side
+	m.dv.CommentStartLine = 0
+	m.dv.CommentStartSide = ""
 	ta := textarea.New()
-	ta.SetWidth(m.contentWidth() - 10 - 6)
+	ta.SetWidth(m.dv.ContentWidth() - 10 - 6)
 	ta.SetHeight(5)
 	ta.ShowLineNumbers = false
 	ta.Prompt = ""
 	ta.Focus()
 	ta.Placeholder = "Reply to thread..."
-	m.commentInput = ta
-	m.composing = true
+	m.dv.CommentInput = ta
+	m.dv.Composing = true
 	m.rebuildContent()
 	// Scroll to ensure the comment box is visible.
 	m.scrollCommentBoxIntoView()
@@ -2550,7 +2204,7 @@ func (m *Model) toggleResolveAtCursor() bool {
 			break
 		}
 	}
-	m.reformatAllFiles()
+	m.formatFile(m.dv.CurrentFileIdx)
 	m.rebuildContent()
 	return true
 }
@@ -2559,17 +2213,17 @@ func (m *Model) toggleResolveAtCursor() bool {
 func (m Model) getDiffHunkForComment(c comments.LocalComment) string {
 	// Find the file index.
 	fileIdx := -1
-	for i, f := range m.files {
+	for i, f := range m.dv.Files {
 		if f.Filename == c.Path {
 			fileIdx = i
 			break
 		}
 	}
-	if fileIdx < 0 || fileIdx >= len(m.fileDiffs) {
+	if fileIdx < 0 || fileIdx >= len(m.dv.FileDiffs) {
 		return ""
 	}
 
-	lines := m.fileDiffs[fileIdx]
+	lines := m.dv.FileDiffs[fileIdx]
 	// Find the diff line that matches the comment.
 	targetIdx := -1
 	for i, dl := range lines {
@@ -2678,8 +2332,8 @@ func (m Model) fileIndexForPath(path string) int {
 }
 
 func (m *Model) rebuildFilePathIndex() {
-	m.filePathIndex = make(map[string]int, len(m.files))
-	for i, f := range m.files {
+	m.filePathIndex = make(map[string]int, len(m.dv.Files))
+	for i, f := range m.dv.Files {
 		m.filePathIndex[f.Filename] = i
 	}
 }
@@ -2688,16 +2342,16 @@ type stageDoneMsg struct{}
 
 // stageWholeFile stages an entire file using the appropriate git command.
 func (m Model) stageWholeFile(unstage bool) (Model, tea.Cmd, bool) {
-	idx := m.currentFileIdx
-	if idx < 0 || idx >= len(m.files) || idx >= len(m.fileDiffs) {
+	idx := m.dv.CurrentFileIdx
+	if idx < 0 || idx >= len(m.dv.Files) || idx >= len(m.dv.FileDiffs) {
 		return m, nil, false
 	}
-	filename := m.files[idx].Filename
-	fileStatus := m.files[idx].Status
+	filename := m.dv.Files[idx].Filename
+	fileStatus := m.dv.Files[idx].Status
 	repoRoot := m.repoRoot
 
 	// Optimistically remove the file from the view.
-	m.removeDiffLines(idx, 0, len(m.fileDiffs[idx])-1)
+	m.removeDiffLines(idx, 0, len(m.dv.FileDiffs[idx])-1)
 	m.stagingInFlight++
 
 	return m, func() tea.Msg {
@@ -2715,21 +2369,21 @@ func (m Model) stageWholeFile(unstage bool) (Model, tea.Cmd, bool) {
 
 // stageSelection stages or unstages the current line or J/K selection range.
 func (m Model) stageSelection(unstage bool) (Model, tea.Cmd, bool) {
-	idx := m.currentFileIdx
-	if idx < 0 || idx >= len(m.fileDiffs) || idx >= len(m.files) {
+	idx := m.dv.CurrentFileIdx
+	if idx < 0 || idx >= len(m.dv.FileDiffs) || idx >= len(m.dv.Files) {
 		return m, nil, false
 	}
 
-	lines := m.fileDiffs[idx]
-	filename := m.files[idx].Filename
-	fileStatus := m.files[idx].Status
-	patch := m.files[idx].Patch
+	lines := m.dv.FileDiffs[idx]
+	filename := m.dv.Files[idx].Filename
+	fileStatus := m.dv.Files[idx].Status
+	patch := m.dv.Files[idx].Patch
 	repoRoot := m.repoRoot
 
 	// Determine selection range.
-	selStart, selEnd := m.diffCursor, m.diffCursor
-	if m.selectionAnchor >= 0 && m.selectionAnchor != m.diffCursor {
-		selStart, selEnd = m.selectionAnchor, m.diffCursor
+	selStart, selEnd := m.dv.DiffCursor, m.dv.DiffCursor
+	if m.dv.SelectionAnchor >= 0 && m.dv.SelectionAnchor != m.dv.DiffCursor {
+		selStart, selEnd = m.dv.SelectionAnchor, m.dv.DiffCursor
 		if selStart > selEnd {
 			selStart, selEnd = selEnd, selStart
 		}
@@ -2754,7 +2408,7 @@ func (m Model) stageSelection(unstage bool) (Model, tea.Cmd, bool) {
 		return m, nil, true
 	}
 
-	m.selectionAnchor = -1
+	m.dv.SelectionAnchor = -1
 
 	// Optimistically remove staged lines from the current diff view.
 	m.removeDiffLines(idx, selStart, selEnd)
@@ -2768,24 +2422,24 @@ func (m Model) stageSelection(unstage bool) (Model, tea.Cmd, bool) {
 
 // stageHunk stages or unstages the entire hunk the cursor is in.
 func (m Model) stageHunk(unstage bool) (Model, tea.Cmd, bool) {
-	idx := m.currentFileIdx
-	if idx < 0 || idx >= len(m.fileDiffs) || idx >= len(m.files) {
+	idx := m.dv.CurrentFileIdx
+	if idx < 0 || idx >= len(m.dv.FileDiffs) || idx >= len(m.dv.Files) {
 		return m, nil, false
 	}
 
-	lines := m.fileDiffs[idx]
-	if m.diffCursor >= len(lines) {
+	lines := m.dv.FileDiffs[idx]
+	if m.dv.DiffCursor >= len(lines) {
 		return m, nil, false
 	}
 
-	dl := lines[m.diffCursor]
+	dl := lines[m.dv.DiffCursor]
 	if dl.Type == components.LineHunk {
 		return m, nil, false
 	}
 
-	filename := m.files[idx].Filename
-	fileStatus := m.files[idx].Status
-	patch := m.files[idx].Patch
+	filename := m.dv.Files[idx].Filename
+	fileStatus := m.dv.Files[idx].Status
+	patch := m.dv.Files[idx].Patch
 	repoRoot := m.repoRoot
 
 	var lineNo int
@@ -2799,7 +2453,7 @@ func (m Model) stageHunk(unstage bool) (Model, tea.Cmd, bool) {
 	}
 
 	// Optimistically remove the entire hunk from the view.
-	hunkStart, hunkEnd := m.findHunkRange(idx, m.diffCursor)
+	hunkStart, hunkEnd := m.findHunkRange(idx, m.dv.DiffCursor)
 	m.removeDiffLines(idx, hunkStart, hunkEnd)
 	m.stagingInFlight++
 
@@ -2813,10 +2467,10 @@ func (m Model) stageHunk(unstage bool) (Model, tea.Cmd, bool) {
 // Additions are removed entirely; deletions become context lines.
 // If no diff lines remain, the file is removed from the file list.
 func (m *Model) removeDiffLines(fileIdx, start, end int) {
-	if fileIdx >= len(m.fileDiffs) {
+	if fileIdx >= len(m.dv.FileDiffs) {
 		return
 	}
-	lines := m.fileDiffs[fileIdx]
+	lines := m.dv.FileDiffs[fileIdx]
 	var newLines []components.DiffLine
 	for i, dl := range lines {
 		if i >= start && i <= end {
@@ -2839,46 +2493,47 @@ func (m *Model) removeDiffLines(fileIdx, start, end int) {
 
 	if !hasChanges {
 		// Remove the file entirely from the view.
-		m.files = append(m.files[:fileIdx], m.files[fileIdx+1:]...)
-		m.fileDiffs = append(m.fileDiffs[:fileIdx], m.fileDiffs[fileIdx+1:]...)
-		m.highlightedFiles = append(m.highlightedFiles[:fileIdx], m.highlightedFiles[fileIdx+1:]...)
-		m.renderedFiles = append(m.renderedFiles[:fileIdx], m.renderedFiles[fileIdx+1:]...)
-		m.fileDiffOffsets = append(m.fileDiffOffsets[:fileIdx], m.fileDiffOffsets[fileIdx+1:]...)
-		m.fileCommentPositions = append(m.fileCommentPositions[:fileIdx], m.fileCommentPositions[fileIdx+1:]...)
-		m.treeEntries = components.BuildFileTree(m.files)
-		m.selectionAnchor = -1
+		m.dv.Files = append(m.dv.Files[:fileIdx], m.dv.Files[fileIdx+1:]...)
+		m.dv.FileDiffs = append(m.dv.FileDiffs[:fileIdx], m.dv.FileDiffs[fileIdx+1:]...)
+		m.dv.HighlightedFiles = append(m.dv.HighlightedFiles[:fileIdx], m.dv.HighlightedFiles[fileIdx+1:]...)
+		m.dv.RenderedFiles = append(m.dv.RenderedFiles[:fileIdx], m.dv.RenderedFiles[fileIdx+1:]...)
+		m.dv.FileDiffOffsets = append(m.dv.FileDiffOffsets[:fileIdx], m.dv.FileDiffOffsets[fileIdx+1:]...)
+		m.dv.FileCommentPositions = append(m.dv.FileCommentPositions[:fileIdx], m.dv.FileCommentPositions[fileIdx+1:]...)
+		m.dv.Tree.Files = m.dv.Files
+		m.dv.Tree.Entries = components.BuildFileTree(m.dv.Files)
+		m.dv.SelectionAnchor = -1
 		m.rebuildFilePathIndex()
 
 		// Navigate away from the removed file.
-		if len(m.files) == 0 {
-			m.currentFileIdx = -1
-			m.treeCursor = 0
-			m.diffCursor = 0
-		} else if m.currentFileIdx >= len(m.files) {
-			m.currentFileIdx = len(m.files) - 1
-			m.treeCursor = m.treeIndexForFile(m.currentFileIdx)
-			m.diffCursor = m.firstNonHunkLine(m.currentFileIdx)
-			m.formatFile(m.currentFileIdx)
+		if len(m.dv.Files) == 0 {
+			m.dv.CurrentFileIdx = -1
+			m.dv.Tree.Cursor = 0
+			m.dv.DiffCursor = 0
+		} else if m.dv.CurrentFileIdx >= len(m.dv.Files) {
+			m.dv.CurrentFileIdx = len(m.dv.Files) - 1
+			m.dv.Tree.Cursor = m.dv.Tree.IndexForFile(m.dv.CurrentFileIdx)
+			m.dv.DiffCursor = m.dv.FirstNonHunkLine(m.dv.CurrentFileIdx)
+			m.formatFile(m.dv.CurrentFileIdx)
 		} else {
-			m.treeCursor = m.treeIndexForFile(m.currentFileIdx)
-			m.diffCursor = m.firstNonHunkLine(m.currentFileIdx)
-			m.formatFile(m.currentFileIdx)
+			m.dv.Tree.Cursor = m.dv.Tree.IndexForFile(m.dv.CurrentFileIdx)
+			m.dv.DiffCursor = m.dv.FirstNonHunkLine(m.dv.CurrentFileIdx)
+			m.formatFile(m.dv.CurrentFileIdx)
 		}
 		m.rebuildContent()
 		return
 	}
 
-	m.fileDiffs[fileIdx] = newLines
+	m.dv.FileDiffs[fileIdx] = newLines
 
 	// Clamp cursor and skip hunk lines.
-	if m.diffCursor >= len(newLines) {
-		m.diffCursor = len(newLines) - 1
+	if m.dv.DiffCursor >= len(newLines) {
+		m.dv.DiffCursor = len(newLines) - 1
 	}
-	if m.diffCursor < 0 {
-		m.diffCursor = 0
+	if m.dv.DiffCursor < 0 {
+		m.dv.DiffCursor = 0
 	}
-	if len(newLines) > 0 && newLines[m.diffCursor].Type == components.LineHunk {
-		m.diffCursor = m.firstNonHunkLine(fileIdx)
+	if len(newLines) > 0 && newLines[m.dv.DiffCursor].Type == components.LineHunk {
+		m.dv.DiffCursor = m.dv.FirstNonHunkLine(fileIdx)
 	}
 
 	// Re-format to get correct rendered content and offsets.
@@ -2889,7 +2544,7 @@ func (m *Model) removeDiffLines(fileIdx, start, end int) {
 // findHunkRange returns the start and end diff line indices for the hunk
 // containing the given line index.
 func (m Model) findHunkRange(fileIdx, lineIdx int) (start, end int) {
-	lines := m.fileDiffs[fileIdx]
+	lines := m.dv.FileDiffs[fileIdx]
 
 	// Find hunk start — scan backward for the @@ header.
 	start = lineIdx
@@ -2914,7 +2569,7 @@ func (m Model) findHunkRange(fileIdx, lineIdx int) (start, end int) {
 }
 
 func (m Model) getFullFileDiff(path string) string {
-	for _, f := range m.files {
+	for _, f := range m.dv.Files {
 		if f.Filename == path {
 			return f.Patch
 		}
@@ -2922,34 +2577,3 @@ func (m Model) getFullFileDiff(path string) string {
 	return ""
 }
 
-// splitDiffBorders splits a rendered diff line into border|inner|border parts.
-func splitDiffBorders(line string) (prefix, inner, suffix string) {
-	const borderChar = "│"
-
-	firstIdx := strings.Index(line, borderChar)
-	if firstIdx < 0 {
-		return "", line, ""
-	}
-
-	lastIdx := strings.LastIndex(line, borderChar)
-	if lastIdx == firstIdx {
-		return "", line, ""
-	}
-
-	prefixEnd := firstIdx + len(borderChar)
-	if prefixEnd < len(line) && line[prefixEnd] == '\033' {
-		if i := strings.IndexByte(line[prefixEnd:], 'm'); i >= 0 {
-			prefixEnd += i + 1
-		}
-	}
-
-	suffixStart := lastIdx
-	for i := lastIdx - 1; i >= prefixEnd; i-- {
-		if line[i] == '\033' {
-			suffixStart = i
-			break
-		}
-	}
-
-	return line[:prefixEnd], line[prefixEnd:suffixStart], line[suffixStart:]
-}

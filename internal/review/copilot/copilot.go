@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -35,19 +34,14 @@ type ErrorMsg struct {
 
 // Client wraps the Copilot SDK for code review conversations.
 type Client struct {
-	sdk              *sdk.Client
-	session          *sdk.Session
-	mu               sync.Mutex
-	ctx              context.Context
-	cancel           context.CancelFunc
-	ready            chan struct{}
-	startErr         error
-	events           chan tea.Msg
-	activeCommentID  string // current comment being replied to
-	listenerAttached bool
-	lastSendAt       time.Time
-	log              *log.Logger
-	logFile          *os.File
+	sdk      *sdk.Client
+	ctx      context.Context
+	cancel   context.CancelFunc
+	ready    chan struct{}
+	startErr error
+	events   chan tea.Msg
+	log      *log.Logger
+	logFile  *os.File
 }
 
 // New creates and starts a Copilot client.
@@ -99,6 +93,7 @@ func (c *Client) ListenCmd() tea.Cmd {
 }
 
 // SendComment sends a comment with diff context to Copilot and streams back replies.
+// Each comment gets its own session so multiple can run in parallel.
 func (c *Client) SendComment(commentID, body, filePath, fileContent, fullDiff, diffHunk string, threadHistory []string) tea.Cmd {
 	return func() tea.Msg {
 		select {
@@ -112,131 +107,81 @@ func (c *Client) SendComment(commentID, body, filePath, fileContent, fullDiff, d
 			return ErrorMsg{CommentID: commentID, Err: fmt.Errorf("copilot not available: %w", c.startErr)}
 		}
 
-		c.mu.Lock()
-		c.activeCommentID = commentID
-
-		// If session seems stuck (last send was > 2 min ago with no idle), reset it.
-		if c.session != nil && !c.lastSendAt.IsZero() && time.Since(c.lastSendAt) > 2*time.Minute {
-			c.log.Println("session appears stuck, resetting...")
-			c.session.Disconnect()
-			c.session = nil
-			c.listenerAttached = false
+		// Create a dedicated session for this comment.
+		c.log.Printf("creating session for comment %s", commentID)
+		session, err := c.sdk.CreateSession(c.ctx, &sdk.SessionConfig{
+			Model:               "claude-opus-4.6",
+			Streaming:           true,
+			OnPermissionRequest: sdk.PermissionHandler.ApproveAll,
+		})
+		if err != nil {
+			c.log.Printf("CreateSession failed for %s: %v", commentID, err)
+			return ErrorMsg{CommentID: commentID, Err: fmt.Errorf("create session: %w", err)}
 		}
+		c.log.Printf("session created for %s: %s", commentID, session.SessionID)
 
-		if c.session == nil {
-			c.log.Println("creating copilot session...")
-			session, err := c.sdk.CreateSession(c.ctx, &sdk.SessionConfig{
-				Model:               "claude-opus-4.6",
-				Streaming:           true,
-				OnPermissionRequest: sdk.PermissionHandler.ApproveAll,
-			})
-			if err != nil {
-				c.mu.Unlock()
-				c.log.Printf("CreateSession failed: %v", err)
-				return ErrorMsg{CommentID: commentID, Err: fmt.Errorf("create session: %w", err)}
+		// Attach a listener that tags all events with this commentID.
+		session.On(func(event sdk.SessionEvent) {
+			switch event.Type {
+			case sdk.SessionEventTypeAssistantMessageDelta:
+				if event.Data.DeltaContent != nil && *event.Data.DeltaContent != "" {
+					c.events <- ReplyMsg{
+						CommentID: commentID,
+						Content:   *event.Data.DeltaContent,
+					}
+				}
+			case sdk.SessionEventTypeToolExecutionStart:
+				name := ""
+				if event.Data.ToolName != nil {
+					name = *event.Data.ToolName
+				}
+				c.events <- ToolMsg{CommentID: commentID, Name: name, Done: false}
+			case sdk.SessionEventTypeToolExecutionComplete:
+				name := ""
+				if event.Data.ToolName != nil {
+					name = *event.Data.ToolName
+				}
+				c.events <- ToolMsg{CommentID: commentID, Name: name, Done: true}
+			case sdk.SessionEventTypeSessionIdle:
+				c.log.Printf("session idle for %s", commentID)
+				c.events <- ReplyMsg{CommentID: commentID, Done: true}
+				session.Disconnect()
+			case sdk.SessionEventTypeSessionError:
+				msg := "copilot error"
+				if event.Data.Message != nil {
+					msg = *event.Data.Message
+				}
+				c.log.Printf("session error for %s: %s", commentID, msg)
+				c.events <- ErrorMsg{CommentID: commentID, Err: fmt.Errorf("%s", msg)}
+				session.Disconnect()
 			}
-			c.log.Printf("session created: %s", session.SessionID)
-			c.session = session
-		}
-
-		if !c.listenerAttached {
-			c.setupListener()
-			c.listenerAttached = true
-			c.log.Println("listener attached")
-		}
-		c.mu.Unlock()
+		})
 
 		prompt := buildReviewPrompt(body, filePath, fileContent, fullDiff, diffHunk, threadHistory)
 		c.log.Printf("sending prompt (%d chars) for comment %s", len(prompt), commentID)
 
-		c.mu.Lock()
-		c.lastSendAt = time.Now()
-		c.mu.Unlock()
-
-		_, err := c.session.Send(c.ctx, sdk.MessageOptions{
+		_, err = session.Send(c.ctx, sdk.MessageOptions{
 			Prompt: prompt,
 		})
 		if err != nil {
-			c.log.Printf("session.Send failed: %v", err)
+			c.log.Printf("session.Send failed for %s: %v", commentID, err)
+			session.Disconnect()
 			return ErrorMsg{CommentID: commentID, Err: fmt.Errorf("send: %w", err)}
 		}
 
-		c.log.Println("session.Send returned successfully")
+		c.log.Printf("session.Send returned for %s", commentID)
 
-		// Start a response timeout — if no events within 60s, error out.
+		// Response timeout.
 		go func() {
 			time.Sleep(60 * time.Second)
-			c.mu.Lock()
-			// Only fire timeout if this send is still active.
-			if c.activeCommentID == commentID && !c.lastSendAt.IsZero() {
-				c.log.Printf("response timeout for %s", commentID)
-				c.lastSendAt = time.Time{}
-				c.mu.Unlock()
-				c.events <- ErrorMsg{CommentID: commentID, Err: fmt.Errorf("copilot response timeout (60s)")}
-			} else {
-				c.mu.Unlock()
-			}
+			c.events <- ErrorMsg{CommentID: commentID, Err: fmt.Errorf("copilot response timeout (60s)")}
+			session.Disconnect()
 		}()
 
 		return nil
 	}
 }
 
-func (c *Client) setupListener() {
-	c.session.On(func(event sdk.SessionEvent) {
-		c.mu.Lock()
-		commentID := c.activeCommentID
-		c.mu.Unlock()
-
-		switch event.Type {
-		case sdk.SessionEventTypeAssistantMessageDelta:
-			if event.Data.DeltaContent != nil && *event.Data.DeltaContent != "" {
-				c.log.Printf("delta: %d chars for %s", len(*event.Data.DeltaContent), commentID)
-				c.events <- ReplyMsg{
-					CommentID: commentID,
-					Content:   *event.Data.DeltaContent,
-				}
-			}
-		case sdk.SessionEventTypeAssistantMessage:
-			c.log.Printf("assistant message complete for %s", commentID)
-		case sdk.SessionEventTypeToolExecutionStart:
-			name := ""
-			if event.Data.ToolName != nil {
-				name = *event.Data.ToolName
-			}
-			c.log.Printf("tool start: %s", name)
-			c.events <- ToolMsg{CommentID: commentID, Name: name, Done: false}
-		case sdk.SessionEventTypeToolExecutionComplete:
-			name := ""
-			if event.Data.ToolName != nil {
-				name = *event.Data.ToolName
-			}
-			c.log.Printf("tool complete: %s", name)
-			c.events <- ToolMsg{CommentID: commentID, Name: name, Done: true}
-		case sdk.SessionEventTypeSessionIdle:
-			c.log.Printf("session idle for %s", commentID)
-			c.mu.Lock()
-			c.lastSendAt = time.Time{}
-			c.mu.Unlock()
-			c.events <- ReplyMsg{
-				CommentID: commentID,
-				Done:      true,
-			}
-		case sdk.SessionEventTypeSessionError:
-			msg := "copilot error"
-			if event.Data.Message != nil {
-				msg = *event.Data.Message
-			}
-			c.log.Printf("session error: %s", msg)
-			c.events <- ErrorMsg{
-				CommentID: commentID,
-				Err:       fmt.Errorf("%s", msg),
-			}
-		default:
-			c.log.Printf("unhandled event type: %v", event.Type)
-		}
-	})
-}
 
 func buildReviewPrompt(comment, filePath, fileContent, fullDiff, diffHunk string, threadHistory []string) string {
 	var b strings.Builder
@@ -275,12 +220,6 @@ func buildReviewPrompt(comment, filePath, fileContent, fullDiff, diffHunk string
 
 // Stop shuts down the client and releases resources.
 func (c *Client) Stop() {
-	c.mu.Lock()
-	if c.session != nil {
-		c.session.Disconnect()
-		c.session = nil
-	}
-	c.mu.Unlock()
 	if c.sdk != nil {
 		c.sdk.Stop()
 	}
