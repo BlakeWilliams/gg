@@ -731,6 +731,9 @@ func (d *DiffViewer) SpliceThreadWithHighlight(fileIdx int, side string, line in
 	if fileIdx < len(d.FileDiffOffsets) {
 		d.FileDiffOffsets[fileIdx] = rc.DiffLineOffsets
 	}
+	if fileIdx < len(d.FileCommentPositions) {
+		d.FileCommentPositions[fileIdx] = rc.CommentPositions
+	}
 }
 
 // RemoveThread removes a comment thread from the cached render.
