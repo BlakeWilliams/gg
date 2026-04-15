@@ -225,6 +225,23 @@ func (d DiffViewer) LastNonHunkLine(fileIdx int) int {
 	return len(lines) - 1
 }
 
+// DiffLineIdxForComment finds the diff line index for a given side/line.
+// Returns -1 if not found.
+func (d DiffViewer) DiffLineIdxForComment(fileIdx int, side string, line int) int {
+	if fileIdx < 0 || fileIdx >= len(d.FileDiffs) {
+		return -1
+	}
+	for i, dl := range d.FileDiffs[fileIdx] {
+		if side == "LEFT" && dl.Type == components.LineDel && dl.OldLineNo == line {
+			return i
+		}
+		if side == "RIGHT" && dl.Type != components.LineDel && dl.NewLineNo == line {
+			return i
+		}
+	}
+	return -1
+}
+
 // ScrollToDiffCursor adjusts the viewport so the cursor line is visible.
 func (d *DiffViewer) ScrollToDiffCursor() {
 	idx := d.CurrentFileIdx
@@ -1057,6 +1074,33 @@ func (d *DiffViewer) HandleNavKey(key string) KeyResult {
 		} else {
 			d.VP.SetYOffset(d.VP.YOffset() - d.Height)
 		}
+		return KeyHandled
+	case "G":
+		d.WaitingG = false
+		if d.Tree.Focused {
+			totalEntries := 2 + len(d.Tree.Entries)
+			d.Tree.MoveCursorBy(totalEntries)
+		} else {
+			d.VP.GotoBottom()
+			if d.CurrentFileIdx >= 0 && d.HasDiffLines() {
+				d.SyncDiffCursorToViewport()
+			}
+		}
+		return KeyHandled
+	case "g":
+		if d.WaitingG {
+			d.WaitingG = false
+			if d.Tree.Focused {
+				d.Tree.MoveCursorBy(-2 - len(d.Tree.Entries))
+			} else {
+				d.VP.GotoTop()
+				if d.CurrentFileIdx >= 0 && d.HasDiffLines() {
+					d.SyncDiffCursorToViewport()
+				}
+			}
+			return KeyHandled
+		}
+		d.WaitingG = true
 		return KeyHandled
 	}
 	return KeyNotHandled

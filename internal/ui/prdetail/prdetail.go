@@ -709,7 +709,6 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 	case "G":
 		m.dv.WaitingG = false
 		if m.dv.Tree.Focused {
-			// Jump tree cursor to last entry.
 			totalEntries := 2 + len(m.dv.Tree.Entries)
 			m.dv.Tree.MoveCursorBy(totalEntries)
 		} else {
@@ -723,7 +722,6 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		if m.dv.WaitingG {
 			m.dv.WaitingG = false
 			if m.dv.Tree.Focused {
-				// Jump tree cursor to first entry (Description).
 				m.dv.Tree.MoveCursorBy(-2 - len(m.dv.Tree.Entries))
 			} else {
 				m.activeViewport().GotoTop()

@@ -856,37 +856,10 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 				return m.stageHunk(true)
 			}
 		}
-	case "ctrl+d", "ctrl+u", "ctrl+f", "ctrl+b":
+	case "ctrl+d", "ctrl+u", "ctrl+f", "ctrl+b", "G", "g":
 		if m.dv.HandleNavKey(msg.String()) == diffviewer.KeyHandled {
 			return m, nil, true
 		}
-	case "G":
-		m.dv.WaitingG = false
-		if m.dv.Tree.Focused {
-			totalEntries := 2 + len(m.dv.Tree.Entries)
-			m.dv.Tree.MoveCursorBy(totalEntries)
-		} else {
-			m.dv.VP.GotoBottom()
-			if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-				m.dv.SyncDiffCursorToViewport()
-			}
-		}
-		return m, nil, true
-	case "g":
-		if m.dv.WaitingG {
-			m.dv.WaitingG = false
-			if m.dv.Tree.Focused {
-				m.dv.Tree.MoveCursorBy(-2 - len(m.dv.Tree.Entries))
-			} else {
-				m.dv.VP.GotoTop()
-				if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-					m.dv.SyncDiffCursorToViewport()
-				}
-			}
-			return m, nil, true
-		}
-		m.dv.WaitingG = true
-		return m, nil, true
 	default:
 		m.dv.WaitingG = false
 	}
@@ -1575,8 +1548,32 @@ func (m Model) handleCommentKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			m.dv.CopilotDots = 0
 		}
 
-		m.formatFile(m.dv.CurrentFileIdx)
-		m.rebuildContent()
+		// Try splice-based update (O(content) vs O(n) full re-render).
+		spliced := false
+		fileIdx := m.dv.CurrentFileIdx
+		if m.replyToID != "" {
+			// Reply to existing thread — use SpliceThread.
+			m.dv.SpliceThreadForComment(fileIdx, comment.Side, comment.Line)
+			spliced = true
+		} else {
+			// New thread — use InsertThread.
+			diffLineIdx := m.dv.DiffLineIdxForComment(fileIdx, comment.Side, comment.Line)
+			if diffLineIdx >= 0 {
+				threadComments := m.commentStore.ForFile(comment.Path)
+				filtered := components.CommentsForThread(threadComments, comment.Side, comment.Line)
+				if m.dv.InsertThread(fileIdx, diffLineIdx, comment.Side, comment.Line, filtered) {
+					spliced = true
+				}
+			}
+		}
+
+		if spliced {
+			m.rebuildContentIfChanged()
+		} else {
+			// Fallback to full re-render.
+			m.formatFile(fileIdx)
+			m.rebuildContent()
+		}
 
 		if m.dv.Copilot != nil {
 			// Gather copilot context before returning — these are cheap in-memory lookups.
