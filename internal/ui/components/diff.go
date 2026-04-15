@@ -100,15 +100,17 @@ type DiffRenderResult struct {
 // This is the expensive part (Chroma syntax highlighting) that can be cached
 // across resizes.
 type HighlightedDiff struct {
-	File      github.PullRequestFile
-	DiffLines []DiffLine
-	HlLines   []string // syntax-highlighted lines (full file), or nil
-	Filename  string   // for fallback highlighting
+	File       github.PullRequestFile
+	DiffLines  []DiffLine
+	HlLines    []string // syntax-highlighted lines for new/right side (full file), or nil
+	HlLinesOld []string // syntax-highlighted lines for old/left side (full file), or nil
+	Filename   string   // for fallback highlighting
 }
 
 // HighlightDiffFile runs the expensive Chroma syntax highlighting and returns
 // a HighlightedDiff that can be cached and re-formatted at different widths.
-func HighlightDiffFile(f github.PullRequestFile, fileContent string, chromaStyle *chroma.Style) HighlightedDiff {
+// fileContent is the new/right side (working tree), oldFileContent is the old/left side (e.g., HEAD).
+func HighlightDiffFile(f github.PullRequestFile, fileContent, oldFileContent string, chromaStyle *chroma.Style) HighlightedDiff {
 	hd := HighlightedDiff{
 		File:     f,
 		Filename: f.Filename,
@@ -118,28 +120,50 @@ func HighlightDiffFile(f github.PullRequestFile, fileContent string, chromaStyle
 	}
 	hd.DiffLines = ParsePatchLines(f.Patch)
 
-	// Validate that file content covers all line numbers in the diff.
+	// Validate that new file content covers all line numbers in the diff.
 	// In branch mode, the working tree file may differ from the committed version,
 	// causing line number mismatches that produce blank rendered lines.
-	fileContentValid := fileContent != ""
-	if fileContentValid {
+	newContentValid := fileContent != ""
+	if newContentValid {
 		fileLineCount := strings.Count(fileContent, "\n") + 1
 		for _, dl := range hd.DiffLines {
 			if dl.Type == LineAdd && dl.NewLineNo > fileLineCount {
-				fileContentValid = false
+				newContentValid = false
 				break
 			}
 			if dl.Type == LineContext && dl.NewLineNo > fileLineCount {
-				fileContentValid = false
+				newContentValid = false
 				break
 			}
 		}
 	}
 
-	if fileContentValid {
+	// Validate that old file content covers all old line numbers in the diff.
+	oldContentValid := oldFileContent != ""
+	if oldContentValid {
+		oldLineCount := strings.Count(oldFileContent, "\n") + 1
+		for _, dl := range hd.DiffLines {
+			if dl.Type == LineDel && dl.OldLineNo > oldLineCount {
+				oldContentValid = false
+				break
+			}
+			if dl.Type == LineContext && dl.OldLineNo > oldLineCount {
+				oldContentValid = false
+				break
+			}
+		}
+	}
+
+	if newContentValid {
 		hd.HlLines = highlightFileLines(fileContent, f.Filename, chromaStyle)
-	} else {
-		// Fallback: batch-highlight the diff content.
+	}
+	if oldContentValid {
+		hd.HlLinesOld = highlightFileLines(oldFileContent, f.Filename, chromaStyle)
+	}
+
+	// Fallback: if we don't have valid new content, batch-highlight the diff
+	// content for sequential access (needed for add/context lines).
+	if !newContentValid {
 		var codeBuilder strings.Builder
 		for _, dl := range hd.DiffLines {
 			if dl.Type == LineHunk {
@@ -194,7 +218,7 @@ func FormatDiffFile(hd HighlightedDiff, width int, colors styles.DiffColors, com
 	gutterW := TotalGutterWidth(colW)
 
 	// Format each line at the target width using cached highlighted content.
-	formatDiffLinesFromHL(diffLines, hd.HlLines, hd.Filename, width, colors, colW)
+	formatDiffLinesFromHL(diffLines, hd.HlLines, hd.HlLinesOld, hd.Filename, width, colors, colW)
 
 	commentsByLine := buildCommentThreads(comments)
 
@@ -443,7 +467,7 @@ func RenderLineRange(hd HighlightedDiff, layout DiffLayout, startLine, endLine i
 	rangeLen := approxEnd - approxStart
 	diffLines := make([]DiffLine, rangeLen)
 	copy(diffLines, hd.DiffLines[approxStart:approxEnd])
-	formatDiffLinesRangeFromHL(diffLines, approxStart, hd.DiffLines, hd.HlLines, hd.Filename, width, colors, layout.ColW)
+	formatDiffLinesRangeFromHL(diffLines, approxStart, hd.DiffLines, hd.HlLines, hd.HlLinesOld, hd.Filename, width, colors, layout.ColW)
 
 	// Render sequentially from approxStart, tracking actual position.
 	renderedLine := layout.DiffLineOffsets[approxStart]
@@ -511,7 +535,7 @@ func RenderLineRange(hd HighlightedDiff, layout DiffLayout, startLine, endLine i
 
 // RenderDiffFile is a convenience that highlights and formats in one call.
 func RenderDiffFile(f github.PullRequestFile, fileContent string, width int, colors styles.DiffColors, comments []github.ReviewComment) DiffRenderResult {
-	hd := HighlightDiffFile(f, fileContent, colors.ChromaStyle)
+	hd := HighlightDiffFile(f, fileContent, "", colors.ChromaStyle)
 	return FormatDiffFile(hd, width, colors, comments)
 }
 
@@ -576,12 +600,13 @@ func expandTabs(s string) string {
 
 // formatDiffLinesRangeFromHL formats a subset of diff lines starting at globalStart.
 // It uses allDiffLines to compute the hlIdx offset for sequential highlight mode.
-func formatDiffLinesRangeFromHL(diffLines []DiffLine, globalStart int, allDiffLines []DiffLine, hlLines []string, filename string, width int, colors styles.DiffColors, colW int) {
-	useLineIndex := detectUseLineIndex(allDiffLines, hlLines)
+func formatDiffLinesRangeFromHL(diffLines []DiffLine, globalStart int, allDiffLines []DiffLine, hlLines, hlLinesOld []string, filename string, width int, colors styles.DiffColors, colW int) {
+	useNewLineIndex := detectUseLineIndex(allDiffLines, hlLines)
+	useOldLineIndex := len(hlLinesOld) > 0 && detectUseOldLineIndex(allDiffLines, hlLinesOld)
 
 	// Compute hlIdx offset: count non-hunk lines before globalStart in sequential mode.
 	hlIdx := 0
-	if !useLineIndex {
+	if !useNewLineIndex && !useOldLineIndex {
 		for i := 0; i < globalStart && i < len(allDiffLines); i++ {
 			if allDiffLines[i].Type != LineHunk {
 				hlIdx++
@@ -596,12 +621,12 @@ func formatDiffLinesRangeFromHL(diffLines []DiffLine, globalStart int, allDiffLi
 		switch dl.Type {
 		case LineHunk:
 			dl.Rendered = renderHunkLine(dl.Content, width, colors)
-			if !useLineIndex {
+			if !useNewLineIndex && !useOldLineIndex {
 				hlIdx++
 			}
 		case LineAdd:
 			var hl string
-			if useLineIndex {
+			if useNewLineIndex {
 				hl = getHighlightedLine(hlLines, dl.NewLineNo)
 			} else if hlIdx < len(hlLines) {
 				hl = hlLines[hlIdx]
@@ -615,11 +640,14 @@ func formatDiffLinesRangeFromHL(diffLines []DiffLine, globalStart int, allDiffLi
 			dl.Rendered = padWithBg(truncateLine(gutter+hl, width), width, colors.AddBg)
 		case LineDel:
 			var hl string
-			if useLineIndex {
-				hl = highlightSnippet(dl.Content, filename, colors.ChromaStyle)
+			if useOldLineIndex {
+				hl = getHighlightedLine(hlLinesOld, dl.OldLineNo)
 			} else if hlIdx < len(hlLines) {
 				hl = hlLines[hlIdx]
 				hlIdx++
+			} else {
+				// Fallback: highlight single line (slower but handles edge cases)
+				hl = highlightSnippet(dl.Content, filename, colors.ChromaStyle)
 			}
 			hl = expandTabs(hl)
 			hl = injectBackground(hl, colors.DelBg)
@@ -629,7 +657,7 @@ func formatDiffLinesRangeFromHL(diffLines []DiffLine, globalStart int, allDiffLi
 			dl.Rendered = padWithBg(truncateLine(gutter+hl, width), width, colors.DelBg)
 		case LineContext:
 			var hl string
-			if useLineIndex {
+			if useNewLineIndex {
 				hl = getHighlightedLine(hlLines, dl.NewLineNo)
 			} else if hlIdx < len(hlLines) {
 				hl = hlLines[hlIdx]
@@ -671,7 +699,33 @@ func detectUseLineIndex(diffLines []DiffLine, hlLines []string) bool {
 	return hasLines && allFit
 }
 
-func formatDiffLinesFromHL(diffLines []DiffLine, hlLines []string, filename string, width int, colors styles.DiffColors, colW int) {
+// detectUseOldLineIndex checks if hlLinesOld are indexed by old line number.
+func detectUseOldLineIndex(diffLines []DiffLine, hlLinesOld []string) bool {
+	if len(diffLines) == 0 || len(hlLinesOld) == 0 {
+		return false
+	}
+	allFit := true
+	hasLines := false
+	for _, dl := range diffLines {
+		if dl.Type == LineDel && dl.OldLineNo > 0 {
+			hasLines = true
+			if dl.OldLineNo > len(hlLinesOld) {
+				allFit = false
+				break
+			}
+		}
+		if dl.Type == LineContext && dl.OldLineNo > 0 {
+			hasLines = true
+			if dl.OldLineNo > len(hlLinesOld) {
+				allFit = false
+				break
+			}
+		}
+	}
+	return hasLines && allFit
+}
+
+func formatDiffLinesFromHL(diffLines []DiffLine, hlLines, hlLinesOld []string, filename string, width int, colors styles.DiffColors, colW int) {
 	// Detect if hlLines are indexed by line number (full file) or sequential (fallback).
 	// Full file mode: hlLines[lineNo-1] gives the highlighted line.
 	// Fallback mode: hlLines are in diff order (including blank for hunks).
@@ -679,28 +733,8 @@ func formatDiffLinesFromHL(diffLines []DiffLine, hlLines []string, filename stri
 	// or from fallback diff-based highlighting (sequential).
 	// Full-file mode: every line number in the diff must be within hlLines range.
 	// If ANY line number exceeds hlLines, it's fallback (sequential) mode.
-	useLineIndex := false
-	if len(diffLines) > 0 && len(hlLines) > 0 {
-		allFit := true
-		hasLines := false
-		for _, dl := range diffLines {
-			if dl.Type == LineAdd && dl.NewLineNo > 0 {
-				hasLines = true
-				if dl.NewLineNo > len(hlLines) {
-					allFit = false
-					break
-				}
-			}
-			if dl.Type == LineContext && dl.NewLineNo > 0 {
-				hasLines = true
-				if dl.NewLineNo > len(hlLines) {
-					allFit = false
-					break
-				}
-			}
-		}
-		useLineIndex = hasLines && allFit
-	}
+	useNewLineIndex := detectUseLineIndex(diffLines, hlLines)
+	useOldLineIndex := len(hlLinesOld) > 0 && detectUseOldLineIndex(diffLines, hlLinesOld)
 
 	hlIdx := 0
 	for i := range diffLines {
@@ -708,13 +742,13 @@ func formatDiffLinesFromHL(diffLines []DiffLine, hlLines []string, filename stri
 		switch dl.Type {
 		case LineHunk:
 			dl.Rendered = renderHunkLine(dl.Content, width, colors)
-			if !useLineIndex {
+			if !useNewLineIndex && !useOldLineIndex {
 				hlIdx++
 			}
 
 		case LineAdd:
 			var hl string
-			if useLineIndex {
+			if useNewLineIndex {
 				hl = getHighlightedLine(hlLines, dl.NewLineNo)
 			} else if hlIdx < len(hlLines) {
 				hl = hlLines[hlIdx]
@@ -729,11 +763,14 @@ func formatDiffLinesFromHL(diffLines []DiffLine, hlLines []string, filename stri
 
 		case LineDel:
 			var hl string
-			if useLineIndex {
-				hl = highlightSnippet(dl.Content, filename, colors.ChromaStyle)
+			if useOldLineIndex {
+				hl = getHighlightedLine(hlLinesOld, dl.OldLineNo)
 			} else if hlIdx < len(hlLines) {
 				hl = hlLines[hlIdx]
 				hlIdx++
+			} else {
+				// Fallback: highlight single line (slower but handles edge cases)
+				hl = highlightSnippet(dl.Content, filename, colors.ChromaStyle)
 			}
 			hl = expandTabs(hl)
 			hl = injectBackground(hl, colors.DelBg)
@@ -744,7 +781,7 @@ func formatDiffLinesFromHL(diffLines []DiffLine, hlLines []string, filename stri
 
 		case LineContext:
 			var hl string
-			if useLineIndex {
+			if useNewLineIndex {
 				hl = getHighlightedLine(hlLines, dl.NewLineNo)
 			} else if hlIdx < len(hlLines) {
 				hl = hlLines[hlIdx]

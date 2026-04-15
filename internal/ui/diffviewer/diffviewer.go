@@ -4,6 +4,7 @@ import (
 	"strings"
 	"time"
 
+	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/viewport"
 	"charm.land/lipgloss/v2"
@@ -71,9 +72,29 @@ type DiffViewer struct {
 	CopilotPending  map[string]CopilotPendingInfo // commentID -> pending info
 	CopilotDots     int                      // shared animation frame (0-3)
 
+	// Comment source — set by outer model. Returns base comments for a file
+	// (without copilot pending, which DiffViewer appends itself).
+	Comments CommentSource
+
+	// Render body callback for markdown in comment threads.
+	RenderBody func(body string, width int, bg string) string
+
+	// Render cache per file (for splice-based updates).
+	FileRenderCache []*components.DiffRenderResult
+
+	// Loading spinner (shown while highlighting is in progress for current file).
+	Spinner       spinner.Model
+	SpinnerActive bool
+
 	// Internal
 	WaitingG    bool
 	LastContent string
+}
+
+// CommentSource provides comments for a file. Each view implements this
+// to return comments from its backing store (local CommentStore, GitHub API, etc).
+type CommentSource interface {
+	CommentsForFile(filename string) []github.ReviewComment
 }
 
 // --- Layout helpers ---
@@ -560,8 +581,48 @@ func (d DiffViewer) RenderLayout(rightView string, rightTitle string) string {
 
 // --- File formatting ---
 
-// FormatFileWithComments recomputes the rendered diff + offsets for a single file
-// using the provided comments. The outer model is responsible for gathering comments.
+// CommentsForFile gathers comments for a file: base comments from the
+// CommentSource + copilot pending comments.
+func (d DiffViewer) CommentsForFile(filename string) []github.ReviewComment {
+	var comments []github.ReviewComment
+	if d.Comments != nil {
+		comments = d.Comments.CommentsForFile(filename)
+	}
+	return d.AppendCopilotPending(filename, comments)
+}
+
+// FormatFile renders a file and caches the result (content + offsets + splice data).
+// Uses the CommentSource to gather comments automatically.
+func (d *DiffViewer) FormatFile(index int) {
+	if index < 0 || index >= len(d.HighlightedFiles) || d.HighlightedFiles[index].File.Filename == "" {
+		return
+	}
+	hl := d.HighlightedFiles[index]
+	width := d.ContentWidth()
+	fileComments := d.CommentsForFile(d.Files[index].Filename)
+
+	var opts components.DiffFormatOptions
+	if d.RenderBody != nil {
+		opts.RenderBody = d.RenderBody
+	}
+
+	result := components.FormatDiffFile(hl, width, d.Ctx.DiffColors, fileComments, opts)
+	if index < len(d.RenderedFiles) {
+		d.RenderedFiles[index] = result.Content
+	}
+	if index < len(d.FileDiffOffsets) {
+		d.FileDiffOffsets[index] = result.DiffLineOffsets
+	}
+	if index < len(d.FileCommentPositions) {
+		d.FileCommentPositions[index] = result.CommentPositions
+	}
+	if index < len(d.FileRenderCache) {
+		d.FileRenderCache[index] = &result
+	}
+}
+
+// FormatFileWithComments renders a file with explicit comments (no CommentSource).
+// Used when the caller has already gathered comments.
 func (d *DiffViewer) FormatFileWithComments(index int, fileComments []github.ReviewComment) {
 	if index >= len(d.HighlightedFiles) {
 		return
@@ -572,7 +633,12 @@ func (d *DiffViewer) FormatFileWithComments(index int, fileComments []github.Rev
 	}
 	width := d.ContentWidth()
 
-	result := components.FormatDiffFile(hl, width, d.Ctx.DiffColors, fileComments)
+	var opts components.DiffFormatOptions
+	if d.RenderBody != nil {
+		opts.RenderBody = d.RenderBody
+	}
+
+	result := components.FormatDiffFile(hl, width, d.Ctx.DiffColors, fileComments, opts)
 	if index < len(d.RenderedFiles) {
 		d.RenderedFiles[index] = result.Content
 	}
@@ -581,6 +647,66 @@ func (d *DiffViewer) FormatFileWithComments(index int, fileComments []github.Rev
 	}
 	if index < len(d.FileCommentPositions) {
 		d.FileCommentPositions[index] = result.CommentPositions
+	}
+	if index < len(d.FileRenderCache) {
+		d.FileRenderCache[index] = &result
+	}
+}
+
+// ReformatAllFiles invalidates all caches and re-renders the current file.
+func (d *DiffViewer) ReformatAllFiles() {
+	for i := range d.RenderedFiles {
+		d.RenderedFiles[i] = ""
+	}
+	for i := range d.FileRenderCache {
+		d.FileRenderCache[i] = nil
+	}
+	if d.CurrentFileIdx >= 0 {
+		d.FormatFile(d.CurrentFileIdx)
+	}
+}
+
+// SpliceThreadForComment re-renders a single comment thread and splices it
+// into the cached render for the given file. O(thread) instead of O(n).
+func (d *DiffViewer) SpliceThreadForComment(fileIdx int, side string, line int) {
+	if fileIdx < 0 || fileIdx >= len(d.FileRenderCache) || d.FileRenderCache[fileIdx] == nil {
+		d.FormatFile(fileIdx)
+		return
+	}
+	rc := d.FileRenderCache[fileIdx]
+	if len(rc.ThreadRanges) == 0 {
+		d.FormatFile(fileIdx)
+		return
+	}
+
+	threadIdx := -1
+	for i, tr := range rc.ThreadRanges {
+		if tr.Side == side && tr.Line == line {
+			threadIdx = i
+			break
+		}
+	}
+	if threadIdx < 0 {
+		d.FormatFile(fileIdx)
+		return
+	}
+
+	diffLineIdx := rc.ThreadRanges[threadIdx].DiffLineIdx
+	lt := components.LineAdd
+	if diffLineIdx < len(d.FileDiffs[fileIdx]) {
+		lt = d.FileDiffs[fileIdx][diffLineIdx].Type
+	}
+
+	fileComments := d.CommentsForFile(d.Files[fileIdx].Filename)
+	threadComments := components.CommentsForThread(fileComments, side, line)
+	gutterW := components.TotalGutterWidth(components.GutterColWidth(d.FileDiffs[fileIdx]))
+
+	newContent := components.RenderSingleThread(threadComments, d.ContentWidth(), lt, d.Ctx.DiffColors, false, 0, d.RenderBody, gutterW)
+	components.SpliceThread(rc, threadIdx, newContent)
+
+	d.RenderedFiles[fileIdx] = rc.Content
+	if fileIdx < len(d.FileDiffOffsets) {
+		d.FileDiffOffsets[fileIdx] = rc.DiffLineOffsets
 	}
 }
 
@@ -682,6 +808,7 @@ func (d *DiffViewer) InitFileSlices(n int) {
 	d.FileDiffs = make([][]components.DiffLine, n)
 	d.FileDiffOffsets = make([][]int, n)
 	d.FileCommentPositions = make([][]components.CommentPosition, n)
+	d.FileRenderCache = make([]*components.DiffRenderResult, n)
 }
 
 // --- Copilot helpers ---
@@ -716,6 +843,37 @@ func (d DiffViewer) CopilotPendingPath(commentID string) string {
 		return info.Path
 	}
 	return ""
+}
+
+// --- Spinner helpers ---
+
+// InitSpinner creates the spinner model.
+func (d *DiffViewer) InitSpinner() {
+	d.Spinner = spinner.New(spinner.WithSpinner(spinner.MiniDot))
+	d.Spinner.Style = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
+}
+
+// SpinnerView renders a centered loading spinner for the diff viewport.
+func (d DiffViewer) SpinnerView() string {
+	h := d.ViewportHeight()
+	w := d.RightPanelInnerWidth()
+	label := d.Spinner.View() + " Highlighting…"
+	labelW := lipgloss.Width(label)
+
+	var b strings.Builder
+	topPad := h/2 - 1
+	if topPad < 0 {
+		topPad = 0
+	}
+	for i := 0; i < topPad; i++ {
+		b.WriteString("\n")
+	}
+	leftPad := (w - labelW) / 2
+	if leftPad < 0 {
+		leftPad = 0
+	}
+	b.WriteString(strings.Repeat(" ", leftPad) + label)
+	return b.String()
 }
 
 // --- Standalone helpers ---

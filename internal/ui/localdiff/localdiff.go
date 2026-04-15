@@ -16,8 +16,8 @@ import (
 	"github.com/blakewilliams/ghq/internal/ui/styles"
 	"github.com/blakewilliams/ghq/internal/ui/uictx"
 	"github.com/blakewilliams/ghq/internal/git/watcher"
+	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textarea"
-	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
@@ -86,8 +86,8 @@ type Model struct {
 	// Layout per file (for cursor positioning).
 	fileLayouts []components.DiffLayout
 
-	// Render cache per file (for splice-based updates).
-	fileRenderCache []*components.DiffRenderResult
+	// Tracks which files have real Chroma highlighting (vs placeholder).
+	chromaHighlighted map[int]bool
 
 	// Comments.
 	commentStore *comments.CommentStore
@@ -124,27 +124,34 @@ func New(ctx *uictx.Context, repoRoot string, width, height int) Model {
 	cp, _ := copilot.New(repoRoot)
 	active := comments.LoadActiveState(repoRoot, branch)
 	vs := comments.LoadViewState(repoRoot, branch, active.Mode)
+	cs := comments.LoadComments(repoRoot)
+	dv := diffviewer.DiffViewer{
+		Ctx:             ctx,
+		Width:           width,
+		Height:          height,
+		CurrentFileIdx:  -1,
+		SelectionAnchor: -1,
+		Tree: components.FileTree{
+			Width:   35,
+			Height:  height - 2,
+			Focused: true,
+		},
+		Copilot:         cp,
+		CopilotReplyBuf: make(map[string]string),
+		Comments:        commentStoreAdapter{store: cs},
+		RenderBody:      renderMarkdownBody,
+	}
+	dv.InitSpinner()
+
 	return Model{
 		ctx: ctx,
-		dv: diffviewer.DiffViewer{
-			Ctx:             ctx,
-			Width:           width,
-			Height:          height,
-			CurrentFileIdx:  -1,
-			SelectionAnchor: -1,
-			Tree: components.FileTree{
-				Width:   35,
-				Height:  height - 2,
-				Focused: true,
-			},
-			Copilot:         cp,
-			CopilotReplyBuf: make(map[string]string),
-		},
-		repoRoot:      repoRoot,
-		branch:        branch,
-		mode:          active.Mode,
+		dv:  dv,
+		chromaHighlighted: make(map[int]bool),
+		repoRoot:          repoRoot,
+		branch:            branch,
+		mode:              active.Mode,
 		watcher:       w,
-		commentStore:  comments.LoadComments(repoRoot),
+		commentStore:  cs,
 		fileCursors:   make(map[string]int),
 		filePathIndex: make(map[string]int),
 		savedFilename: vs.Filename,
@@ -306,10 +313,8 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 						e := m.dv.Tree.Entries[eIdx]
 						if !e.IsDir && e.FileIndex >= 0 {
 							m.dv.Tree.Cursor = idx
-							m.dv.CurrentFileIdx = e.FileIndex
-							m.rebuildContent()
-							m.dv.VP.GotoTop()
-							m.saveViewState()
+							cmd := m.selectTreeEntry()
+							return m, cmd
 						}
 					}
 				}
@@ -322,6 +327,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		oldPatches := make(map[string]string, len(m.dv.Files))
 		oldHighlights := make(map[string]components.HighlightedDiff)
 		oldRendered := make(map[string]string)
+		oldOffsets := make(map[string][]int)
 		for i, f := range m.dv.Files {
 			oldPatches[f.Filename] = f.Patch
 			if i < len(m.dv.HighlightedFiles) && m.dv.HighlightedFiles[i].File.Filename != "" {
@@ -329,6 +335,9 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 			}
 			if i < len(m.dv.RenderedFiles) {
 				oldRendered[f.Filename] = m.dv.RenderedFiles[i]
+			}
+			if i < len(m.dv.FileDiffOffsets) {
+				oldOffsets[f.Filename] = m.dv.FileDiffOffsets[i]
 			}
 		}
 
@@ -339,7 +348,6 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		m.dv.FileDiffOffsets = make([][]int, len(msg.files))
 		m.dv.FileCommentPositions = make([][]components.CommentPosition, len(msg.files))
 		m.fileLayouts = make([]components.DiffLayout, len(msg.files))
-		m.fileRenderCache = make([]*components.DiffRenderResult, len(msg.files))
 		m.rebuildFilePathIndex()
 		m.dv.FilesListLoaded = true
 
@@ -351,6 +359,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 				if hl, ok := oldHighlights[f.Filename]; ok {
 					m.dv.HighlightedFiles[i] = hl
 					m.dv.RenderedFiles[i] = oldRendered[f.Filename]
+					m.dv.FileDiffOffsets[i] = oldOffsets[f.Filename]
 					continue
 				}
 			}
@@ -358,6 +367,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 			// a skeleton while the new highlight is in progress.
 			if rendered, ok := oldRendered[f.Filename]; ok {
 				m.dv.RenderedFiles[i] = rendered
+				m.dv.FileDiffOffsets[i] = oldOffsets[f.Filename]
 			}
 			needHighlight = append(needHighlight, i)
 		}
@@ -381,6 +391,9 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		} else if m.dv.CurrentFileIdx >= len(m.dv.Files) {
 			m.dv.CurrentFileIdx = -1
 			m.dv.Tree.Cursor = 0
+		} else if m.dv.CurrentFileIdx >= 0 {
+			// Sync tree cursor with current file after SetFiles reset it.
+			m.dv.Tree.Cursor = m.dv.Tree.IndexForFile(m.dv.CurrentFileIdx)
 		}
 
 		// Only re-format the current file if it kept its highlights.
@@ -407,7 +420,13 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 					break
 				}
 			}
-			return m, m.highlightFileCmd(needHighlight[0])
+			cmds := []tea.Cmd{m.highlightFileCmd(needHighlight[0])}
+			// Show spinner if the current file is being highlighted.
+			if needHighlight[0] == m.dv.CurrentFileIdx {
+				m.dv.SpinnerActive = true
+				cmds = append(cmds, m.dv.Spinner.Tick)
+			}
+			return m, tea.Batch(cmds...)
 		}
 		m.dv.FilesLoading = false
 		return m, nil
@@ -464,20 +483,37 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 
+	case spinner.TickMsg:
+		if m.dv.SpinnerActive {
+			var cmd tea.Cmd
+			m.dv.Spinner, cmd = m.dv.Spinner.Update(msg)
+			m.rebuildContentIfChanged()
+			return m, cmd
+		}
+		return m, nil
+
 	case fileHighlightedMsg:
 		if msg.index >= len(m.dv.HighlightedFiles) {
 			return m, nil
 		}
 		m.dv.HighlightedFiles[msg.index] = msg.highlight
 		m.dv.FilesHighlighted++
-		// Only render the current file synchronously. Others render on access.
-		if msg.index == m.dv.CurrentFileIdx || m.dv.CurrentFileIdx == -1 {
+		m.chromaHighlighted[msg.index] = true
+		// Stop spinner if this is the file we were waiting on.
+		if msg.index == m.dv.CurrentFileIdx {
+			m.dv.SpinnerActive = false
+		}
+		// Re-render with real highlights if this is the current file.
+		if msg.index == m.dv.CurrentFileIdx {
+			m.dv.RenderedFiles[msg.index] = "" // invalidate to force re-render with highlights
 			m.formatFile(msg.index)
 			m.rebuildContent()
+		} else {
+			m.dv.RenderedFiles[msg.index] = "" // invalidate so next access uses highlights
 		}
-		// Find the next file that needs highlighting.
+		// Find the next file that needs Chroma highlighting.
 		for next := msg.index + 1; next < len(m.dv.Files); next++ {
-			if m.dv.HighlightedFiles[next].File.Filename == "" {
+			if !m.chromaHighlighted[next] {
 				return m, m.highlightFileCmd(next)
 			}
 		}
@@ -713,12 +749,12 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		return m, nil, true
 	case "ctrl+k":
 		m.dv.Tree.MoveSelection(-1)
-		m.selectTreeEntry()
-		return m, nil, true
+		cmd := m.selectTreeEntry()
+		return m, cmd, true
 	case "ctrl+j":
 		m.dv.Tree.MoveSelection(1)
-		m.selectTreeEntry()
-		return m, nil, true
+		cmd := m.selectTreeEntry()
+		return m, cmd, true
 	case "j", "down":
 		if m.dv.Tree.Focused {
 			m.dv.Tree.MoveCursorBy(1)
@@ -757,9 +793,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		}
 	case "enter":
 		if m.dv.Tree.Focused {
-			m.selectTreeEntry()
+			cmd := m.selectTreeEntry()
 			m.dv.Tree.Focused = false
-			return m, nil, true
+			return m, cmd, true
 		}
 		// If inside a thread, exit thread mode.
 		if m.dv.ThreadCursor > 0 {
@@ -1021,48 +1057,11 @@ func (m Model) renderLayout(rightView string) string {
 // --- Content building ---
 
 func (m *Model) rebuildContent() {
-	innerW := m.dv.RightPanelInnerWidth()
-	innerH := m.dv.Height - 2
-
-	if !m.dv.VPReady {
-		m.dv.VP = viewport.New()
-		m.dv.VPReady = true
-	}
-	m.dv.VP.SetWidth(innerW)
-	m.dv.VP.SetHeight(innerH)
-
-	var newContent string
-	if m.dv.CurrentFileIdx == -1 {
-		newContent = m.buildOverviewContent(innerW)
-	} else {
-		newContent = m.buildFileContent(innerW)
-	}
-	m.dv.VP.SetContent(newContent)
+	m.dv.RebuildContent(m.buildOverviewContent, m.buildFileContent)
 }
 
-// rebuildContentIfChanged only updates the viewport if the content actually changed.
-// Use this for paths where the content might not have changed (timer ticks, etc.)
 func (m *Model) rebuildContentIfChanged() {
-	innerW := m.dv.RightPanelInnerWidth()
-	innerH := m.dv.Height - 2
-
-	if !m.dv.VPReady {
-		m.dv.VP = viewport.New()
-		m.dv.VPReady = true
-	}
-	m.dv.VP.SetWidth(innerW)
-	m.dv.VP.SetHeight(innerH)
-
-	var newContent string
-	if m.dv.CurrentFileIdx == -1 {
-		newContent = m.buildOverviewContent(innerW)
-	} else {
-		newContent = m.buildFileContent(innerW)
-	}
-	if newContent != m.dv.LastContent {
-		m.dv.LastContent = newContent
-		m.dv.VP.SetContent(newContent)
-	}
+	m.dv.RebuildContentIfChanged(m.buildOverviewContent, m.buildFileContent)
 }
 
 func (m Model) buildOverviewContent(w int) string {
@@ -1122,41 +1121,18 @@ func (m *Model) buildFileContent(w int) string {
 		return ""
 	}
 
-	// Use virtualized rendering if layout is available.
-	if idx < len(m.fileLayouts) && idx < len(m.dv.HighlightedFiles) &&
-		m.fileLayouts[idx].TotalRenderedLines > 0 && m.dv.HighlightedFiles[idx].File.Filename != "" {
-		return m.buildVirtualFileContent(idx, w)
-	}
-
-	// Fallback: full render or skeleton.
-	var content strings.Builder
-	if m.dv.RenderedFiles[idx] != "" {
-		rendered := m.dv.RenderedFiles[idx]
-		if m.dv.Composing && m.dv.HasDiffLines() {
-			rendered = m.insertCommentBox(rendered, idx)
-		}
-		content.WriteString(rendered)
-	} else {
-		for i := 0; i < 20; i++ {
-			gutter := dimStyle.Render(strings.Repeat("─", components.TotalGutterWidth(components.DefaultGutterColWidth)))
-			lineW := 15 + (i*7)%25
-			if lineW > w-12 {
-				lineW = w - 12
-			}
-			code := dimStyle.Render(strings.Repeat("─", lineW))
-			content.WriteString(gutter + " " + code + "\n")
-		}
-	}
-	content.WriteString("\n" + strings.Repeat("\n", m.dv.Height/2))
-	return content.String()
+	return m.buildVirtualFileContent(idx, w)
 }
 
 func (m *Model) buildVirtualFileContent(idx, w int) string {
-	// Use cached rendered content. Recomputed by formatFile on comment/width changes.
 	rendered := m.dv.RenderedFiles[idx]
 	if rendered == "" {
-		// Not yet rendered — render now and cache.
-		m.renderAndCacheFile(idx, w)
+		// If the file hasn't been highlighted yet, show a spinner while
+		// the async highlight goroutine finishes.
+		if idx < len(m.dv.HighlightedFiles) && m.dv.HighlightedFiles[idx].File.Filename == "" {
+			return m.dv.SpinnerView()
+		}
+		m.dv.FormatFile(idx)
 		rendered = m.dv.RenderedFiles[idx]
 	}
 
@@ -1167,85 +1143,15 @@ func (m *Model) buildVirtualFileContent(idx, w int) string {
 	return rendered + "\n" + strings.Repeat("\n", m.dv.Height/2)
 }
 
-// spliceThreadForComment re-renders a single comment thread and splices it
-// into the cached render. O(thread) instead of O(n) for the whole file.
-func (m *Model) spliceThreadForComment(fileIdx int, commentID string) {
-	if fileIdx < 0 || fileIdx >= len(m.fileRenderCache) || m.fileRenderCache[fileIdx] == nil {
-		// No cache — fall back to full render.
-		m.formatFile(fileIdx)
-		return
-	}
-	rc := m.fileRenderCache[fileIdx]
-	if len(rc.ThreadRanges) == 0 {
-		m.formatFile(fileIdx)
-		return
-	}
 
-	// Find which thread this comment belongs to.
-	// The pending copilot comment is a reply, so find the thread by its anchor line.
+// spliceThreadForComment delegates to DiffViewer's splice method.
+func (m *Model) spliceThreadForComment(fileIdx int, commentID string) {
 	info, ok := m.dv.CopilotPending[commentID]
 	if !ok {
-		m.formatFile(fileIdx)
+		m.dv.FormatFile(fileIdx)
 		return
 	}
-	threadIdx := -1
-	for i, tr := range rc.ThreadRanges {
-		if tr.Side == info.Side && tr.Line == info.Line {
-			threadIdx = i
-			break
-		}
-	}
-	if threadIdx < 0 {
-		// Thread not in cache (new thread since last full render) — full render.
-		m.formatFile(fileIdx)
-		return
-	}
-
-	// Get the diff line type for this thread's anchor.
-	diffLineIdx := rc.ThreadRanges[threadIdx].DiffLineIdx
-	lt := components.LineAdd
-	if diffLineIdx < len(m.dv.FileDiffs[fileIdx]) {
-		lt = m.dv.FileDiffs[fileIdx][diffLineIdx].Type
-	}
-
-	// Gather thread comments for the affected line.
-	fileComments := m.commentsForFile(fileIdx)
-	threadComments := components.CommentsForThread(fileComments, info.Side, info.Line)
-
-	gutterW := components.TotalGutterWidth(components.GutterColWidth(m.dv.FileDiffs[fileIdx]))
-	newContent := components.RenderSingleThread(threadComments, m.dv.ContentWidth(), lt, m.ctx.DiffColors, false, 0, func(body string, width int, bg string) string {
-		return renderMarkdownBody(body, width, bg)
-	}, gutterW)
-
-	components.SpliceThread(rc, threadIdx, newContent)
-	m.dv.RenderedFiles[fileIdx] = rc.Content
-	if fileIdx < len(m.dv.FileDiffOffsets) {
-		m.dv.FileDiffOffsets[fileIdx] = rc.DiffLineOffsets
-	}
-}
-
-// renderAndCacheFile runs FormatDiffFile and caches the result.
-func (m *Model) renderAndCacheFile(idx, w int) {
-	hl := m.dv.HighlightedFiles[idx]
-	colors := m.ctx.DiffColors
-	fileComments := m.commentsForFile(idx)
-
-	var opts components.DiffFormatOptions
-	opts.RenderBody = func(body string, width int, bg string) string {
-		return renderMarkdownBody(body, width, bg)
-	}
-
-	result := components.FormatDiffFile(hl, w, colors, fileComments, opts)
-	m.dv.RenderedFiles[idx] = result.Content
-	if idx < len(m.dv.FileDiffOffsets) {
-		m.dv.FileDiffOffsets[idx] = result.DiffLineOffsets
-	}
-	if idx < len(m.dv.FileCommentPositions) {
-		m.dv.FileCommentPositions[idx] = result.CommentPositions
-	}
-	if idx < len(m.fileRenderCache) {
-		m.fileRenderCache[idx] = &result
-	}
+	m.dv.SpliceThreadForComment(fileIdx, info.Side, info.Line)
 }
 
 // --- File rendering pipeline ---
@@ -1254,53 +1160,70 @@ func (m Model) highlightFileCmd(index int) tea.Cmd {
 	f := m.dv.Files[index]
 	repoRoot := m.repoRoot
 	chromaStyle := m.ctx.DiffColors.ChromaStyle
+	mode := m.mode
 
 	return func() tea.Msg {
-		var fileContent string
+		var fileContent, oldFileContent string
+
+		// Get new file content (working tree) for added/modified files.
 		if f.Status != "removed" && f.Patch != "" {
 			if content, err := git.FileContent(repoRoot, f.Filename); err == nil {
 				fileContent = content
 			}
 		}
-		hl := components.HighlightDiffFile(f, fileContent, chromaStyle)
+
+		// Get old file content for deleted/modified files.
+		if f.Status != "added" && f.Patch != "" {
+			var ref string
+			switch mode {
+			case git.DiffWorking, git.DiffStaged:
+				ref = "HEAD"
+			case git.DiffBranch:
+				// For branch mode, we need the merge-base.
+				// FileContentAtRef with HEAD works since the diff is against merge-base
+				// but the old lines come from the current branch's version at that point.
+				// Actually, for branch mode the "old" side is the merge-base commit.
+				defaultBranch, _ := git.DefaultBranch(repoRoot)
+				if mb, err := git.MergeBase(repoRoot, defaultBranch); err == nil {
+					ref = mb
+				} else {
+					ref = "HEAD"
+				}
+			default:
+				ref = "HEAD"
+			}
+			if content, err := git.FileContentAtRef(repoRoot, f.Filename, ref); err == nil {
+				oldFileContent = content
+			}
+		}
+
+		hl := components.HighlightDiffFile(f, fileContent, oldFileContent, chromaStyle)
 		return fileHighlightedMsg{highlight: hl, index: index}
 	}
 }
 
 func (m *Model) formatFile(index int) {
-	if index >= len(m.dv.HighlightedFiles) {
-		return
-	}
-	// Re-render and cache.
-	m.renderAndCacheFile(index, m.dv.ContentWidth())
+	m.dv.FormatFile(index)
 }
 
-func (m Model) commentsForFile(fileIdx int) []github.ReviewComment {
-	if m.commentStore == nil || fileIdx < 0 || fileIdx >= len(m.dv.Files) {
+// commentStoreAdapter adapts a CommentStore to the CommentSource interface.
+type commentStoreAdapter struct {
+	store *comments.CommentStore
+}
+
+func (a commentStoreAdapter) CommentsForFile(filename string) []github.ReviewComment {
+	if a.store == nil {
 		return nil
 	}
-	filename := m.dv.Files[fileIdx].Filename
-	fileComments := m.commentStore.ForFile(filename)
+	return a.store.ForFile(filename)
+}
 
-	// Wrap width for comment bodies inside the thread box.
-	var gutterW int
-	if fileIdx < len(m.dv.FileDiffs) {
-		gutterW = components.TotalGutterWidth(components.GutterColWidth(m.dv.FileDiffs[fileIdx]))
-	} else {
-		gutterW = components.TotalGutterWidth(components.DefaultGutterColWidth)
+// commentsForFile returns comments for a file by index (convenience).
+func (m Model) commentsForFile(fileIdx int) []github.ReviewComment {
+	if fileIdx < 0 || fileIdx >= len(m.dv.Files) {
+		return nil
 	}
-	wrapW := m.dv.ContentWidth() - gutterW - 4 // gutter + "│ " + " │"
-	if wrapW < 20 {
-		wrapW = 20
-	}
-
-	// Don't pre-render markdown here — it's done in commentsForFileWithBg
-	// at render time when we know the diff line's background color.
-
-	// Add pending copilot replies as temporary comments so they render inline.
-	fileComments = m.dv.AppendCopilotPending(filename, fileComments)
-
-	return fileComments
+	return m.dv.CommentsForFile(m.dv.Files[fileIdx].Filename)
 }
 
 // renderMarkdownBody does lightweight inline markdown rendering suitable
@@ -1411,21 +1334,14 @@ func replaceMarkdownPair(s, delim, open, close string) string {
 	return s
 }
 
-// reformatAllFiles invalidates all file layouts so they get recomputed
-// on next access. Only the current file is reformatted immediately.
 func (m *Model) reformatAllFiles() {
-	for i := range m.fileLayouts {
-		m.fileLayouts[i] = components.DiffLayout{}
-	}
-	if m.dv.CurrentFileIdx >= 0 {
-		m.formatFile(m.dv.CurrentFileIdx)
-	}
+	m.dv.ReformatAllFiles()
 }
 
 // needsRenderBufferUpdate returns true if the viewport scrolled outside
 // the pre-rendered buffer and needs a fresh render.
 
-func (m *Model) selectTreeEntry() {
+func (m *Model) selectTreeEntry() tea.Cmd {
 	m.dv.SelectionAnchor = -1
 	// Save cursor position for the file we're leaving.
 	if m.dv.CurrentFileIdx >= 0 && m.dv.CurrentFileIdx < len(m.dv.Files) {
@@ -1433,11 +1349,12 @@ func (m *Model) selectTreeEntry() {
 	}
 	m.dv.ThreadCursor = 0
 	if m.dv.Tree.Cursor == 0 {
+		m.dv.SpinnerActive = false
 		m.dv.CurrentFileIdx = -1
 		m.rebuildContent()
 		m.dv.VP.GotoTop()
 		m.saveViewState()
-		return
+		return nil
 	}
 	eIdx := m.dv.Tree.Cursor - 2
 	if eIdx >= 0 && eIdx < len(m.dv.Tree.Entries) {
@@ -1449,7 +1366,17 @@ func (m *Model) selectTreeEntry() {
 			} else {
 				m.dv.DiffCursor = m.dv.FirstNonHunkLine(e.FileIndex)
 			}
-			// Use cached render if available (instant). Otherwise render now.
+			// If the file hasn't been highlighted yet, show a spinner
+			// and kick off highlighting for this file directly (the
+			// sequential chain may have already passed this index).
+			needsHighlight := e.FileIndex < len(m.dv.HighlightedFiles) && m.dv.HighlightedFiles[e.FileIndex].File.Filename == ""
+			if needsHighlight {
+				m.dv.SpinnerActive = true
+				m.rebuildContent()
+				m.saveViewState()
+				return tea.Batch(m.dv.Spinner.Tick, m.highlightFileCmd(e.FileIndex))
+			}
+			m.dv.SpinnerActive = false
 			if m.dv.RenderedFiles[e.FileIndex] == "" {
 				m.formatFile(e.FileIndex)
 			}
@@ -1458,6 +1385,7 @@ func (m *Model) selectTreeEntry() {
 			m.saveViewState()
 		}
 	}
+	return nil
 }
 
 // --- Diff cursor ---

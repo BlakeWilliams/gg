@@ -36,7 +36,7 @@ func intPtr(i int) *int { return &i }
 func TestCommentPositions_SingleComment(t *testing.T) {
 	patch := "@@ -1,3 +1,4 @@\n context\n+added line\n+another\n context"
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 
 	comments := []github.ReviewComment{
 		makeComment(1, "This looks good", "test.go", 2, "RIGHT", nil),
@@ -68,7 +68,7 @@ func TestCommentPositions_SingleComment(t *testing.T) {
 func TestCommentPositions_Thread(t *testing.T) {
 	patch := "@@ -1,3 +1,4 @@\n context\n+added line\n+another\n context"
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 
 	comments := []github.ReviewComment{
 		makeComment(1, "First comment", "test.go", 2, "RIGHT", nil),
@@ -110,7 +110,7 @@ func TestCommentPositions_Thread(t *testing.T) {
 func TestCommentPositions_MultilineBody(t *testing.T) {
 	patch := "@@ -1,3 +1,4 @@\n context\n+added line\n+another\n context"
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 
 	comments := []github.ReviewComment{
 		makeComment(1, "Line one\n\nLine three\nLine four", "test.go", 2, "RIGHT", nil),

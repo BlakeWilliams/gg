@@ -11,7 +11,7 @@ import (
 func TestComputeDiffLayout_Basic(t *testing.T) {
 	patch := "@@ -1,3 +1,5 @@\n context\n+added one\n+added two\n-removed\n context end"
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 
 	layout := ComputeDiffLayout(hl, 80, nil)
 
@@ -37,7 +37,7 @@ func TestComputeDiffLayout_Basic(t *testing.T) {
 func TestComputeDiffLayout_WithComments(t *testing.T) {
 	patch := "@@ -1,3 +1,4 @@\n context\n+added line\n+another\n context end"
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 
 	line := 2
 	comments := []github.ReviewComment{
@@ -63,7 +63,7 @@ func TestComputeDiffLayout_WithComments(t *testing.T) {
 func TestRenderLineRange_FullRange(t *testing.T) {
 	patch := "@@ -1,3 +1,4 @@\n context\n+added\n context end"
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 	colors := styles.DiffColors{}
 
 	layout := ComputeDiffLayout(hl, 80, nil)
@@ -99,7 +99,7 @@ func TestRenderLineRange_PartialRange(t *testing.T) {
 	}
 	patch := strings.Join(patchLines, "\n")
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 	colors := styles.DiffColors{}
 
 	layout := ComputeDiffLayout(hl, 80, nil)
@@ -121,7 +121,7 @@ func TestRenderLineRange_PartialRange(t *testing.T) {
 func TestRenderLineRange_WithComments(t *testing.T) {
 	patch := "@@ -1,5 +1,6 @@\n context\n+added one\n+added two\n context mid\n+added three\n context end"
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 	colors := styles.DiffColors{}
 
 	line2 := 2
@@ -171,7 +171,7 @@ func TestRenderLineRange_WithComments(t *testing.T) {
 func TestRenderLineRange_CommentHighlight(t *testing.T) {
 	patch := "@@ -1,3 +1,4 @@\n context\n+added\n context end"
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 	colors := styles.DiffColors{HighlightBorderFg: "\033[33m"}
 
 	line := 2
@@ -202,7 +202,7 @@ func TestRenderLineRange_CommentHighlight(t *testing.T) {
 
 func TestComputeDiffLayout_EmptyPatch(t *testing.T) {
 	file := github.PullRequestFile{Filename: "test.go", Patch: "", Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 
 	layout := ComputeDiffLayout(hl, 80, nil)
 
@@ -217,7 +217,7 @@ func TestLayoutOffsets_MatchFullRender(t *testing.T) {
 	// Verify that layout offsets agree with the actual FormatDiffFile offsets.
 	patch := "@@ -1,5 +1,7 @@\n first\n+added a\n middle\n-removed\n+replaced\n+extra\n last"
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 	colors := styles.DiffColors{}
 
 	layout := ComputeDiffLayout(hl, 80, nil)
@@ -240,7 +240,7 @@ func TestLayoutOffsets_MatchFullRender(t *testing.T) {
 func TestLayoutOffsets_WithComments_MatchFullRender(t *testing.T) {
 	patch := "@@ -1,3 +1,4 @@\n context\n+added\n+another\n context end"
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 	colors := styles.DiffColors{}
 
 	line := 2
@@ -278,7 +278,7 @@ func TestVirtualRender_MatchesFullRender(t *testing.T) {
 	// For a small diff, virtual full-range render should match FormatDiffFile exactly.
 	patch := "@@ -1,4 +1,5 @@\n alpha\n+beta\n gamma\n-delta\n epsilon"
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 	colors := styles.DiffColors{}
 
 	layout := ComputeDiffLayout(hl, 80, nil)
@@ -296,7 +296,7 @@ func TestVirtualRender_MatchesFullRender(t *testing.T) {
 func TestVirtualRender_WithComments_MatchesFullRender(t *testing.T) {
 	patch := "@@ -1,3 +1,4 @@\n context\n+added\n context end"
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 	colors := styles.DiffColors{}
 
 	line := 2
@@ -335,7 +335,7 @@ func TestLayout_LargeFile(t *testing.T) {
 	}
 	patch := strings.Join(patchLines, "\n")
 	file := github.PullRequestFile{Filename: "big.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 
 	layout := ComputeDiffLayout(hl, 120, nil)
 
@@ -371,7 +371,7 @@ func TestLayout_LargeFile_WithScatteredComments(t *testing.T) {
 	}
 	patch := strings.Join(patchLines, "\n")
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 
 	// Comments scattered at various lines.
 	line10, line30, line60, line90 := 10, 30, 60, 90
@@ -404,7 +404,7 @@ func TestLayout_LargeFile_WithScatteredComments(t *testing.T) {
 func TestLayout_DifferentWidths(t *testing.T) {
 	patch := "@@ -1,3 +1,4 @@\n context\n+added a somewhat longer line of code that might wrap at narrow widths\n context end"
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 
 	layoutWide := ComputeDiffLayout(hl, 200, nil)
 	layoutNarrow := ComputeDiffLayout(hl, 40, nil)
@@ -419,7 +419,7 @@ func TestLayout_DifferentWidths(t *testing.T) {
 func TestLayout_ResizeProducesDifferentLayout(t *testing.T) {
 	patch := "@@ -1,3 +1,4 @@\n ctx\n+added\n ctx end"
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 
 	layout80 := ComputeDiffLayout(hl, 80, nil)
 	layout120 := ComputeDiffLayout(hl, 120, nil)
@@ -436,7 +436,7 @@ func TestLayout_ResizeProducesDifferentLayout(t *testing.T) {
 func TestRenderLineRange_BeyondEnd(t *testing.T) {
 	patch := "@@ -1,2 +1,3 @@\n ctx\n+added"
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 
 	layout := ComputeDiffLayout(hl, 80, nil)
 	// Request range beyond the end.
@@ -450,7 +450,7 @@ func TestRenderLineRange_BeyondEnd(t *testing.T) {
 func TestRenderLineRange_NegativeStart(t *testing.T) {
 	patch := "@@ -1,2 +1,3 @@\n ctx\n+added"
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 
 	layout := ComputeDiffLayout(hl, 80, nil)
 	// Negative start should be clamped to 0.
@@ -467,7 +467,7 @@ func TestRenderLineRange_NegativeStart(t *testing.T) {
 func TestRenderLineRange_ZeroRange(t *testing.T) {
 	patch := "@@ -1,2 +1,3 @@\n ctx\n+added"
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 
 	layout := ComputeDiffLayout(hl, 80, nil)
 	lines, _ := RenderLineRange(hl, layout, 5, 5, 80, styles.DiffColors{}, nil)
@@ -481,7 +481,7 @@ func TestCommentThread_AtBufferBoundary(t *testing.T) {
 	// Comment thread that starts in the visible range but extends beyond it.
 	patch := "@@ -1,3 +1,4 @@\n context\n+added\n context end"
 	file := github.PullRequestFile{Filename: "test.go", Patch: patch, Status: "modified"}
-	hl := HighlightDiffFile(file, "", nil)
+	hl := HighlightDiffFile(file, "", "", nil)
 
 	line := 2
 	comments := []github.ReviewComment{

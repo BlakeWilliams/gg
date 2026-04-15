@@ -105,6 +105,16 @@ func DefaultBranch(dir string) (string, error) {
 	return "main", nil // default fallback
 }
 
+// MergeBase returns the merge-base commit between the given branch and HEAD.
+func MergeBase(dir, branch string) (string, error) {
+	cmd := exec.Command("git", "-C", dir, "merge-base", branch, "HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git merge-base: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // Diff runs git diff and returns the raw unified diff output.
 func Diff(dir string, mode DiffMode) (string, error) {
 	var args []string
@@ -208,6 +218,17 @@ func FileContent(dir string, path string) (string, error) {
 		return "", err
 	}
 	return string(data), nil
+}
+
+// FileContentAtRef reads a file at a specific git ref (e.g., "HEAD", "main", commit SHA).
+// Returns empty string if the file doesn't exist at that ref.
+func FileContentAtRef(dir, path, ref string) (string, error) {
+	cmd := exec.Command("git", "-C", dir, "show", ref+":"+path)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
 var diffHeaderRegex = regexp.MustCompile(`^diff --git a/(.*) b/(.*)`)

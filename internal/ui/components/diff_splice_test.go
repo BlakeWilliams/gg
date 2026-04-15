@@ -49,7 +49,7 @@ func renderWithComments(patch string, comments []github.ReviewComment, width int
 		Status:   "added",
 		Patch:    patch,
 	}
-	hl := HighlightDiffFile(f, "", nil)
+	hl := HighlightDiffFile(f, "", "", nil)
 	return FormatDiffFile(hl, width, spliceTestColors(), comments)
 }
 
@@ -153,7 +153,7 @@ func TestSplice_SingleThread(t *testing.T) {
 	updatedComments := []github.ReviewComment{comment(1, 5, "updated body")}
 	newThread := RenderSingleThread(updatedComments, 80, LineAdd, spliceTestColors(), false, 0, nil, result.ThreadRanges[0].LineCount)
 	// Actually we need the gutterW. Let me compute it properly.
-	hl := HighlightDiffFile(github.PullRequestFile{Filename: "test.go", Status: "added", Patch: patch}, "", nil)
+	hl := HighlightDiffFile(github.PullRequestFile{Filename: "test.go", Status: "added", Patch: patch}, "", "", nil)
 	gutterW := TotalGutterWidth(GutterColWidth(hl.DiffLines))
 	newThread = RenderSingleThread(updatedComments, 80, LineAdd, spliceTestColors(), false, 0, nil, gutterW)
 
@@ -175,7 +175,7 @@ func TestSplice_MatchesFullRender(t *testing.T) {
 
 	// Splice to "updated".
 	updatedComments := []github.ReviewComment{comment(1, 5, "updated")}
-	hl := HighlightDiffFile(github.PullRequestFile{Filename: "test.go", Status: "added", Patch: patch}, "", nil)
+	hl := HighlightDiffFile(github.PullRequestFile{Filename: "test.go", Status: "added", Patch: patch}, "", "", nil)
 	gutterW := TotalGutterWidth(GutterColWidth(hl.DiffLines))
 	newThread := RenderSingleThread(updatedComments, 80, LineAdd, spliceTestColors(), false, 0, nil, gutterW)
 	SpliceThread(&result, 0, newThread)
@@ -219,7 +219,7 @@ func TestSplice_MultipleThreads(t *testing.T) {
 
 	// Splice the middle thread.
 	updatedComments := []github.ReviewComment{comment(2, 10, "REPLACED")}
-	hl := HighlightDiffFile(github.PullRequestFile{Filename: "test.go", Status: "added", Patch: patch}, "", nil)
+	hl := HighlightDiffFile(github.PullRequestFile{Filename: "test.go", Status: "added", Patch: patch}, "", "", nil)
 	gutterW := TotalGutterWidth(GutterColWidth(hl.DiffLines))
 	newThread := RenderSingleThread(updatedComments, 80, LineAdd, spliceTestColors(), false, 0, nil, gutterW)
 	SpliceThread(&result, 1, newThread)
@@ -246,7 +246,7 @@ func TestSplice_MultipleThreads(t *testing.T) {
 // TestSplice_GrowingComment simulates copilot streaming — comment grows on each splice.
 func TestSplice_GrowingComment(t *testing.T) {
 	patch := makeTestPatch(10)
-	hl := HighlightDiffFile(github.PullRequestFile{Filename: "test.go", Status: "added", Patch: patch}, "", nil)
+	hl := HighlightDiffFile(github.PullRequestFile{Filename: "test.go", Status: "added", Patch: patch}, "", "", nil)
 	gutterW := TotalGutterWidth(GutterColWidth(hl.DiffLines))
 
 	// Start with short comment.
@@ -290,7 +290,7 @@ func TestSplice_DiffLineOffsets(t *testing.T) {
 	offsetBefore := result.DiffLineOffsets[4] // line 5 (0-indexed: hunk=0, line1=1, line2=2, line3=3, line4=4)
 
 	// Splice with longer comment.
-	hl := HighlightDiffFile(github.PullRequestFile{Filename: "test.go", Status: "added", Patch: patch}, "", nil)
+	hl := HighlightDiffFile(github.PullRequestFile{Filename: "test.go", Status: "added", Patch: patch}, "", "", nil)
 	gutterW := TotalGutterWidth(GutterColWidth(hl.DiffLines))
 	longComment := []github.ReviewComment{comment(1, 3, "this is a much\nlonger comment\nwith multiple\nlines")}
 	newThread := RenderSingleThread(longComment, 80, LineAdd, spliceTestColors(), false, 0, nil, gutterW)
@@ -327,7 +327,7 @@ func TestSplice_MultipleReplies(t *testing.T) {
 		replyComment(2, 1, "reply from bot", 5),
 		replyComment(3, 1, "another reply", 5),
 	}
-	hl := HighlightDiffFile(github.PullRequestFile{Filename: "test.go", Status: "added", Patch: patch}, "", nil)
+	hl := HighlightDiffFile(github.PullRequestFile{Filename: "test.go", Status: "added", Patch: patch}, "", "", nil)
 	gutterW := TotalGutterWidth(GutterColWidth(hl.DiffLines))
 	newThread := RenderSingleThread(updatedComments, 80, LineAdd, spliceTestColors(), false, 0, nil, gutterW)
 	SpliceThread(&result, 0, newThread)
