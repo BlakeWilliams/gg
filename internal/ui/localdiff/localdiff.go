@@ -624,7 +624,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		var cmd tea.Cmd
 		m.dv.VP, cmd = m.dv.VP.Update(msg)
 		if m.dv.VP.YOffset() != prevOffset && m.dv.CurrentFileIdx >= 0 {
-			m.syncDiffCursorToViewport()
+			m.dv.SyncDiffCursorToViewport()
 		}
 		return m, cmd
 	}
@@ -673,7 +673,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 				m.dv.ThreadCursor = 0
 				m.formatFile(m.dv.CurrentFileIdx)
 				m.rebuildContent()
-				m.scrollToDiffCursor()
+				m.dv.ScrollToDiffCursor()
 			}
 			return m, nil, true
 		case "ctrl+d":
@@ -686,7 +686,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			m.dv.ThreadCursor = 0
 			m.formatFile(m.dv.CurrentFileIdx)
 			m.rebuildContent()
-			m.scrollToDiffCursor()
+			m.dv.ScrollToDiffCursor()
 			return m, nil, true
 		case "r":
 			if cmd := m.replyToThreadAtCursor(); cmd != nil {
@@ -702,7 +702,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			m.dv.ThreadCursor = 0
 			m.formatFile(m.dv.CurrentFileIdx)
 			m.rebuildContent()
-			m.scrollToDiffCursor()
+			m.dv.ScrollToDiffCursor()
 			return m, nil, true
 		}
 		return m, nil, true
@@ -762,7 +762,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		}
 		if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
 			m.dv.SelectionAnchor = -1
-			m.moveDiffCursor(1)
+			m.dv.MoveDiffCursor(1)
 			return m, nil, true
 		}
 	case "k", "up":
@@ -772,7 +772,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		}
 		if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
 			m.dv.SelectionAnchor = -1
-			m.moveDiffCursor(-1)
+			m.dv.MoveDiffCursor(-1)
 			return m, nil, true
 		}
 	case "J", "shift+down":
@@ -780,7 +780,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			if m.dv.SelectionAnchor < 0 {
 				m.dv.SelectionAnchor = m.dv.DiffCursor
 			}
-			m.moveDiffCursor(1)
+			m.dv.MoveDiffCursor(1)
 			return m, nil, true
 		}
 	case "K", "shift+up":
@@ -788,7 +788,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			if m.dv.SelectionAnchor < 0 {
 				m.dv.SelectionAnchor = m.dv.DiffCursor
 			}
-			m.moveDiffCursor(-1)
+			m.dv.MoveDiffCursor(-1)
 			return m, nil, true
 		}
 	case "enter":
@@ -802,7 +802,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			m.dv.ThreadCursor = 0
 			m.formatFile(m.dv.CurrentFileIdx)
 			m.rebuildContent()
-			m.scrollToDiffCursor()
+			m.dv.ScrollToDiffCursor()
 			return m, nil, true
 		}
 		// If on a line with comments, enter thread navigation.
@@ -893,7 +893,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		if m.dv.Tree.Focused {
 			m.dv.Tree.MoveCursorBy(m.dv.Height / 2)
 		} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			m.scrollAndSyncCursor(m.dv.Height / 2)
+			m.dv.ScrollAndSyncCursor(m.dv.Height / 2)
 		} else {
 			m.dv.VP.SetYOffset(m.dv.VP.YOffset() + m.dv.Height/2)
 		}
@@ -903,7 +903,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		if m.dv.Tree.Focused {
 			m.dv.Tree.MoveCursorBy(-m.dv.Height / 2)
 		} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			m.scrollAndSyncCursor(-m.dv.Height / 2)
+			m.dv.ScrollAndSyncCursor(-m.dv.Height / 2)
 		} else {
 			m.dv.VP.SetYOffset(m.dv.VP.YOffset() - m.dv.Height/2)
 		}
@@ -913,7 +913,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		if m.dv.Tree.Focused {
 			m.dv.Tree.MoveCursorBy(m.dv.Height)
 		} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			m.scrollAndSyncCursor(m.dv.Height)
+			m.dv.ScrollAndSyncCursor(m.dv.Height)
 		} else {
 			m.dv.VP.SetYOffset(m.dv.VP.YOffset() + m.dv.Height)
 		}
@@ -923,7 +923,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		if m.dv.Tree.Focused {
 			m.dv.Tree.MoveCursorBy(-m.dv.Height)
 		} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-			m.scrollAndSyncCursor(-m.dv.Height)
+			m.dv.ScrollAndSyncCursor(-m.dv.Height)
 		} else {
 			m.dv.VP.SetYOffset(m.dv.VP.YOffset() - m.dv.Height)
 		}
@@ -936,7 +936,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		} else {
 			m.dv.VP.GotoBottom()
 			if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-				m.syncDiffCursorToViewport()
+				m.dv.SyncDiffCursorToViewport()
 			}
 		}
 		return m, nil, true
@@ -948,7 +948,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			} else {
 				m.dv.VP.GotoTop()
 				if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
-					m.syncDiffCursorToViewport()
+					m.dv.SyncDiffCursorToViewport()
 				}
 			}
 			return m, nil, true
@@ -1381,32 +1381,11 @@ func (m *Model) selectTreeEntry() tea.Cmd {
 				m.formatFile(e.FileIndex)
 			}
 			m.rebuildContent()
-			m.scrollToDiffCursor()
+			m.dv.ScrollToDiffCursor()
 			m.saveViewState()
 		}
 	}
 	return nil
-}
-
-// --- Diff cursor ---
-
-func (m *Model) moveDiffCursor(delta int) {
-	if m.dv.CurrentFileIdx < 0 || m.dv.CurrentFileIdx >= len(m.dv.FileDiffs) {
-		return
-	}
-	m.dv.ThreadCursor = 0
-	lines := m.dv.FileDiffs[m.dv.CurrentFileIdx]
-	newPos := m.dv.DiffCursor + delta
-
-	for newPos >= 0 && newPos < len(lines) && lines[newPos].Type == components.LineHunk {
-		newPos += delta
-	}
-
-	if newPos < 0 || newPos >= len(lines) {
-		return
-	}
-	m.dv.DiffCursor = newPos
-	m.scrollToDiffCursor()
 }
 
 // lineHasComments returns true if the diff line at the given index has a comment thread.
@@ -1432,52 +1411,6 @@ func (m Model) lineHasComments(diffIdx int) bool {
 	return m.commentStore != nil && m.commentStore.FindThreadRoot(path, line, side) != ""
 }
 
-func (m *Model) moveDiffCursorBy(delta int) {
-	if m.dv.CurrentFileIdx < 0 || m.dv.CurrentFileIdx >= len(m.dv.FileDiffs) {
-		return
-	}
-	m.dv.ThreadCursor = 0
-	lines := m.dv.FileDiffs[m.dv.CurrentFileIdx]
-	newPos := m.dv.DiffCursor + delta
-
-	if newPos < 0 {
-		newPos = 0
-	}
-	if newPos >= len(lines) {
-		newPos = len(lines) - 1
-	}
-
-	if newPos >= 0 && newPos < len(lines) && lines[newPos].Type == components.LineHunk {
-		dir := 1
-		if delta < 0 {
-			dir = -1
-		}
-		found := false
-		for p := newPos + dir; p >= 0 && p < len(lines); p += dir {
-			if lines[p].Type != components.LineHunk {
-				newPos = p
-				found = true
-				break
-			}
-		}
-		if !found {
-			for p := newPos - dir; p >= 0 && p < len(lines); p -= dir {
-				if lines[p].Type != components.LineHunk {
-					newPos = p
-					found = true
-					break
-				}
-			}
-		}
-		if !found {
-			return
-		}
-	}
-
-	m.dv.DiffCursor = newPos
-	m.scrollToDiffCursor()
-}
-
 // goToSourceLine jumps the diff cursor to the line closest to the given
 // source line number (new side preferred, falls back to old side).
 func (m *Model) goToSourceLine(lineNo int) {
@@ -1490,7 +1423,7 @@ func (m *Model) goToSourceLine(lineNo int) {
 	m.dv.SelectionAnchor = -1
 	m.formatFile(idx)
 	m.rebuildContent()
-	m.scrollToDiffCursor()
+	m.dv.ScrollToDiffCursor()
 }
 
 // threadCommentCount returns the number of comments in the thread on the
@@ -1514,6 +1447,8 @@ func (m Model) threadCommentCount() int {
 	_ = path
 	return count
 }
+
+const scrollMargin = 5
 
 // scrollToThreadCursor scrolls the viewport to show the selected comment
 // using the exact rendered positions tracked by CommentPositions.
@@ -1657,145 +1592,6 @@ func (m *Model) scrollCommentBoxIntoView() {
 	bottom := m.dv.VP.YOffset() + vpH - 1
 	if boxBottom > bottom {
 		m.dv.VP.SetYOffset(boxBottom - vpH + 1)
-	}
-}
-
-const scrollMargin = 5
-
-func (m *Model) scrollToDiffCursor() {
-	idx := m.dv.CurrentFileIdx
-	if idx < 0 || idx >= len(m.dv.FileDiffOffsets) {
-		return
-	}
-	if m.dv.DiffCursor >= len(m.dv.FileDiffOffsets[idx]) {
-		return
-	}
-	vpH := m.dv.ViewportHeight()
-	absLine := m.dv.FileDiffOffsets[idx][m.dv.DiffCursor]
-	top := m.dv.VP.YOffset()
-	bottom := top + vpH - 1
-
-	if absLine < top+scrollMargin {
-		target := absLine - scrollMargin
-		if target < 0 {
-			target = 0
-		}
-		m.dv.VP.SetYOffset(target)
-	} else if absLine > bottom-scrollMargin {
-		m.dv.VP.SetYOffset(absLine - vpH + scrollMargin + 1)
-	}
-}
-
-// scrollAndSyncCursor scrolls the viewport by delta lines, then moves
-// the diff cursor to the diff line at the same screen-relative position.
-// This keeps the cursor visually stable (vim ctrl+d/u behavior).
-func (m *Model) scrollAndSyncCursor(delta int) {
-	m.dv.ThreadCursor = 0
-	idx := m.dv.CurrentFileIdx
-	if idx < 0 || idx >= len(m.dv.FileDiffOffsets) {
-		return
-	}
-
-	prevOffset := m.dv.VP.YOffset()
-
-	// Remember cursor's screen-relative position.
-	cursorAbs := 0
-	if m.dv.DiffCursor < len(m.dv.FileDiffOffsets[idx]) {
-		cursorAbs = m.dv.FileDiffOffsets[idx][m.dv.DiffCursor]
-	}
-	relPos := cursorAbs - prevOffset
-
-	// Scroll viewport.
-	m.dv.VP.SetYOffset(prevOffset + delta)
-
-	// Skip if viewport didn't actually move.
-	if m.dv.VP.YOffset() == prevOffset {
-		return
-	}
-
-	// Binary search for the closest non-hunk diff line to the target position.
-	targetAbs := m.dv.VP.YOffset() + relPos
-	offsets := m.dv.FileDiffOffsets[idx]
-	diffs := m.dv.FileDiffs[idx]
-
-	// Binary search: find the first offset >= targetAbs.
-	lo, hi := 0, len(offsets)-1
-	for lo < hi {
-		mid := (lo + hi) / 2
-		if offsets[mid] < targetAbs {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	// Check lo and neighbors for closest non-hunk line.
-	best := -1
-	bestDist := 0
-	for _, i := range []int{lo - 1, lo, lo + 1} {
-		if i < 0 || i >= len(offsets) {
-			continue
-		}
-		if i < len(diffs) && diffs[i].Type == components.LineHunk {
-			continue
-		}
-		dist := offsets[i] - targetAbs
-		if dist < 0 {
-			dist = -dist
-		}
-		if best == -1 || dist < bestDist {
-			best = i
-			bestDist = dist
-		}
-	}
-	if best >= 0 {
-		m.dv.DiffCursor = best
-	}
-}
-
-// findClosestDiffLine binary-searches for the non-hunk diff line closest to targetOffset.
-func findClosestDiffLine(offsets []int, diffs []components.DiffLine, targetOffset int) int {
-	if len(offsets) == 0 {
-		return -1
-	}
-	lo, hi := 0, len(offsets)-1
-	for lo < hi {
-		mid := (lo + hi) / 2
-		if offsets[mid] < targetOffset {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	best := -1
-	bestDist := 0
-	for _, i := range []int{lo - 1, lo, lo + 1} {
-		if i < 0 || i >= len(offsets) {
-			continue
-		}
-		if i < len(diffs) && diffs[i].Type == components.LineHunk {
-			continue
-		}
-		dist := offsets[i] - targetOffset
-		if dist < 0 {
-			dist = -dist
-		}
-		if best == -1 || dist < bestDist {
-			best = i
-			bestDist = dist
-		}
-	}
-	return best
-}
-
-func (m *Model) syncDiffCursorToViewport() {
-	idx := m.dv.CurrentFileIdx
-	if idx < 0 || idx >= len(m.dv.FileDiffOffsets) || len(m.dv.FileDiffOffsets[idx]) == 0 {
-		return
-	}
-	target := m.dv.VP.YOffset() + m.dv.ViewportHeight()/2
-	best := findClosestDiffLine(m.dv.FileDiffOffsets[idx], m.dv.FileDiffs[idx], target)
-	if best >= 0 {
-		m.dv.DiffCursor = best
 	}
 }
 
