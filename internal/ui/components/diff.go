@@ -123,9 +123,12 @@ func HighlightDiffFile(f github.PullRequestFile, fileContent, oldFileContent str
 	// Validate that new file content covers all line numbers in the diff.
 	// In branch mode, the working tree file may differ from the committed version,
 	// causing line number mismatches that produce blank rendered lines.
+	//
+	// Trim trailing newlines before counting since highlightBlock also trims
+	// trailing newlines, so the line count must match the split result.
 	newContentValid := fileContent != ""
 	if newContentValid {
-		fileLineCount := strings.Count(fileContent, "\n") + 1
+		fileLineCount := strings.Count(strings.TrimRight(fileContent, "\n"), "\n") + 1
 		for _, dl := range hd.DiffLines {
 			if dl.Type == LineAdd && dl.NewLineNo > fileLineCount {
 				newContentValid = false
@@ -141,7 +144,7 @@ func HighlightDiffFile(f github.PullRequestFile, fileContent, oldFileContent str
 	// Validate that old file content covers all old line numbers in the diff.
 	oldContentValid := oldFileContent != ""
 	if oldContentValid {
-		oldLineCount := strings.Count(oldFileContent, "\n") + 1
+		oldLineCount := strings.Count(strings.TrimRight(oldFileContent, "\n"), "\n") + 1
 		for _, dl := range hd.DiffLines {
 			if dl.Type == LineDel && dl.OldLineNo > oldLineCount {
 				oldContentValid = false
@@ -165,9 +168,12 @@ func HighlightDiffFile(f github.PullRequestFile, fileContent, oldFileContent str
 	// content for sequential access (needed for add/context lines).
 	if !newContentValid {
 		var codeBuilder strings.Builder
-		for _, dl := range hd.DiffLines {
+		for i, dl := range hd.DiffLines {
 			if dl.Type == LineHunk {
-				codeBuilder.WriteString("\n")
+				// Insert newline separator between hunks, but not before the first one.
+				if i > 0 {
+					codeBuilder.WriteString("\n")
+				}
 			} else {
 				codeBuilder.WriteString(dl.Content)
 				codeBuilder.WriteString("\n")
@@ -605,13 +611,19 @@ func formatDiffLinesRangeFromHL(diffLines []DiffLine, globalStart int, allDiffLi
 	useOldLineIndex := len(hlLinesOld) > 0 && detectUseOldLineIndex(allDiffLines, hlLinesOld)
 
 	// Compute hlIdx offset: count non-hunk lines before globalStart in sequential mode.
+	// In sequential mode, only hunks after the first have a separator line in hlLines.
 	hlIdx := 0
+	seenHunk := false
 	if !useNewLineIndex && !useOldLineIndex {
 		for i := 0; i < globalStart && i < len(allDiffLines); i++ {
-			if allDiffLines[i].Type != LineHunk {
-				hlIdx++
+			if allDiffLines[i].Type == LineHunk {
+				// Only count a slot for hunks after the first one.
+				if seenHunk {
+					hlIdx++
+				}
+				seenHunk = true
 			} else {
-				hlIdx++ // hunks also consume a slot in sequential mode
+				hlIdx++
 			}
 		}
 	}
@@ -621,9 +633,12 @@ func formatDiffLinesRangeFromHL(diffLines []DiffLine, globalStart int, allDiffLi
 		switch dl.Type {
 		case LineHunk:
 			dl.Rendered = renderHunkLine(dl.Content, width, colors)
-			if !useNewLineIndex && !useOldLineIndex {
+			// In sequential fallback mode, hunks after the first have a separator
+			// line in hlLines that we need to skip.
+			if !useNewLineIndex && !useOldLineIndex && seenHunk {
 				hlIdx++
 			}
+			seenHunk = true
 		case LineAdd:
 			var hl string
 			if useNewLineIndex {
@@ -737,14 +752,18 @@ func formatDiffLinesFromHL(diffLines []DiffLine, hlLines, hlLinesOld []string, f
 	useOldLineIndex := len(hlLinesOld) > 0 && detectUseOldLineIndex(diffLines, hlLinesOld)
 
 	hlIdx := 0
+	seenHunk := false
 	for i := range diffLines {
 		dl := &diffLines[i]
 		switch dl.Type {
 		case LineHunk:
 			dl.Rendered = renderHunkLine(dl.Content, width, colors)
-			if !useNewLineIndex && !useOldLineIndex {
+			// In sequential fallback mode, hunks after the first have a separator
+			// line in hlLines that we need to skip.
+			if !useNewLineIndex && !useOldLineIndex && seenHunk {
 				hlIdx++
 			}
+			seenHunk = true
 
 		case LineAdd:
 			var hl string

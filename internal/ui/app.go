@@ -87,6 +87,7 @@ type Model struct {
 	palette     terminal.Palette
 	repoRoot    string // local git repo root, if any
 	startupMode string // from CLI arg
+	startupPR   int    // specific PR number from CLI arg
 	width       int
 	height      int
 }
@@ -104,7 +105,8 @@ type AppConfig struct {
 	Owner    string
 	Repo     string
 	RepoRoot string // local git repo root, if any
-	Mode     string // "inbox", "pr", "diff", or "" (show picker)
+	Mode     string // "inbox", "pr", "diff", "pulls", or "" (show picker)
+	PRNumber int    // specific PR number for "pr" mode
 }
 
 // NewApp creates and returns a new top-level UI model.
@@ -116,6 +118,7 @@ func NewApp(cfg AppConfig) Model {
 		ctx:         ctx,
 		repoRoot:    cfg.RepoRoot,
 		startupMode: cfg.Mode,
+		startupPR:   cfg.PRNumber,
 	}
 
 	// If a mode was specified, open that view directly.
@@ -129,8 +132,12 @@ func NewApp(cfg AppConfig) Model {
 	case "inbox":
 		m.activeView = inboxui.New(ctx, m.nwo())
 	case "pr":
-		// PR mode starts with inbox, then fetches the branch PR in Init.
-		m.activeView = inboxui.New(ctx, m.nwo())
+		// PR mode with specific number, will fetch in Init.
+		// Show empty view while loading to avoid flashing inbox.
+		m.activeView = emptyView{}
+	case "pulls":
+		// Show the PR list for the specified repo.
+		m.activeView = prlist.New(ctx)
 	default:
 		// No mode specified — show startup picker over blank screen.
 		m.activeView = emptyView{}
@@ -151,8 +158,11 @@ func (m Model) Init() tea.Cmd {
 
 	switch m.startupMode {
 	case "pr":
-		// Fetch the PR for the current branch.
-		if m.repoRoot != "" && m.ctx.Owner != "" {
+		if m.startupPR > 0 {
+			// Fetch specific PR by number.
+			cmds = append(cmds, uictx.FetchPR(m.ctx.Client, m.ctx.Owner, m.ctx.Repo, m.startupPR))
+		} else if m.repoRoot != "" && m.ctx.Owner != "" {
+			// Fetch the PR for the current branch.
 			branch, _ := git.CurrentBranch(m.repoRoot)
 			if branch != "" {
 				cmds = append(cmds, uictx.FetchPRByBranch(m.ctx.Client, m.ctx.Owner, m.ctx.Repo, branch))
