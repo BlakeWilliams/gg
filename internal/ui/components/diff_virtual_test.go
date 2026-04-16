@@ -184,8 +184,8 @@ func TestRenderLineRange_CommentHighlight(t *testing.T) {
 
 	// Render with highlight on the comment.
 	opts := DiffFormatOptions{
-		HighlightThreadLine:  2,
-		HighlightThreadSide:  "RIGHT",
+		HighlightThreadLine:   2,
+		HighlightThreadSide:   "RIGHT",
 		HighlightCommentIndex: 1,
 	}
 	lines, _ := RenderLineRange(hl, layout, 0, layout.TotalRenderedLines, 80, colors, comments, opts)
@@ -498,4 +498,279 @@ func TestCommentThread_AtBufferBoundary(t *testing.T) {
 	if len(lines) == 0 {
 		t.Fatal("expected non-empty result even with comment at boundary")
 	}
+}
+
+func TestFormatDiffFile_LineOrdering(t *testing.T) {
+	// Simplified version of localdiff.go patch - multiple hunks with adds/removes
+	patch := `@@ -11,12 +11,13 @@ import (
+ "github.com/blakewilliams/ghq/internal/git"
+ "github.com/blakewilliams/ghq/internal/github"
+ "github.com/blakewilliams/ghq/internal/ui/components"
++"github.com/blakewilliams/ghq/internal/ui/diffviewer"
+ "github.com/blakewilliams/ghq/internal/ui/picker"
+ "github.com/blakewilliams/ghq/internal/ui/styles"
+ "github.com/blakewilliams/ghq/internal/ui/uictx"
+ "github.com/blakewilliams/ghq/internal/git/watcher"
++"charm.land/bubbles/v2/spinner"
+ "charm.land/bubbles/v2/textarea"
+-"charm.land/bubbles/v2/viewport"
+ tea "charm.land/bubbletea/v2"
+ "charm.land/lipgloss/v2"
+@@ -73,20 +74,10 @@ type prDetectFailedMsg struct{}
+ var dimStyle = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
+
+ type Model struct {
+-ctx    *uictx.Context
+-width  int
+-height int
++// Embedded diff viewer (shared with prdetail).
++dv  diffviewer.DiffViewer
++ctx *uictx.Context // alias for dv.Ctx
+
+ // Git state.
+ repoRoot string
+ branch   string
+ mode     git.DiffMode
+
+-// Right panel viewport.
+-vp      viewport.Model
+-vpReady bool`
+
+	file := github.PullRequestFile{
+		Filename: "internal/ui/localdiff/localdiff.go",
+		Patch:    patch,
+		Status:   "modified",
+	}
+	hl := HighlightDiffFile(file, "", "", nil)
+
+	result := FormatDiffFile(hl, 120, styles.DiffColors{}, nil)
+	lines := strings.Split(result.Content, "\n")
+
+	// Find key content and verify ordering
+	var (
+		modelStructLine = -1
+		viewportLine    = -1
+		ctxContextLine  = -1 // "ctx *uictx.Context" new line
+		gitStateLine    = -1
+	)
+
+	for i, line := range lines {
+		if strings.Contains(line, "type Model struct") {
+			modelStructLine = i
+		}
+		if strings.Contains(line, "viewport") {
+			viewportLine = i
+		}
+		if strings.Contains(line, "ctx *uictx.Context") {
+			ctxContextLine = i
+		}
+		if strings.Contains(line, "// Git state") {
+			gitStateLine = i
+		}
+	}
+
+	// viewport import deletion should be in the FIRST hunk (imports section)
+	// Model struct should be in the SECOND hunk
+	// So viewport line should come BEFORE Model struct line
+	if viewportLine > modelStructLine && modelStructLine > 0 {
+		t.Errorf("viewport deletion (line %d) should appear before 'type Model struct' (line %d)\nContent around Model struct:\n%s",
+			viewportLine, modelStructLine,
+			strings.Join(lines[max(0, modelStructLine-3):min(len(lines), modelStructLine+10)], "\n"))
+	}
+
+	// ctx *uictx.Context should come AFTER type Model struct (it's inside the struct)
+	if modelStructLine >= 0 && ctxContextLine >= 0 && ctxContextLine < modelStructLine {
+		t.Errorf("'ctx *uictx.Context' (line %d) should appear after 'type Model struct' (line %d)",
+			ctxContextLine, modelStructLine)
+	}
+
+	// Git state comment should come after ctx line
+	if ctxContextLine >= 0 && gitStateLine >= 0 && gitStateLine < ctxContextLine {
+		t.Errorf("'// Git state' (line %d) should appear after 'ctx *uictx.Context' (line %d)",
+			gitStateLine, ctxContextLine)
+	}
+
+	t.Logf("Line positions: viewport=%d, modelStruct=%d, ctxContext=%d, gitState=%d",
+		viewportLine, modelStructLine, ctxContextLine, gitStateLine)
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func TestFormatDiffFile_LineOrdering_Debug(t *testing.T) {
+	// Same patch as above
+	patch := `@@ -11,12 +11,13 @@ import (
+ "github.com/blakewilliams/ghq/internal/git"
+ "github.com/blakewilliams/ghq/internal/github"
+ "github.com/blakewilliams/ghq/internal/ui/components"
++"github.com/blakewilliams/ghq/internal/ui/diffviewer"
+ "github.com/blakewilliams/ghq/internal/ui/picker"
+ "github.com/blakewilliams/ghq/internal/ui/styles"
+ "github.com/blakewilliams/ghq/internal/ui/uictx"
+ "github.com/blakewilliams/ghq/internal/git/watcher"
++"charm.land/bubbles/v2/spinner"
+ "charm.land/bubbles/v2/textarea"
+-"charm.land/bubbles/v2/viewport"
+ tea "charm.land/bubbletea/v2"
+ "charm.land/lipgloss/v2"
+@@ -73,20 +74,10 @@ type prDetectFailedMsg struct{}
+ var dimStyle = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
+
+ type Model struct {
+-ctx    *uictx.Context
+-width  int
+-height int
++// Embedded diff viewer (shared with prdetail).
++dv  diffviewer.DiffViewer
++ctx *uictx.Context // alias for dv.Ctx
+
+ // Git state.
+ repoRoot string
+ branch   string
+ mode     git.DiffMode
+
+-// Right panel viewport.
+-vp      viewport.Model
+-vpReady bool`
+
+	file := github.PullRequestFile{
+		Filename: "internal/ui/localdiff/localdiff.go",
+		Patch:    patch,
+		Status:   "modified",
+	}
+	hl := HighlightDiffFile(file, "", "", nil)
+	result := FormatDiffFile(hl, 120, styles.DiffColors{}, nil)
+
+	t.Logf("Full content:\n%s", result.Content)
+}
+
+func TestRenderLineRange_MultiHunk(t *testing.T) {
+	// Same patch with two hunks
+	patch := `@@ -11,12 +11,13 @@ import (
+ "github.com/blakewilliams/ghq/internal/git"
+ "github.com/blakewilliams/ghq/internal/github"
+ "github.com/blakewilliams/ghq/internal/ui/components"
++"github.com/blakewilliams/ghq/internal/ui/diffviewer"
+ "github.com/blakewilliams/ghq/internal/ui/picker"
+ "github.com/blakewilliams/ghq/internal/ui/styles"
+ "github.com/blakewilliams/ghq/internal/ui/uictx"
+ "github.com/blakewilliams/ghq/internal/git/watcher"
++"charm.land/bubbles/v2/spinner"
+ "charm.land/bubbles/v2/textarea"
+-"charm.land/bubbles/v2/viewport"
+ tea "charm.land/bubbletea/v2"
+ "charm.land/lipgloss/v2"
+@@ -73,20 +74,10 @@ type prDetectFailedMsg struct{}
+ var dimStyle = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
+
+ type Model struct {
+-ctx    *uictx.Context
+-width  int
+-height int
++// Embedded diff viewer (shared with prdetail).
++dv  diffviewer.DiffViewer
++ctx *uictx.Context // alias for dv.Ctx
+
+ // Git state.
+ repoRoot string
+ branch   string
+ mode     git.DiffMode
+
+-// Right panel viewport.
+-vp      viewport.Model
+-vpReady bool`
+
+	file := github.PullRequestFile{
+		Filename: "internal/ui/localdiff/localdiff.go",
+		Patch:    patch,
+		Status:   "modified",
+	}
+	hl := HighlightDiffFile(file, "", "", nil)
+	layout := ComputeDiffLayout(hl, 120, nil)
+
+	// Render lines 15-25 which should span from first hunk into second hunk
+	content, _ := RenderLineRange(hl, layout, 15, 25, 120, styles.DiffColors{}, nil)
+
+	t.Logf("Lines 15-25:\n%s", strings.Join(content, "\n"))
+
+	// Check that viewport (first hunk) and Model struct (second hunk) don't intermix
+	var viewportIdx, modelIdx int = -1, -1
+	for i, line := range content {
+		if strings.Contains(line, "viewport") {
+			viewportIdx = i
+		}
+		if strings.Contains(line, "Model struct") {
+			modelIdx = i
+		}
+	}
+
+	// If both are present, viewport should come before Model
+	if viewportIdx >= 0 && modelIdx >= 0 && viewportIdx > modelIdx {
+		t.Errorf("viewport (line %d) should appear before Model struct (line %d) in rendered range", viewportIdx, modelIdx)
+	}
+}
+
+func TestRenderLineRange_HunkBoundary(t *testing.T) {
+	// Same patch
+	patch := `@@ -11,12 +11,13 @@ import (
+ "github.com/blakewilliams/ghq/internal/git"
+ "github.com/blakewilliams/ghq/internal/github"
+ "github.com/blakewilliams/ghq/internal/ui/components"
++"github.com/blakewilliams/ghq/internal/ui/diffviewer"
+ "github.com/blakewilliams/ghq/internal/ui/picker"
+ "github.com/blakewilliams/ghq/internal/ui/styles"
+ "github.com/blakewilliams/ghq/internal/ui/uictx"
+ "github.com/blakewilliams/ghq/internal/git/watcher"
++"charm.land/bubbles/v2/spinner"
+ "charm.land/bubbles/v2/textarea"
+-"charm.land/bubbles/v2/viewport"
+ tea "charm.land/bubbletea/v2"
+ "charm.land/lipgloss/v2"
+@@ -73,20 +74,10 @@ type prDetectFailedMsg struct{}
+ var dimStyle = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
+
+ type Model struct {
+-ctx    *uictx.Context
+-width  int
+-height int
++// Embedded diff viewer (shared with prdetail).
++dv  diffviewer.DiffViewer
++ctx *uictx.Context // alias for dv.Ctx
+
+ // Git state.
+ repoRoot string
+ branch   string
+ mode     git.DiffMode
+
+-// Right panel viewport.
+-vp      viewport.Model
+-vpReady bool`
+
+	file := github.PullRequestFile{
+		Filename: "internal/ui/localdiff/localdiff.go",
+		Patch:    patch,
+		Status:   "modified",
+	}
+	hl := HighlightDiffFile(file, "", "", nil)
+	layout := ComputeDiffLayout(hl, 120, nil)
+
+	t.Logf("Total rendered lines: %d", layout.TotalRenderedLines)
+	t.Logf("Diff line offsets: %v", layout.DiffLineOffsets)
+
+	// Render lines around the hunk boundary (end of first hunk, start of second)
+	// First hunk has 15 lines (1 hunk header + 14 content lines)
+	// Try rendering lines 10-20 to see the boundary
+	content, _ := RenderLineRange(hl, layout, 10, 20, 120, styles.DiffColors{}, nil)
+	t.Logf("Lines 10-20 (around hunk boundary):\n%s", strings.Join(content, "\n"))
 }

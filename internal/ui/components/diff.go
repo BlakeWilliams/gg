@@ -7,12 +7,12 @@ import (
 	"strings"
 	"time"
 
+	"charm.land/lipgloss/v2"
 	"github.com/alecthomas/chroma/v2"
 	"github.com/alecthomas/chroma/v2/formatters"
 	"github.com/alecthomas/chroma/v2/lexers"
 	chromastyles "github.com/alecthomas/chroma/v2/styles"
 	"github.com/charmbracelet/x/ansi"
-	"charm.land/lipgloss/v2"
 
 	"github.com/blakewilliams/ghq/internal/github"
 	"github.com/blakewilliams/ghq/internal/ui/styles"
@@ -70,10 +70,10 @@ var (
 
 // CommentPosition records the rendered line offset for a comment in a thread.
 type CommentPosition struct {
-	Line int    // diff line number (source)
-	Side string // "LEFT" or "RIGHT"
-	Idx  int    // 0-based index within the thread
-	Offset int  // rendered line index where this comment's header starts
+	Line   int    // diff line number (source)
+	Side   string // "LEFT" or "RIGHT"
+	Idx    int    // 0-based index within the thread
+	Offset int    // rendered line index where this comment's header starts
 }
 
 // ThreadRange tracks the byte range of a comment thread in the rendered content.
@@ -120,42 +120,9 @@ func HighlightDiffFile(f github.PullRequestFile, fileContent, oldFileContent str
 	}
 	hd.DiffLines = ParsePatchLines(f.Patch)
 
-	// Validate that new file content covers all line numbers in the diff.
-	// In branch mode, the working tree file may differ from the committed version,
-	// causing line number mismatches that produce blank rendered lines.
-	//
-	// Trim trailing newlines before counting since highlightBlock also trims
-	// trailing newlines, so the line count must match the split result.
+	// Simply use the provided content if non-empty - trust the caller.
 	newContentValid := fileContent != ""
-	if newContentValid {
-		fileLineCount := strings.Count(strings.TrimRight(fileContent, "\n"), "\n") + 1
-		for _, dl := range hd.DiffLines {
-			if dl.Type == LineAdd && dl.NewLineNo > fileLineCount {
-				newContentValid = false
-				break
-			}
-			if dl.Type == LineContext && dl.NewLineNo > fileLineCount {
-				newContentValid = false
-				break
-			}
-		}
-	}
-
-	// Validate that old file content covers all old line numbers in the diff.
 	oldContentValid := oldFileContent != ""
-	if oldContentValid {
-		oldLineCount := strings.Count(strings.TrimRight(oldFileContent, "\n"), "\n") + 1
-		for _, dl := range hd.DiffLines {
-			if dl.Type == LineDel && dl.OldLineNo > oldLineCount {
-				oldContentValid = false
-				break
-			}
-			if dl.Type == LineContext && dl.OldLineNo > oldLineCount {
-				oldContentValid = false
-				break
-			}
-		}
-	}
 
 	if newContentValid {
 		hd.HlLines = highlightFileLines(fileContent, f.Filename, chromaStyle)
@@ -509,13 +476,13 @@ func RenderSingleThread(comments []github.ReviewComment, width int, lt LineType,
 }
 
 type DiffLayout struct {
-	TotalRenderedLines int               // total height when fully rendered
-	DiffLineOffsets    []int             // diff line index → first rendered line
-	RenderedLineCounts []int             // how many rendered lines each diff line produces
-	CommentLineCounts  []int             // rendered lines for comment thread below each diff line (0 if none)
+	TotalRenderedLines int   // total height when fully rendered
+	DiffLineOffsets    []int // diff line index → first rendered line
+	RenderedLineCounts []int // how many rendered lines each diff line produces
+	CommentLineCounts  []int // rendered lines for comment thread below each diff line (0 if none)
 	CommentPositions   []CommentPosition
-	ColW               int               // gutter column width
-	GutterW            int               // total gutter width
+	ColW               int                                   // gutter column width
+	GutterW            int                                   // total gutter width
 	CommentsByLine     map[commentKey][]github.ReviewComment // pre-built thread map
 }
 
@@ -807,11 +774,9 @@ func formatDiffLinesRangeFromHL(diffLines []DiffLine, globalStart int, allDiffLi
 			var hl string
 			if useOldLineIndex {
 				hl = getHighlightedLine(hlLinesOld, dl.OldLineNo)
-			} else if hlIdx < len(hlLines) {
-				hl = hlLines[hlIdx]
-				hlIdx++
 			} else {
-				// Fallback: highlight single line (slower but handles edge cases)
+				// Fallback: highlight single line (slower but handles edge cases).
+				// Never use hlLines (new file content) for deleted lines.
 				hl = highlightSnippet(dl.Content, filename, colors.ChromaStyle)
 			}
 			hl = expandTabs(hl)
@@ -894,10 +859,6 @@ func formatDiffLinesFromHL(diffLines []DiffLine, hlLines, hlLinesOld []string, f
 	// Detect if hlLines are indexed by line number (full file) or sequential (fallback).
 	// Full file mode: hlLines[lineNo-1] gives the highlighted line.
 	// Fallback mode: hlLines are in diff order (including blank for hunks).
-	// Detect if hlLines are from full-file highlighting (indexed by line number)
-	// or from fallback diff-based highlighting (sequential).
-	// Full-file mode: every line number in the diff must be within hlLines range.
-	// If ANY line number exceeds hlLines, it's fallback (sequential) mode.
 	useNewLineIndex := detectUseLineIndex(diffLines, hlLines)
 	useOldLineIndex := len(hlLinesOld) > 0 && detectUseOldLineIndex(diffLines, hlLinesOld)
 
@@ -934,11 +895,9 @@ func formatDiffLinesFromHL(diffLines []DiffLine, hlLines, hlLinesOld []string, f
 			var hl string
 			if useOldLineIndex {
 				hl = getHighlightedLine(hlLinesOld, dl.OldLineNo)
-			} else if hlIdx < len(hlLines) {
-				hl = hlLines[hlIdx]
-				hlIdx++
 			} else {
-				// Fallback: highlight single line (slower but handles edge cases)
+				// Fallback: highlight single line (slower but handles edge cases).
+				// Never use hlLines (new file content) for deleted lines.
 				hl = highlightSnippet(dl.Content, filename, colors.ChromaStyle)
 			}
 			hl = expandTabs(hl)
@@ -1232,7 +1191,6 @@ func bgForLineType(lt LineType, colors styles.DiffColors) string {
 	}
 }
 
-
 // commentGutter renders an empty gutter matching the diff line style.
 func commentGutter(bg string, gutterW int) string {
 	return bg + strings.Repeat(" ", gutterW)
@@ -1249,8 +1207,8 @@ func emptyLine(bg string, width int) string {
 // When highlighted is true, the border uses yellow instead of the dim default.
 // commentThreadResult holds the rendered thread string and per-comment line counts.
 type commentThreadResult struct {
-	content       string
-	commentLines  []int // rendered line count for each comment (header + body)
+	content      string
+	commentLines []int // rendered line count for each comment (header + body)
 }
 
 // renderCommentThread renders a thread of review comments.

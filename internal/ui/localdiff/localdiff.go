@@ -6,20 +6,20 @@ import (
 	"strings"
 	"time"
 
+	"charm.land/bubbles/v2/spinner"
+	"charm.land/bubbles/v2/textarea"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	"github.com/blakewilliams/ghq/internal/git"
+	"github.com/blakewilliams/ghq/internal/git/watcher"
+	"github.com/blakewilliams/ghq/internal/github"
 	"github.com/blakewilliams/ghq/internal/review/comments"
 	"github.com/blakewilliams/ghq/internal/review/copilot"
-	"github.com/blakewilliams/ghq/internal/git"
-	"github.com/blakewilliams/ghq/internal/github"
 	"github.com/blakewilliams/ghq/internal/ui/components"
 	"github.com/blakewilliams/ghq/internal/ui/diffviewer"
 	"github.com/blakewilliams/ghq/internal/ui/picker"
 	"github.com/blakewilliams/ghq/internal/ui/styles"
 	"github.com/blakewilliams/ghq/internal/ui/uictx"
-	"github.com/blakewilliams/ghq/internal/git/watcher"
-	"charm.land/bubbles/v2/spinner"
-	"charm.land/bubbles/v2/textarea"
-	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 
 	"github.com/google/uuid"
 )
@@ -89,6 +89,9 @@ type Model struct {
 	// Tracks which files have real Chroma highlighting (vs placeholder).
 	chromaHighlighted map[int]bool
 
+	// Mode used for last highlight generation (to invalidate cache on mode change).
+	lastHighlightMode git.DiffMode
+
 	// Comments.
 	commentStore *comments.CommentStore
 	replyToID    string
@@ -144,19 +147,19 @@ func New(ctx *uictx.Context, repoRoot string, width, height int) Model {
 	dv.InitSpinner()
 
 	return Model{
-		ctx: ctx,
-		dv:  dv,
+		ctx:               ctx,
+		dv:                dv,
 		chromaHighlighted: make(map[int]bool),
 		repoRoot:          repoRoot,
 		branch:            branch,
 		mode:              active.Mode,
-		watcher:       w,
-		commentStore:  cs,
-		fileCursors:   make(map[string]int),
-		filePathIndex: make(map[string]int),
-		savedFilename: vs.Filename,
-		savedLineNo:   vs.LineNo,
-		savedSide:     vs.Side,
+		watcher:           w,
+		commentStore:      cs,
+		fileCursors:       make(map[string]int),
+		filePathIndex:     make(map[string]int),
+		savedFilename:     vs.Filename,
+		savedLineNo:       vs.LineNo,
+		savedSide:         vs.Side,
 	}
 }
 
@@ -347,27 +350,36 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		m.dv.FileDiffs = make([][]components.DiffLine, len(msg.files))
 		m.dv.FileDiffOffsets = make([][]int, len(msg.files))
 		m.dv.FileCommentPositions = make([][]components.CommentPosition, len(msg.files))
+		m.dv.FileRenderCache = make([]*components.DiffRenderResult, len(msg.files))
 		m.fileLayouts = make([]components.DiffLayout, len(msg.files))
 		m.rebuildFilePathIndex()
 		m.dv.FilesListLoaded = true
 
-		// Reuse cached highlights for files whose patch hasn't changed.
+		// Reuse cached highlights for files whose patch hasn't changed AND mode is the same.
+		// Mode change requires re-highlighting because branch mode reads from HEAD commit
+		// while working/staged modes read from the working tree.
+		modeChanged := m.lastHighlightMode != m.mode
 		var needHighlight []int
 		for i, f := range msg.files {
 			m.dv.FileDiffs[i] = components.ParsePatchLines(f.Patch)
-			if old, ok := oldPatches[f.Filename]; ok && old == f.Patch {
-				if hl, ok := oldHighlights[f.Filename]; ok {
-					m.dv.HighlightedFiles[i] = hl
-					m.dv.RenderedFiles[i] = oldRendered[f.Filename]
-					m.dv.FileDiffOffsets[i] = oldOffsets[f.Filename]
-					continue
+			if !modeChanged {
+				if old, ok := oldPatches[f.Filename]; ok && old == f.Patch {
+					if hl, ok := oldHighlights[f.Filename]; ok {
+						m.dv.HighlightedFiles[i] = hl
+						m.dv.RenderedFiles[i] = oldRendered[f.Filename]
+						m.dv.FileDiffOffsets[i] = oldOffsets[f.Filename]
+						continue
+					}
 				}
 			}
 			// Keep stale rendered content so the viewport doesn't flash
 			// a skeleton while the new highlight is in progress.
-			if rendered, ok := oldRendered[f.Filename]; ok {
-				m.dv.RenderedFiles[i] = rendered
-				m.dv.FileDiffOffsets[i] = oldOffsets[f.Filename]
+			// But DON'T copy old offsets when mode changed - they're wrong.
+			if !modeChanged {
+				if rendered, ok := oldRendered[f.Filename]; ok {
+					m.dv.RenderedFiles[i] = rendered
+					m.dv.FileDiffOffsets[i] = oldOffsets[f.Filename]
+				}
 			}
 			needHighlight = append(needHighlight, i)
 		}
@@ -420,6 +432,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 					break
 				}
 			}
+			m.lastHighlightMode = m.mode // track mode for cache invalidation
 			cmds := []tea.Cmd{m.highlightFileCmd(needHighlight[0])}
 			// Show spinner if the current file is being highlighted.
 			if needHighlight[0] == m.dv.CurrentFileIdx {
@@ -428,6 +441,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 			}
 			return m, tea.Batch(cmds...)
 		}
+		m.lastHighlightMode = m.mode // track mode even if no files needed highlighting
 		m.dv.FilesLoading = false
 		return m, nil
 
@@ -934,12 +948,10 @@ func (m Model) View() string {
 	if !m.dv.VPReady {
 		return ""
 	}
-
 	rightView := m.dv.VP.View()
 	if m.dv.CurrentFileIdx >= 0 {
 		rightView = m.dv.OverlayDiffCursor(rightView)
 	}
-
 	return m.renderLayout(rightView)
 }
 
@@ -1042,6 +1054,25 @@ func (m *Model) buildVirtualFileContent(idx, w int) string {
 	return rendered + "\n" + strings.Repeat("\n", m.dv.Height/2)
 }
 
+func stripAnsi(s string) string {
+	// Simple ANSI stripper
+	result := make([]byte, 0, len(s))
+	inEscape := false
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\033' {
+			inEscape = true
+			continue
+		}
+		if inEscape {
+			if (s[i] >= 'a' && s[i] <= 'z') || (s[i] >= 'A' && s[i] <= 'Z') {
+				inEscape = false
+			}
+			continue
+		}
+		result = append(result, s[i])
+	}
+	return string(result)
+}
 
 // spliceThreadForComment delegates to DiffViewer's splice method.
 func (m *Model) spliceThreadForComment(fileIdx int, commentID string) {
@@ -1064,10 +1095,18 @@ func (m Model) highlightFileCmd(index int) tea.Cmd {
 	return func() tea.Msg {
 		var fileContent, oldFileContent string
 
-		// Get new file content (working tree) for added/modified files.
+		// Get new file content for added/modified files.
 		if f.Status != "removed" && f.Patch != "" {
-			if content, err := git.FileContent(repoRoot, f.Filename); err == nil {
-				fileContent = content
+			if mode == git.DiffBranch {
+				// Branch mode diff is merge-base..HEAD (committed), so use committed HEAD.
+				if content, err := git.FileContentAtRef(repoRoot, f.Filename, "HEAD"); err == nil {
+					fileContent = content
+				}
+			} else {
+				// Working/Staged mode: use working tree
+				if content, err := git.FileContent(repoRoot, f.Filename); err == nil {
+					fileContent = content
+				}
 			}
 		}
 
@@ -1078,10 +1117,7 @@ func (m Model) highlightFileCmd(index int) tea.Cmd {
 			case git.DiffWorking, git.DiffStaged:
 				ref = "HEAD"
 			case git.DiffBranch:
-				// For branch mode, we need the merge-base.
-				// FileContentAtRef with HEAD works since the diff is against merge-base
-				// but the old lines come from the current branch's version at that point.
-				// Actually, for branch mode the "old" side is the merge-base commit.
+				// For branch mode, the "old" side is the merge-base commit.
 				defaultBranch, _ := git.DefaultBranch(repoRoot)
 				if mb, err := git.MergeBase(repoRoot, defaultBranch); err == nil {
 					ref = mb
@@ -1555,21 +1591,26 @@ func (m Model) handleCommentKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			m.dv.CopilotDots = 0
 		}
 
-		// Try splice-based update (O(content) vs O(n) full re-render).
-		spliced := false
+		// In branch mode, always use full re-render (InsertThread has offset issues
+		// due to different file content sources). In other modes, try splice-based
+		// update for O(content) instead of O(n) performance.
 		fileIdx := m.dv.CurrentFileIdx
-		if m.replyToID != "" {
-			// Reply to existing thread — use SpliceThread.
-			m.dv.SpliceThreadForComment(fileIdx, comment.Side, comment.Line)
-			spliced = true
-		} else {
-			// New thread — use InsertThread.
-			diffLineIdx := m.dv.DiffLineIdxForComment(fileIdx, comment.Side, comment.Line)
-			if diffLineIdx >= 0 {
-				threadComments := m.commentStore.ForFile(comment.Path)
-				filtered := components.CommentsForThread(threadComments, comment.Side, comment.Line)
-				if m.dv.InsertThread(fileIdx, diffLineIdx, comment.Side, comment.Line, filtered) {
-					spliced = true
+		spliced := false
+
+		if m.mode != git.DiffBranch {
+			if m.replyToID != "" {
+				// Reply to existing thread — use SpliceThread.
+				m.dv.SpliceThreadForComment(fileIdx, comment.Side, comment.Line)
+				spliced = true
+			} else {
+				// New thread — use InsertThread.
+				diffLineIdx := m.dv.DiffLineIdxForComment(fileIdx, comment.Side, comment.Line)
+				if diffLineIdx >= 0 {
+					threadComments := m.commentStore.ForFile(comment.Path)
+					filtered := components.CommentsForThread(threadComments, comment.Side, comment.Line)
+					if m.dv.InsertThread(fileIdx, diffLineIdx, comment.Side, comment.Line, filtered) {
+						spliced = true
+					}
 				}
 			}
 		}
@@ -2245,4 +2286,3 @@ func (m Model) getFullFileDiff(path string) string {
 	}
 	return ""
 }
-
