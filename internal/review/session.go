@@ -177,10 +177,18 @@ func (s *Session) FormatFile(path string, width int, colors styles.DiffColors, o
 		opt = opts[0]
 	}
 
-	result := components.FormatDiffFile(*f.Highlighted, width, colors, f.AllComments(), opt)
-	f.Rendered = result.Content
-	f.DiffOffsets = result.DiffLineOffsets
-	f.CommentPositions = result.CommentPositions
+	diffLines := make([]components.DiffLine, len(f.Highlighted.DiffLines))
+	copy(diffLines, f.Highlighted.DiffLines)
+
+	colW := components.GutterColWidth(diffLines)
+	components.FormatDiffLinesFromHL(diffLines, f.Highlighted.HlLines, f.Highlighted.HlLinesOld, f.Highlighted.Filename, width, colors, colW)
+
+	list := components.BuildRenderList(diffLines, f.AllComments(), opt)
+	rc := components.RenderContext{Width: width, Colors: colors, ColW: colW}
+
+	f.Rendered = list.String(rc)
+	f.DiffOffsets = list.DiffLineOffsets(len(diffLines), rc)
+	f.CommentPositions = list.CommentPositions(rc)
 }
 
 // RemoveFile removes a file from the session.

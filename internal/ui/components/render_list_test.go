@@ -3,9 +3,35 @@ package components
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/blakewilliams/ghq/internal/github"
+	"github.com/blakewilliams/ghq/internal/ui/styles"
 )
+
+func testColors() styles.DiffColors {
+	return styles.DiffColors{
+		BorderFg:          "\033[90m",
+		HighlightBorderFg: "\033[33m",
+	}
+}
+
+func intPtr(i int) *int { return &i }
+
+func makeComment(id int, body, path string, line int, side string, replyTo *int) github.ReviewComment {
+	return github.ReviewComment{
+		ID:           id,
+		Body:         body,
+		Path:         path,
+		Line:         &line,
+		OriginalLine: &line,
+		Side:         side,
+		InReplyToID:  replyTo,
+		User:         github.User{Login: "testuser"},
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
+	}
+}
 
 func makeDiffLineItem(idx int, lt LineType, content string) *DiffLineItem {
 	dl := &DiffLine{
@@ -268,24 +294,19 @@ func TestFileRenderList_InvalidateAll(t *testing.T) {
 	}
 }
 
-func TestBuildRenderList_MatchesFormatDiffFile(t *testing.T) {
-	// Build a realistic highlighted diff with comments.
+func TestBuildRenderList_OutputStructure(t *testing.T) {
+	// Build a realistic highlighted diff with comments and verify the render
+	// list produces structurally valid output (offsets, comment positions, etc.).
 	patch := `@@ -1,3 +1,4 @@
  context line 1
 +added line 2
  context line 3
  context line 4`
 
-	file := github.PullRequestFile{
-		Filename: "test.go",
-		Patch:    patch,
-		Status:   "modified",
-	}
-
 	diffLines := ParsePatchLines(patch)
 	colW := GutterColWidth(diffLines)
 
-	// Pre-format lines (same as FormatDiffFile does internally).
+	// Pre-format lines.
 	formattedLines := make([]DiffLine, len(diffLines))
 	copy(formattedLines, diffLines)
 	colors := testColors()
@@ -303,52 +324,44 @@ func TestBuildRenderList_MatchesFormatDiffFile(t *testing.T) {
 		},
 	}
 
-	// Get the old way's output.
-	hd := HighlightedDiff{
-		File:      file,
-		DiffLines: diffLines,
-		Filename:  "test.go",
-	}
-	oldResult := FormatDiffFile(hd, 80, colors, comments)
-
-	// Build render list from pre-formatted lines.
+	// Build render list.
 	list := BuildRenderList(formattedLines, comments)
 	rc := RenderContext{Width: 80, Colors: colors, ColW: colW}
-	newResult := list.String(rc)
+	result := list.String(rc)
 
-	if oldResult.Content != newResult {
-		// Find first difference for debugging.
-		oldLines := strings.Split(oldResult.Content, "\n")
-		newLines := strings.Split(newResult, "\n")
-		maxLen := len(oldLines)
-		if len(newLines) > maxLen {
-			maxLen = len(newLines)
-		}
-		for i := 0; i < maxLen; i++ {
-			var ol, nl string
-			if i < len(oldLines) {
-				ol = oldLines[i]
-			}
-			if i < len(newLines) {
-				nl = newLines[i]
-			}
-			if ol != nl {
-				t.Errorf("first difference at line %d:\n  old: %q\n  new: %q", i, ol, nl)
-				break
-			}
-		}
-		t.Errorf("output lengths: old=%d new=%d", len(oldResult.Content), len(newResult))
+	// Verify output is non-empty and has expected number of lines.
+	if result == "" {
+		t.Fatal("render list produced empty output")
 	}
 
-	// Verify DiffLineOffsets match.
-	oldOffsets := oldResult.DiffLineOffsets
-	newOffsets := list.DiffLineOffsets(len(diffLines), rc)
-	if len(oldOffsets) != len(newOffsets) {
-		t.Fatalf("offset count mismatch: old=%d new=%d", len(oldOffsets), len(newOffsets))
+	resultLines := strings.Split(result, "\n")
+	// Should have 4 diff lines + comment thread lines.
+	if len(resultLines) < 4 {
+		t.Errorf("expected at least 4 lines, got %d", len(resultLines))
 	}
-	for i := range oldOffsets {
-		if oldOffsets[i] != newOffsets[i] {
-			t.Errorf("DiffLineOffsets[%d]: old=%d new=%d", i, oldOffsets[i], newOffsets[i])
+
+	// Verify DiffLineOffsets: should have one entry per diff line.
+	offsets := list.DiffLineOffsets(len(diffLines), rc)
+	if len(offsets) != len(diffLines) {
+		t.Fatalf("offset count mismatch: got %d, want %d", len(offsets), len(diffLines))
+	}
+
+	// Offsets should be non-decreasing.
+	for i := 1; i < len(offsets); i++ {
+		if offsets[i] < offsets[i-1] {
+			t.Errorf("offsets not non-decreasing: [%d]=%d [%d]=%d", i-1, offsets[i-1], i, offsets[i])
 		}
+	}
+
+	// Comment positions should exist and point to valid lines.
+	positions := list.CommentPositions(rc)
+	if len(positions) != 1 {
+		t.Fatalf("expected 1 comment position, got %d", len(positions))
+	}
+	if positions[0].Line != 2 || positions[0].Side != "RIGHT" {
+		t.Errorf("unexpected position: line=%d side=%s", positions[0].Line, positions[0].Side)
+	}
+	if positions[0].Offset <= 0 || positions[0].Offset >= len(resultLines) {
+		t.Errorf("comment offset %d out of range (content has %d lines)", positions[0].Offset, len(resultLines))
 	}
 }

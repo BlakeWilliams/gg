@@ -697,8 +697,10 @@ func (d *DiffViewer) ReformatAllFiles() {
 	for i := range d.RenderedFiles {
 		d.RenderedFiles[i] = ""
 	}
-	for i := range d.FileRenderLists {
-		d.FileRenderLists[i] = nil
+	for _, list := range d.FileRenderLists {
+		if list != nil {
+			list.InvalidateAll()
+		}
 	}
 	if d.CurrentFileIdx >= 0 {
 		d.FormatFile(d.CurrentFileIdx)

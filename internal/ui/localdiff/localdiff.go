@@ -83,9 +83,6 @@ type Model struct {
 	branch   string
 	mode     git.DiffMode
 
-	// Layout per file (for cursor positioning).
-	fileLayouts []components.DiffLayout
-
 	// Tracks which files have real Chroma highlighting (vs placeholder).
 	chromaHighlighted map[int]bool
 
@@ -351,7 +348,6 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		m.dv.FileDiffOffsets = make([][]int, len(msg.files))
 		m.dv.FileCommentPositions = make([][]components.CommentPosition, len(msg.files))
 		m.dv.FileRenderLists = make([]*components.FileRenderList, len(msg.files))
-		m.fileLayouts = make([]components.DiffLayout, len(msg.files))
 		m.rebuildFilePathIndex()
 		m.dv.FilesListLoaded = true
 
@@ -1587,26 +1583,22 @@ func (m Model) handleCommentKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			m.dv.CopilotDots = 0
 		}
 
-		// In branch mode, always use full re-render (InsertThread has offset issues
-		// due to different file content sources). In other modes, try splice-based
-		// update for O(content) instead of O(n) performance.
+		// Use render list operations to update the cached render.
 		fileIdx := m.dv.CurrentFileIdx
 		spliced := false
 
-		if m.mode != git.DiffBranch {
-			if m.replyToID != "" {
-				// Reply to existing thread — use SpliceThread.
-				m.dv.SpliceThreadForComment(fileIdx, comment.Side, comment.Line)
-				spliced = true
-			} else {
-				// New thread — use InsertThread.
-				diffLineIdx := m.dv.DiffLineIdxForComment(fileIdx, comment.Side, comment.Line)
-				if diffLineIdx >= 0 {
-					threadComments := m.commentStore.ForFile(comment.Path)
-					filtered := components.CommentsForThread(threadComments, comment.Side, comment.Line)
-					if m.dv.InsertThread(fileIdx, diffLineIdx, comment.Side, comment.Line, filtered) {
-						spliced = true
-					}
+		if m.replyToID != "" {
+			// Reply to existing thread — splice the updated thread.
+			m.dv.SpliceThreadForComment(fileIdx, comment.Side, comment.Line)
+			spliced = true
+		} else {
+			// New thread — insert into render list.
+			diffLineIdx := m.dv.DiffLineIdxForComment(fileIdx, comment.Side, comment.Line)
+			if diffLineIdx >= 0 {
+				threadComments := m.commentStore.ForFile(comment.Path)
+				filtered := components.CommentsForThread(threadComments, comment.Side, comment.Line)
+				if m.dv.InsertThread(fileIdx, diffLineIdx, comment.Side, comment.Line, filtered) {
+					spliced = true
 				}
 			}
 		}
