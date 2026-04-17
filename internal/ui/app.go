@@ -379,51 +379,35 @@ const (
 func (m Model) renderStatusBar() string {
 	ld, isLocal := m.activeView.(localdiff.Model)
 
-	// --- Left side: branch  mode ---
-	var left string
-	if isLocal {
-		branch := ld.BranchName()
-		mode := ld.DiffMode()
-
-		// Branch segment: cyan bg, black text.
-		branchStyle := lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Black).
-			Background(lipgloss.Cyan)
-		branchSep := lipgloss.NewStyle().
-			Foreground(lipgloss.Cyan)
-
-		branchText := branchStyle.Render(" " + branch + " ")
-
-		// Mode segment: colored bg per mode.
-		modeBg := styles.AirlineModeColor(mode)
-		modeStyle := lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Black).
-			Background(modeBg)
-		modeSepLeft := lipgloss.NewStyle().
-			Foreground(lipgloss.Cyan).
-			Background(modeBg)
-		modeSepRight := lipgloss.NewStyle().
-			Foreground(modeBg)
-
-		modeText := modeStyle.Render(" " + strings.ToUpper(mode.String()) + " ")
-
-		left = branchText + branchSep.Render(plRight) +
-			modeSepLeft.Render(plRight) + modeText + modeSepRight.Render(plRight)
+	if !isLocal {
+		return strings.Repeat(" ", m.width)
 	}
 
-	// --- Right side: PR badge ---
+	branch := ld.BranchName()
+	mode := ld.DiffMode()
+	modeBg := styles.AirlineModeColor(mode)
+
+	// Segment styles
+	branchStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Black).Background(lipgloss.Cyan)
+	modeStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Black).Background(modeBg)
+	midBg := lipgloss.Color("#3a3a3a")
+	midStyle := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack).Background(midBg)
+
+	// Powerline transition arrows (fg = left color, bg = right color)
+	branchToMode := lipgloss.NewStyle().Foreground(lipgloss.Cyan).Background(modeBg).Render(plRight)
+	modeToMid := lipgloss.NewStyle().Foreground(modeBg).Background(midBg).Render(plRight)
+
+	branchText := branchStyle.Render("  " + branch + " ")
+	modeText := modeStyle.Render(" " + strings.ToUpper(mode.String()) + " ")
+
+	left := branchText + branchToMode + modeText + modeToMid
+
+	// Right side: PR badge
 	var right string
-	if isLocal {
-		if pr := ld.PR(); pr != nil {
-			prStyle := lipgloss.NewStyle().
-				Foreground(lipgloss.Black).
-				Background(lipgloss.BrightBlack)
-			prSep := lipgloss.NewStyle().
-				Foreground(lipgloss.BrightBlack)
-			right = prSep.Render(plLeft) + prStyle.Render(fmt.Sprintf(" PR #%d ", pr.Number))
-		}
+	if pr := ld.PR(); pr != nil {
+		prStyle := lipgloss.NewStyle().Foreground(lipgloss.BrightWhite).Background(lipgloss.BrightBlack)
+		midToPr := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack).Background(midBg).Render(plLeft)
+		right = midToPr + prStyle.Render(fmt.Sprintf(" PR #%d ", pr.Number))
 	}
 
 	leftW := lipgloss.Width(left)
@@ -433,7 +417,7 @@ func (m Model) renderStatusBar() string {
 		gap = 0
 	}
 
-	return left + strings.Repeat(" ", gap) + right
+	return left + midStyle.Render(strings.Repeat(" ", gap)) + right
 }
 
 func formatHints(hints []string) string {
