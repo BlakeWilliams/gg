@@ -573,7 +573,7 @@ func formatDiffLinesRangeFromHL(diffLines []DiffLine, globalStart int, allDiffLi
 			gutter := colors.AddBg + colors.AddFg +
 				padNum(colW) + " " + padNum(colW, dl.NewLineNo) +
 				" " + "\033[1m" + "+" + "\033[0m" + colors.AddBg
-			dl.Rendered = padWithBg(truncateLine(gutter+hl, width), width, colors.AddBg)
+			dl.Rendered = gutter + hl
 		case LineDel:
 			var hl string
 			if useOldLineIndex {
@@ -588,7 +588,7 @@ func formatDiffLinesRangeFromHL(diffLines []DiffLine, globalStart int, allDiffLi
 			gutter := colors.DelBg + colors.DelFg +
 				padNum(colW, dl.OldLineNo) + " " + padNum(colW) +
 				" " + "\033[1m" + "-" + "\033[0m" + colors.DelBg
-			dl.Rendered = padWithBg(truncateLine(gutter+hl, width), width, colors.DelBg)
+			dl.Rendered = gutter + hl
 		case LineContext:
 			var hl string
 			if useNewLineIndex {
@@ -601,7 +601,7 @@ func formatDiffLinesRangeFromHL(diffLines []DiffLine, globalStart int, allDiffLi
 			gutter := styles.DiffLineNum.Render(
 				padNum(colW, dl.OldLineNo) + " " + padNum(colW, dl.NewLineNo) + " ",
 			)
-			dl.Rendered = padToWidth(truncateLine(gutter+" "+hl, width), width)
+			dl.Rendered = gutter + " " + hl
 		}
 	}
 }
@@ -697,7 +697,7 @@ func formatDiffLinesFromHL(diffLines []DiffLine, hlLines, hlLinesOld []string, f
 			gutter := colors.AddBg + colors.AddFg +
 				padNum(colW) + " " + padNum(colW, dl.NewLineNo) +
 				" " + "\033[1m" + "+" + "\033[0m" + colors.AddBg
-			dl.Rendered = padWithBg(truncateLine(gutter+hl, width), width, colors.AddBg)
+			dl.Rendered = gutter + hl
 
 		case LineDel:
 			var hl string
@@ -713,7 +713,7 @@ func formatDiffLinesFromHL(diffLines []DiffLine, hlLines, hlLinesOld []string, f
 			gutter := colors.DelBg + colors.DelFg +
 				padNum(colW, dl.OldLineNo) + " " + padNum(colW) +
 				" " + "\033[1m" + "-" + "\033[0m" + colors.DelBg
-			dl.Rendered = padWithBg(truncateLine(gutter+hl, width), width, colors.DelBg)
+			dl.Rendered = gutter + hl
 
 		case LineContext:
 			var hl string
@@ -727,7 +727,7 @@ func formatDiffLinesFromHL(diffLines []DiffLine, hlLines, hlLinesOld []string, f
 			gutter := styles.DiffLineNum.Render(
 				padNum(colW, dl.OldLineNo) + " " + padNum(colW, dl.NewLineNo) + " ",
 			)
-			dl.Rendered = padToWidth(truncateLine(gutter+" "+hl, width), width)
+			dl.Rendered = gutter + " " + hl
 		}
 	}
 }
@@ -735,7 +735,7 @@ func formatDiffLinesFromHL(diffLines []DiffLine, hlLines, hlLinesOld []string, f
 // renderHunkLine renders a @@ hunk header with full-width background.
 func renderHunkLine(content string, width int, colors styles.DiffColors) string {
 	line := colors.HunkBg + colors.HunkFg + expandTabs(content)
-	return padWithBg(truncateLine(line, width), width, colors.HunkBg)
+	return line
 }
 
 // injectBackground replaces every SGR reset in chroma output with a reset
@@ -754,12 +754,7 @@ func injectBackground(highlighted string, bgCode string) string {
 // exceeds the target width. The first segment keeps the original gutter;
 // continuation segments get a blank gutter with matching background.
 func wrapRenderedLine(rendered string, targetW int, lt LineType, colors styles.DiffColors, gutterW int) []string {
-	visW := lipgloss.Width(rendered)
-	if visW <= targetW {
-		return []string{rendered}
-	}
-
-	// Determine the background code for padding continuation lines.
+	// Determine the background code for padding.
 	var bgCode string
 	switch lt {
 	case LineAdd:
@@ -768,6 +763,15 @@ func wrapRenderedLine(rendered string, targetW int, lt LineType, colors styles.D
 		bgCode = colors.DelBg
 	case LineHunk:
 		bgCode = colors.HunkBg
+	}
+
+	visW := lipgloss.Width(rendered)
+	if visW <= targetW {
+		// Short line — pad to full width with background.
+		if bgCode != "" {
+			return []string{padWithBg(rendered, targetW, bgCode)}
+		}
+		return []string{padToWidth(rendered, targetW)}
 	}
 
 	// gutterW is passed in as total visible gutter width
@@ -795,7 +799,9 @@ func wrapRenderedLine(rendered string, targetW int, lt LineType, colors styles.D
 		if remainW <= 0 {
 			break
 		}
-		contGutter := bgCode + strings.Repeat(" ", gutterW)
+		// Continuation gutter: spaces + wrap arrow (↩) in dim.
+		wrapArrow := "\033[2m↩\033[0m" + bgCode + " "
+		contGutter := bgCode + strings.Repeat(" ", gutterW-2) + wrapArrow
 		chunk := ansi.Truncate(remaining, codeW, "")
 		chunkW := lipgloss.Width(chunk)
 		if chunkW <= 0 {
@@ -909,6 +915,37 @@ func truncateLine(s string, width int) string {
 		return s
 	}
 	return ansi.Truncate(s, width, "")
+}
+
+// wrapCommentLine wraps a single line of comment body text to fit within maxW
+// visible columns, preserving ANSI sequences across chunks.
+func wrapCommentLine(line string, maxW int) []string {
+	visW := lipgloss.Width(line)
+	if visW <= maxW || maxW <= 0 {
+		return []string{line}
+	}
+	var segments []string
+	remaining := line
+	for {
+		remainW := lipgloss.Width(remaining)
+		if remainW <= 0 {
+			break
+		}
+		chunk := ansi.Truncate(remaining, maxW, "")
+		chunkW := lipgloss.Width(chunk)
+		if chunkW <= 0 {
+			break
+		}
+		segments = append(segments, chunk)
+		if chunkW >= remainW {
+			break
+		}
+		remaining = ansi.Cut(remaining, chunkW, remainW)
+	}
+	if len(segments) == 0 {
+		return []string{line}
+	}
+	return segments
 }
 
 // commentKey encodes side + line for comment thread lookup.
@@ -1095,21 +1132,21 @@ func renderCommentThread(comments []github.ReviewComment, width int, lt LineType
 			body = renderBody(body, innerW, bg)
 		}
 		for _, line := range strings.Split(body, "\n") {
-			visW := lipgloss.Width(line)
-			if visW > innerW {
-				line = ansi.Truncate(line, innerW, "…")
-				visW = lipgloss.Width(line)
+			// Wrap long lines instead of truncating.
+			wrappedLines := wrapCommentLine(line, innerW)
+			for _, wl := range wrappedLines {
+				visW := lipgloss.Width(wl)
+				pad := innerW - visW
+				if pad < 0 {
+					pad = 0
+				}
+				content := gutterStr + borderFg + "│" + "\033[0m" + bg +
+					" " + wl + "\033[0m" + bg + strings.Repeat(" ", pad) + " " +
+					borderFg + "│" + "\033[0m"
+				b.WriteString(padWithBg(content, width, bg))
+				b.WriteString("\n")
+				lineCount++
 			}
-			pad := innerW - visW
-			if pad < 0 {
-				pad = 0
-			}
-			content := gutterStr + borderFg + "│" + "\033[0m" + bg +
-				" " + line + "\033[0m" + bg + strings.Repeat(" ", pad) + " " +
-				borderFg + "│" + "\033[0m"
-			b.WriteString(padWithBg(content, width, bg))
-			b.WriteString("\n")
-			lineCount++
 		}
 
 		commentLineCounts = append(commentLineCounts, lineCount-commentStart)
