@@ -60,37 +60,27 @@ var (
 	DiffLineNum = lipgloss.NewStyle().
 			Foreground(lipgloss.BrightBlack)
 
-	HeaderBar = lipgloss.NewStyle()
-
-	HeaderRepo = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Cyan)
-
-	HeaderSep = lipgloss.NewStyle().
-			Foreground(lipgloss.BrightBlack)
-
-	HeaderSection = lipgloss.NewStyle().
-			Foreground(lipgloss.BrightWhite)
-
-	HeaderActive = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.BrightWhite)
-
-	StatusBar = lipgloss.NewStyle().
-			Foreground(lipgloss.BrightBlack)
-
-	StatusBarMode = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Black).
-			Background(lipgloss.Magenta).
-			Inline(true)
-
 	StatusBarKey = lipgloss.NewStyle().
 			Foreground(lipgloss.Magenta)
 
 	StatusBarHint = lipgloss.NewStyle().
 			Foreground(lipgloss.BrightBlack)
 )
+
+// AirlineModeColor returns the background color for a diff mode in the
+// vim-airline style status bar.
+func AirlineModeColor(mode interface{ String() string }) color.Color {
+	switch mode.String() {
+	case "working":
+		return lipgloss.Magenta
+	case "staged":
+		return lipgloss.Green
+	case "branch":
+		return lipgloss.Blue
+	default:
+		return lipgloss.BrightBlack
+	}
+}
 
 // PRStatusBadge returns the appropriate styled badge for a PR's state,
 // rendered as a single line with nerdfont rounded caps.
