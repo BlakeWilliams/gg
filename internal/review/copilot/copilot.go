@@ -120,6 +120,9 @@ func (c *Client) SendComment(commentID, body, filePath, fileContent, fullDiff, d
 		}
 		c.log.Printf("session created for %s: %s", commentID, session.SessionID)
 
+		// Channel to cancel the timeout when session completes.
+		done := make(chan struct{})
+
 		// Attach a listener that tags all events with this commentID.
 		session.On(func(event sdk.SessionEvent) {
 			switch event.Type {
@@ -144,6 +147,7 @@ func (c *Client) SendComment(commentID, body, filePath, fileContent, fullDiff, d
 				c.events <- ToolMsg{CommentID: commentID, Name: name, Done: true}
 			case sdk.SessionEventTypeSessionIdle:
 				c.log.Printf("session idle for %s", commentID)
+				close(done) // Cancel timeout
 				c.events <- ReplyMsg{CommentID: commentID, Done: true}
 				session.Disconnect()
 			case sdk.SessionEventTypeSessionError:
@@ -152,6 +156,7 @@ func (c *Client) SendComment(commentID, body, filePath, fileContent, fullDiff, d
 					msg = *event.Data.Message
 				}
 				c.log.Printf("session error for %s: %s", commentID, msg)
+				close(done) // Cancel timeout
 				c.events <- ErrorMsg{CommentID: commentID, Err: fmt.Errorf("%s", msg)}
 				session.Disconnect()
 			}
@@ -165,17 +170,24 @@ func (c *Client) SendComment(commentID, body, filePath, fileContent, fullDiff, d
 		})
 		if err != nil {
 			c.log.Printf("session.Send failed for %s: %v", commentID, err)
+			close(done) // Cancel timeout
 			session.Disconnect()
 			return ErrorMsg{CommentID: commentID, Err: fmt.Errorf("send: %w", err)}
 		}
 
 		c.log.Printf("session.Send returned for %s", commentID)
 
-		// Response timeout.
+		// Response timeout - cancelled if session completes first.
 		go func() {
-			time.Sleep(60 * time.Second)
-			c.events <- ErrorMsg{CommentID: commentID, Err: fmt.Errorf("copilot response timeout (60s)")}
-			session.Disconnect()
+			select {
+			case <-done:
+				// Session completed, no timeout needed.
+				return
+			case <-time.After(60 * time.Second):
+				c.log.Printf("timeout waiting for copilot response for %s", commentID)
+				c.events <- ErrorMsg{CommentID: commentID, Err: fmt.Errorf("copilot response timeout (60s)")}
+				session.Disconnect()
+			}
 		}()
 
 		return nil
