@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"image/color"
 	"os"
 	"strconv"
 	"strings"
@@ -80,6 +81,7 @@ type Model struct {
 	quitPending bool // true after first ctrl+c
 	palette     terminal.Palette
 	repoRoot    string // local git repo root, if any
+	hasDarkBg   bool   // true when terminal has a dark background
 	width       int
 	height      int
 }
@@ -107,6 +109,7 @@ func NewApp(cfg AppConfig) Model {
 		commandBar: commandbar.New(),
 		ctx:        ctx,
 		repoRoot:   cfg.RepoRoot,
+		hasDarkBg:  true, // assume dark until terminal responds
 		activeView: localdiff.New(ctx, cfg.RepoRoot, 0, 0),
 	}
 
@@ -161,6 +164,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.activeView, cmd = m.activeView.Update(contentMsg)
 		return m, cmd
+
+	case tea.BackgroundColorMsg:
+		m.hasDarkBg = msg.IsDark()
+		return m, nil
 
 	case commandbar.CommandMsg:
 		m.mode = modeNormal
@@ -391,7 +398,13 @@ func (m Model) renderStatusBar() string {
 	branchBg := lipgloss.Cyan
 	branchStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Black).Background(branchBg)
 	modeStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Black).Background(modeBg)
-	midBg := lipgloss.BrightBlack
+	// Mid-section adapts to terminal background brightness.
+	var midBg color.Color
+	if m.hasDarkBg {
+		midBg = lipgloss.BrightBlack
+	} else {
+		midBg = lipgloss.White
+	}
 	midStyle := lipgloss.NewStyle().Foreground(lipgloss.Black).Background(midBg)
 
 	// Powerline transition arrows (fg = left color, bg = right color)
