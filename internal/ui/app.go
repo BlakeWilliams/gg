@@ -396,25 +396,28 @@ func (m Model) renderStatusBar() string {
 
 	// Segment styles — use ANSI colors to derive from terminal colorscheme.
 	branchBg := lipgloss.Cyan
-	branchStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Black).Background(branchBg)
 	modeStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Black).Background(modeBg)
+	branchStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Black).Background(branchBg)
 	// Mid-section adapts to terminal background brightness.
 	var midBg color.Color
+	var midFg color.Color
 	if m.hasDarkBg {
-		midBg = lipgloss.BrightBlack
+		midBg = lipgloss.Black
+		midFg = lipgloss.BrightBlack
 	} else {
 		midBg = lipgloss.White
+		midFg = lipgloss.BrightBlack
 	}
-	midStyle := lipgloss.NewStyle().Foreground(lipgloss.Black).Background(midBg)
+	midStyle := lipgloss.NewStyle().Foreground(midFg).Background(midBg)
 
-	// Powerline transition arrows (fg = left color, bg = right color)
-	branchToMode := lipgloss.NewStyle().Foreground(branchBg).Background(modeBg).Render(plRight)
-	modeToMid := lipgloss.NewStyle().Foreground(modeBg).Background(midBg).Render(plRight)
+	// Left: MODE → branch → mid
+	modeToBranch := lipgloss.NewStyle().Foreground(modeBg).Background(branchBg).Render(plRight)
+	branchToMid := lipgloss.NewStyle().Foreground(branchBg).Background(midBg).Render(plRight)
 
-	branchText := branchStyle.Render("  " + branch + " ")
 	modeText := modeStyle.Render(" " + strings.ToUpper(mode.String()) + " ")
+	branchText := branchStyle.Render(" " + branch + " ")
 
-	left := branchText + branchToMode + modeText + modeToMid
+	left := modeText + modeToBranch + branchText + branchToMid
 
 	// Right side: PR badge
 	var right string
