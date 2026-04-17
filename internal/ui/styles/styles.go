@@ -68,17 +68,18 @@ var (
 )
 
 // AirlineModeColor returns the background color for a diff mode in the
-// vim-airline style status bar.
+// vim-airline style status bar. Uses ANSI colors so they derive from the
+// terminal colorscheme.
 func AirlineModeColor(mode interface{ String() string }) color.Color {
 	switch mode.String() {
 	case "working":
-		return lipgloss.Color("#d75f87") // soft pink
+		return lipgloss.Magenta
 	case "staged":
-		return lipgloss.Color("#87d787") // soft green
+		return lipgloss.Green
 	case "branch":
-		return lipgloss.Color("#87afff") // soft blue
+		return lipgloss.Blue
 	default:
-		return lipgloss.Color("#585858")
+		return lipgloss.BrightBlack
 	}
 }
 

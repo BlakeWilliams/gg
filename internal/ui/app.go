@@ -387,12 +387,12 @@ func (m Model) renderStatusBar() string {
 	mode := ld.DiffMode()
 	modeBg := styles.AirlineModeColor(mode)
 
-	// Segment styles
-	branchBg := lipgloss.Color("#5fafaf")
+	// Segment styles — use ANSI colors to derive from terminal colorscheme.
+	branchBg := lipgloss.Cyan
 	branchStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Black).Background(branchBg)
 	modeStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Black).Background(modeBg)
-	midBg := lipgloss.Color("#3a3a3a")
-	midStyle := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack).Background(midBg)
+	midBg := lipgloss.BrightBlack
+	midStyle := lipgloss.NewStyle().Foreground(lipgloss.Black).Background(midBg)
 
 	// Powerline transition arrows (fg = left color, bg = right color)
 	branchToMode := lipgloss.NewStyle().Foreground(branchBg).Background(modeBg).Render(plRight)
@@ -406,8 +406,9 @@ func (m Model) renderStatusBar() string {
 	// Right side: PR badge
 	var right string
 	if pr := ld.PR(); pr != nil {
-		prStyle := lipgloss.NewStyle().Foreground(lipgloss.BrightWhite).Background(lipgloss.BrightBlack)
-		midToPr := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack).Background(midBg).Render(plLeft)
+		prBg := lipgloss.Cyan
+		prStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Black).Background(prBg)
+		midToPr := lipgloss.NewStyle().Foreground(prBg).Background(midBg).Render(plLeft)
 		right = midToPr + prStyle.Render(fmt.Sprintf(" PR #%d ", pr.Number))
 	}
 
