@@ -388,13 +388,14 @@ func (m Model) renderStatusBar() string {
 	modeBg := styles.AirlineModeColor(mode)
 
 	// Segment styles
-	branchStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Black).Background(lipgloss.Cyan)
+	branchBg := lipgloss.Color("#5fafaf")
+	branchStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Black).Background(branchBg)
 	modeStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Black).Background(modeBg)
 	midBg := lipgloss.Color("#3a3a3a")
 	midStyle := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack).Background(midBg)
 
 	// Powerline transition arrows (fg = left color, bg = right color)
-	branchToMode := lipgloss.NewStyle().Foreground(lipgloss.Cyan).Background(modeBg).Render(plRight)
+	branchToMode := lipgloss.NewStyle().Foreground(branchBg).Background(modeBg).Render(plRight)
 	modeToMid := lipgloss.NewStyle().Foreground(modeBg).Background(midBg).Render(plRight)
 
 	branchText := branchStyle.Render("  " + branch + " ")

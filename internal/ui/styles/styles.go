@@ -72,13 +72,13 @@ var (
 func AirlineModeColor(mode interface{ String() string }) color.Color {
 	switch mode.String() {
 	case "working":
-		return lipgloss.Magenta
+		return lipgloss.Color("#d75f87") // soft pink
 	case "staged":
-		return lipgloss.Green
+		return lipgloss.Color("#87d787") // soft green
 	case "branch":
-		return lipgloss.Blue
+		return lipgloss.Color("#87afff") // soft blue
 	default:
-		return lipgloss.BrightBlack
+		return lipgloss.Color("#585858")
 	}
 }
 
