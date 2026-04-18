@@ -592,12 +592,9 @@ func (m Model) filePickerItems() []picker.Item {
 	files := provider.Files()
 	items := make([]picker.Item, 0, len(files))
 	for _, f := range files {
-		dir, base := splitPath(f.Filename)
 		items = append(items, picker.Item{
-			Label:       base,
-			Description: dir,
-			Value:       f.Filename,
-			Keywords:    []string{f.Filename},
+			Label: f.Filename,
+			Value: f.Filename,
 		})
 	}
 	return items
@@ -619,7 +616,7 @@ func (m Model) commandPickerItems() []picker.Item {
 	}
 
 	branch, _ := git.CurrentBranch(m.repoRoot)
-	defaultBranch, _ := git.DefaultBranch(m.repoRoot)
+	defaultBranch, _ := git.DefaultBranchShort(m.repoRoot)
 	if branch != defaultBranch {
 		items = append(items, picker.Item{Label: "Branch Diff", Description: "vs " + defaultBranch, Value: "branch", Keywords: []string{"mode", "compare"}})
 	}

@@ -843,7 +843,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 	case "m":
 		// Cycle diff mode: Working → Staged → Branch (skip Branch on default branch).
 		m.saveViewState()
-		defaultBranch, _ := git.DefaultBranch(m.repoRoot)
+		defaultBranch, _ := git.DefaultBranchShort(m.repoRoot)
 		if m.branchData.branch == defaultBranch {
 			if m.mode == git.DiffWorking {
 				m.mode = git.DiffStaged
@@ -2143,7 +2143,7 @@ func (m Model) buildViewPickerItems() []picker.Item {
 		},
 	}
 
-	defaultBranch, _ := git.DefaultBranch(m.repoRoot)
+	defaultBranch, _ := git.DefaultBranchShort(m.repoRoot)
 	if m.branchData.branch != defaultBranch {
 		items = append(items, picker.Item{
 			Label:       "Branch Diff",
