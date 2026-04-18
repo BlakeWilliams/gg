@@ -41,6 +41,10 @@ type fileHighlightedMsg struct {
 
 type watchReadyMsg struct{}
 type copilotTickMsg struct{}
+type reviewCommentsRefreshMsg struct {
+	Comments []github.ReviewComment
+}
+type reviewCommentsTimerMsg struct{}
 
 // GoToLineMsg is sent from the command bar to jump to a source line number.
 type GoToLineMsg struct {
@@ -108,8 +112,9 @@ type Model struct {
 	filePathIndex map[string]int
 
 	// PR detection.
-	pr       *github.PullRequest // nil if no PR for this branch
-	prLoaded bool                // true once checked
+	pr             *github.PullRequest    // nil if no PR for this branch
+	prLoaded       bool                   // true once checked
+	reviewComments []github.ReviewComment  // GitHub review comments (refreshed every 2m)
 
 	// Render cache.
 	lastFormattedStreamLen int // length of copilot reply buffer at last formatFile
@@ -132,18 +137,18 @@ func New(ctx *uictx.Context, repoRoot string, width, height int) Model {
 		CurrentFileIdx:  -1,
 		SelectionAnchor: -1,
 		Tree: components.FileTree{
-			Width:   35,
-			Height:  height - 2,
-			Focused: true,
+			Width:      35,
+			Height:     height - 2,
+			Focused:    true,
+			ChromeRows: 2,
 		},
 		Copilot:         cp,
 		CopilotReplyBuf: make(map[string]string),
-		Comments:        commentStoreAdapter{store: cs},
 		RenderBody:      renderMarkdownBody,
 	}
 	dv.InitSpinner()
 
-	return Model{
+	m := Model{
 		ctx:               ctx,
 		dv:                dv,
 		chromaHighlighted: make(map[int]bool),
@@ -158,12 +163,22 @@ func New(ctx *uictx.Context, repoRoot string, width, height int) Model {
 		savedLineNo:       vs.LineNo,
 		savedSide:         vs.Side,
 	}
+	m.dv.Comments = commentStoreAdapter{store: cs}
+	return m
 }
 
 func (m Model) BranchName() string              { return m.branch }
 func (m Model) DiffMode() git.DiffMode          { return m.mode }
 func (m Model) PR() *github.PullRequest         { return m.pr }
 func (m Model) Files() []github.PullRequestFile { return m.dv.Files }
+
+// CurrentFilename returns the filename currently being viewed, or "" if on overview.
+func (m Model) CurrentFilename() string {
+	if m.dv.CurrentFileIdx >= 0 && m.dv.CurrentFileIdx < len(m.dv.Files) {
+		return m.dv.Files[m.dv.CurrentFileIdx].Filename
+	}
+	return ""
+}
 
 // restoreSavedPosition finds the saved file by name and restores cursor
 // to the diff line matching the saved source line number.
@@ -311,6 +326,11 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 				}
 			}
 			return m, nil
+		} else if m.dv.CurrentFileIdx >= 0 {
+			if cursor := m.dv.DiffCursorFromScreenY(msg.Y); cursor >= 0 {
+				m.dv.DiffCursor = cursor
+			}
+			return m, nil
 		}
 
 	case diffLoadedMsg:
@@ -453,11 +473,32 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	case prDetectedMsg:
 		m.pr = &msg.PR
 		m.prLoaded = true
-		return m, nil
+		return m, tea.Batch(m.fetchReviewComments(), m.reviewCommentsTimer())
 
 	case prDetectFailedMsg:
 		m.prLoaded = true
 		return m, nil
+
+	case reviewCommentsRefreshMsg:
+		m.reviewComments = msg.Comments
+		m.dv.Comments = commentStoreAdapter{store: m.commentStore, reviewComments: m.reviewComments}
+		// Re-format visible files to include new comments.
+		if m.dv.FilesHighlighted > 0 {
+			for i := 0; i < len(m.dv.Files); i++ {
+				if m.dv.FileRenderLists[i] != nil {
+					m.dv.FormatFile(i)
+				}
+			}
+			m.dv.RebuildContentIfChanged(m.buildOverviewContent, m.buildFileContent)
+		}
+		// Re-arm the timer if we still have a PR.
+		if m.pr != nil {
+			return m, m.reviewCommentsTimer()
+		}
+		return m, nil
+
+	case reviewCommentsTimerMsg:
+		return m, m.fetchReviewComments()
 
 	case stageDoneMsg:
 		m.stagingInFlight--
@@ -1140,16 +1181,23 @@ func (m *Model) updateThreadHighlight() {
 	m.dv.SpliceThreadWithHighlight(m.dv.CurrentFileIdx, side, line, m.dv.ThreadCursor > 0, m.dv.ThreadCursor)
 }
 
-// commentStoreAdapter adapts a CommentStore to the CommentSource interface.
+// commentStoreAdapter adapts a CommentStore + GitHub review comments to the CommentSource interface.
 type commentStoreAdapter struct {
-	store *comments.CommentStore
+	store          *comments.CommentStore
+	reviewComments []github.ReviewComment
 }
 
 func (a commentStoreAdapter) CommentsForFile(filename string) []github.ReviewComment {
-	if a.store == nil {
-		return nil
+	var result []github.ReviewComment
+	if a.store != nil {
+		result = append(result, a.store.ForFile(filename)...)
 	}
-	return a.store.ForFile(filename)
+	for _, c := range a.reviewComments {
+		if c.Path == filename {
+			result = append(result, c)
+		}
+	}
+	return result
 }
 
 // commentsForFile returns comments for a file by index (convenience).
@@ -1158,6 +1206,35 @@ func (m Model) commentsForFile(fileIdx int) []github.ReviewComment {
 		return nil
 	}
 	return m.dv.CommentsForFile(m.dv.Files[fileIdx].Filename)
+}
+
+// fetchReviewComments fetches GitHub review comments for the detected PR.
+func (m Model) fetchReviewComments() tea.Cmd {
+	if m.pr == nil {
+		return nil
+	}
+	client := m.ctx.Client
+	owner, repo, number := m.ctx.Owner, m.ctx.Repo, m.pr.Number
+	return func() tea.Msg {
+		data, found, refetch := client.GetReviewComments(owner, repo, number)
+		if refetch != nil {
+			result, err := refetch()
+			if err == nil {
+				return reviewCommentsRefreshMsg{Comments: result}
+			}
+		}
+		if found {
+			return reviewCommentsRefreshMsg{Comments: data}
+		}
+		return nil
+	}
+}
+
+// reviewCommentsTimer returns a command that fires after 2 minutes to re-fetch comments.
+func (m Model) reviewCommentsTimer() tea.Cmd {
+	return tea.Tick(2*time.Minute, func(time.Time) tea.Msg {
+		return reviewCommentsTimerMsg{}
+	})
 }
 
 // renderMarkdownBody does lightweight inline markdown rendering suitable

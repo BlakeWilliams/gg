@@ -248,6 +248,7 @@ type FileTree struct {
 	Focused        bool
 	CurrentFileIdx int // which file is currently being viewed (-1 = overview)
 	Files          []github.PullRequestFile
+	ChromeRows     int // rows above tree (header + separator) for mouse offset
 }
 
 // SetFiles rebuilds the tree from a new file list and resets the cursor.
@@ -260,6 +261,21 @@ func (t *FileTree) SetFiles(files []github.PullRequestFile) {
 // View renders the file tree panel content (no borders — the parent adds those).
 func (t FileTree) View() []string {
 	return RenderFileTree(t.Entries, t.Files, t.Cursor, t.CurrentFileIdx, t.Width, t.Height)
+}
+
+// scrollStart computes the first visible entry index for the tree.
+func scrollStart(totalEntries, cursor, height int) int {
+	start := cursor - height/2
+	if start < 0 {
+		start = 0
+	}
+	if start+height > totalEntries {
+		start = totalEntries - height
+	}
+	if start < 0 {
+		start = 0
+	}
+	return start
 }
 
 // HandleKey processes a key press. Returns (updated tree, cmd, handled).
@@ -365,12 +381,19 @@ func (t FileTree) IndexForFile(fileIdx int) int {
 	return 0
 }
 
-// EntryIndexAtY maps a mouse Y coordinate to a tree entry index.
+// EntryIndexAtY maps a mouse Y coordinate to a tree entry index,
+// accounting for chrome rows above the tree and scroll position.
 func (t FileTree) EntryIndexAtY(y int) (int, bool) {
-	if y < 0 || y >= len(t.Entries) {
+	row := y - t.ChromeRows
+	if row < 0 || row >= t.Height {
 		return 0, false
 	}
-	return y, true
+	start := scrollStart(len(t.Entries), t.Cursor, t.Height)
+	idx := start + row
+	if idx < 0 || idx >= len(t.Entries) {
+		return 0, false
+	}
+	return idx, true
 }
 
 // HandleMouseClick processes a click in the tree area.

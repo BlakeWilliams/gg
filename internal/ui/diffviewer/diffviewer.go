@@ -366,6 +366,42 @@ func (d DiffViewer) CursorViewportLine() int {
 	return rel
 }
 
+// DiffCursorFromScreenY maps a screen Y coordinate to the nearest diff line
+// index, accounting for chrome rows and viewport scroll. Returns -1 if no
+// valid diff line is found.
+func (d *DiffViewer) DiffCursorFromScreenY(y int) int {
+	chromeRows := 2
+	row := y - chromeRows
+	if row < 0 || row >= d.ViewportHeight() {
+		return -1
+	}
+	absLine := d.VP.YOffset() + row
+
+	idx := d.CurrentFileIdx
+	if idx < 0 || idx >= len(d.FileDiffOffsets) {
+		return -1
+	}
+	offsets := d.FileDiffOffsets[idx]
+	diffs := d.FileDiffs[idx]
+
+	best := -1
+	bestDist := 0
+	for i, off := range offsets {
+		if i < len(diffs) && diffs[i].Type == components.LineHunk {
+			continue
+		}
+		dist := off - absLine
+		if dist < 0 {
+			dist = -dist
+		}
+		if best == -1 || dist < bestDist {
+			best = i
+			bestDist = dist
+		}
+	}
+	return best
+}
+
 // --- Cursor overlay rendering ---
 
 // OverlayDiffCursor applies cursor or selection highlighting to the viewport content.
@@ -591,11 +627,7 @@ func (d DiffViewer) RenderLayout(rightView string, rightTitle string, info Layou
 		}
 	}
 
-	// PR badge.
-	if info.PR != nil {
-		prStyle := lipgloss.NewStyle().Foreground(lipgloss.Cyan)
-		trailerParts = append(trailerParts, prStyle.Render(fmt.Sprintf("PR #%d", info.PR.Number)))
-	}
+	// PR badge — rendered in footer next to branch name, not in header.
 
 	if len(trailerParts) > 0 {
 		rightTrailer = strings.Join(trailerParts, dim.Render("  "))
@@ -670,18 +702,26 @@ func (d DiffViewer) RenderLayout(rightView string, rightTitle string, info Layou
 			// Footer separator (only on tree side).
 			leftPart = chrome.Render(strings.Repeat("─", treeW-1))
 		} else if i == contentH-1 {
-			// Branch name row.
+			// Branch name (left) + PR badge (right).
+			branchText := ""
 			if info.BranchName != "" {
-				branchText := dim.Render(" " + info.BranchName)
-				branchW := lipgloss.Width(branchText)
-				pad := treeW - 1 - branchW
-				if pad < 0 {
-					pad = 0
-				}
-				leftPart = branchText + strings.Repeat(" ", pad)
-			} else {
-				leftPart = strings.Repeat(" ", treeW-1)
+				branchText = dim.Render(" " + info.BranchName)
 			}
+			prText := ""
+			if info.PR != nil {
+				prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%d", info.PR.RepoOwner(), info.PR.RepoName(), info.PR.Number)
+				prStyle := lipgloss.NewStyle().
+					Foreground(lipgloss.Cyan).
+					Hyperlink(prURL)
+				prText = prStyle.Render(fmt.Sprintf("PR#%d", info.PR.Number)) + " "
+			}
+			branchW := lipgloss.Width(branchText)
+			prW := lipgloss.Width(prText)
+			gap := treeW - 1 - branchW - prW
+			if gap < 0 {
+				gap = 0
+			}
+			leftPart = branchText + strings.Repeat(" ", gap) + prText
 		} else {
 			tl := ""
 			if i < len(treeContentLines) {

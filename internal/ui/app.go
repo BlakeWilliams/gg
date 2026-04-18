@@ -85,6 +85,7 @@ type Model struct {
 	termBg      color.Color // actual terminal background color
 	width       int
 	height      int
+	windowTitle string
 }
 
 func (m Model) nwo() string {
@@ -107,11 +108,12 @@ func NewApp(cfg AppConfig) Model {
 	ctx := &uictx.Context{Client: cfg.Client, Owner: cfg.Owner, Repo: cfg.Repo}
 
 	m := Model{
-		commandBar: commandbar.New(),
-		ctx:        ctx,
-		repoRoot:   cfg.RepoRoot,
-		hasDarkBg:  true, // assume dark until terminal responds
-		activeView: localdiff.New(ctx, cfg.RepoRoot, 0, 0),
+		commandBar:  commandbar.New(),
+		ctx:         ctx,
+		repoRoot:    cfg.RepoRoot,
+		hasDarkBg:   true, // assume dark until terminal responds
+		activeView:  localdiff.New(ctx, cfg.RepoRoot, 0, 0),
+		windowTitle: "gg",
 	}
 
 	return m
@@ -351,6 +353,16 @@ func (m Model) handleCommand(msg commandbar.CommandMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) View() tea.View {
+	// Update window title from active view.
+	switch v := m.activeView.(type) {
+	case localdiff.Model:
+		title := "gg • " + v.BranchName()
+		if f := v.CurrentFilename(); f != "" {
+			title += " • " + f
+		}
+		m.windowTitle = title
+	}
+
 	// Reserve a row for command bar / quit hint when active.
 	barActive := m.quitPending || m.mode == modeCommand
 	barHeight := 0
@@ -388,6 +400,9 @@ func (m Model) View() tea.View {
 	v := tea.NewView(output)
 	v.AltScreen = true
 	v.MouseMode = tea.MouseModeCellMotion
+	v.WindowTitle = m.windowTitle
+	// OSC 0 for iTerm2 compatibility (OSC 2 alone doesn't override job name).
+	fmt.Fprintf(os.Stderr, "\033]0;%s\007", m.windowTitle)
 	return v
 }
 

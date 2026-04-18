@@ -214,9 +214,10 @@ func New(pr github.PullRequest, ctx *uictx.Context, width, height int) Model {
 		CurrentFileIdx:  -1,
 		SelectionAnchor: -1,
 		Tree: components.FileTree{
-			Width:   35,
-			Height:  height - 2,
-			Focused: true,
+			Width:      35,
+			Height:     height - 2,
+			Focused:    true,
+			ChromeRows: 2,
 		},
 		CopilotReplyBuf: make(map[string]string),
 	}
