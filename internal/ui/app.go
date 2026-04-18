@@ -80,8 +80,9 @@ type Model struct {
 	ctx         *uictx.Context
 	quitPending bool // true after first ctrl+c
 	palette     terminal.Palette
-	repoRoot    string // local git repo root, if any
-	hasDarkBg   bool   // true when terminal has a dark background
+	repoRoot    string      // local git repo root, if any
+	hasDarkBg   bool        // true when terminal has a dark background
+	termBg      color.Color // actual terminal background color
 	width       int
 	height      int
 }
@@ -167,6 +168,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.BackgroundColorMsg:
 		m.hasDarkBg = msg.IsDark()
+		m.termBg = msg.Color
 		return m, nil
 
 	case commandbar.CommandMsg:
@@ -395,33 +397,27 @@ func (m Model) renderStatusBar() string {
 	modeBg := styles.AirlineModeColor(mode)
 
 	modeStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Black).Background(modeBg)
-	// Mid-section adapts to terminal background brightness.
-	var midBg color.Color
-	var midFg color.Color
-	if m.hasDarkBg {
-		midBg = lipgloss.Black
-		midFg = lipgloss.BrightBlack
-	} else {
-		midBg = lipgloss.White
-		midFg = lipgloss.BrightBlack
-	}
-	midStyle := lipgloss.NewStyle().Foreground(midFg).Background(midBg)
-	branchStyle := lipgloss.NewStyle().Foreground(lipgloss.BrightWhite).Background(midBg)
+
+	// Bar background: slightly lighter than terminal bg in dark mode,
+	// slightly darker in light mode.
+	barBg := m.barBackground()
+	barStyle := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack).Background(barBg)
+	branchStyle := lipgloss.NewStyle().Foreground(lipgloss.BrightWhite).Background(barBg)
 
 	// Left: MODE ▶ • branch
-	modeToMid := lipgloss.NewStyle().Foreground(modeBg).Background(midBg).Render(plRight)
-	modeText := modeStyle.Render(" " + strings.ToUpper(mode.String()) + " ")
+	modeToBar := lipgloss.NewStyle().Foreground(modeBg).Background(barBg).Render(plRight)
+	modeText := modeStyle.Render(strings.ToUpper(mode.String()) + " ")
 	branchText := branchStyle.Render(" \u2022 " + branch + " ")
 
-	left := modeText + modeToMid + branchText
+	left := modeText + modeToBar + branchText
 
 	// Right side: PR badge
 	var right string
 	if pr := ld.PR(); pr != nil {
 		prBg := lipgloss.Cyan
 		prStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Black).Background(prBg)
-		midToPr := lipgloss.NewStyle().Foreground(prBg).Background(midBg).Render(plLeft)
-		right = midToPr + prStyle.Render(fmt.Sprintf(" PR #%d ", pr.Number))
+		barToPr := lipgloss.NewStyle().Foreground(prBg).Background(barBg).Render(plLeft)
+		right = barToPr + prStyle.Render(fmt.Sprintf(" PR #%d ", pr.Number))
 	}
 
 	leftW := lipgloss.Width(left)
@@ -431,7 +427,41 @@ func (m Model) renderStatusBar() string {
 		gap = 0
 	}
 
-	return left + midStyle.Render(strings.Repeat(" ", gap)) + right
+	return left + barStyle.Render(strings.Repeat(" ", gap)) + right
+}
+
+// barBackground computes the status bar background by shifting the terminal
+// background color slightly: lighter in dark mode, darker in light mode.
+func (m Model) barBackground() color.Color {
+	if m.termBg == nil {
+		// No terminal response yet — use a sensible default.
+		if m.hasDarkBg {
+			return lipgloss.Color("#1c1c1c")
+		}
+		return lipgloss.Color("#e4e4e4")
+	}
+	r, g, b, _ := m.termBg.RGBA()
+	// Shift by ~12% of the 0-255 range (≈30 units).
+	if m.hasDarkBg {
+		return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x",
+			clampByte(int(r>>8)+30),
+			clampByte(int(g>>8)+30),
+			clampByte(int(b>>8)+30)))
+	}
+	return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x",
+		clampByte(int(r>>8)-30),
+		clampByte(int(g>>8)-30),
+		clampByte(int(b>>8)-30)))
+}
+
+func clampByte(v int) int {
+	if v < 0 {
+		return 0
+	}
+	if v > 255 {
+		return 255
+	}
+	return v
 }
 
 func formatHints(hints []string) string {
