@@ -2,6 +2,7 @@ package styles
 
 import (
 	"image/color"
+	"strings"
 
 	"charm.land/lipgloss/v2"
 )
@@ -60,37 +61,30 @@ var (
 	DiffLineNum = lipgloss.NewStyle().
 			Foreground(lipgloss.BrightBlack)
 
-	HeaderBar = lipgloss.NewStyle()
-
-	HeaderRepo = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Cyan)
-
-	HeaderSep = lipgloss.NewStyle().
-			Foreground(lipgloss.BrightBlack)
-
-	HeaderSection = lipgloss.NewStyle().
-			Foreground(lipgloss.BrightWhite)
-
-	HeaderActive = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.BrightWhite)
-
-	StatusBar = lipgloss.NewStyle().
-			Foreground(lipgloss.BrightBlack)
-
-	StatusBarMode = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Black).
-			Background(lipgloss.Magenta).
-			Inline(true)
-
 	StatusBarKey = lipgloss.NewStyle().
 			Foreground(lipgloss.Magenta)
 
 	StatusBarHint = lipgloss.NewStyle().
 			Foreground(lipgloss.BrightBlack)
 )
+
+// ModeColor returns the ANSI background color for a diff mode badge.
+// Maps to lualine-style highlight groups from the terminal colorscheme:
+//   - working → Magenta (like normal mode, PmenuSel)
+//   - staged  → Green   (like insert mode, String/MoreMsg)
+//   - branch  → Blue    (like visual mode, Special/Boolean)
+func ModeColor(mode interface{ String() string }) color.Color {
+	switch strings.ToLower(mode.String()) {
+	case "unstaged", "working":
+		return lipgloss.Magenta
+	case "staged":
+		return lipgloss.Green
+	case "branch":
+		return lipgloss.Blue
+	default:
+		return lipgloss.BrightBlack
+	}
+}
 
 // PRStatusBadge returns the appropriate styled badge for a PR's state,
 // rendered as a single line with nerdfont rounded caps.

@@ -41,6 +41,10 @@ type fileHighlightedMsg struct {
 
 type watchReadyMsg struct{}
 type copilotTickMsg struct{}
+type reviewCommentsRefreshMsg struct {
+	Comments []github.ReviewComment
+}
+type reviewCommentsTimerMsg struct{}
 
 // GoToLineMsg is sent from the command bar to jump to a source line number.
 type GoToLineMsg struct {
@@ -108,8 +112,9 @@ type Model struct {
 	filePathIndex map[string]int
 
 	// PR detection.
-	pr       *github.PullRequest // nil if no PR for this branch
-	prLoaded bool                // true once checked
+	pr             *github.PullRequest    // nil if no PR for this branch
+	prLoaded       bool                   // true once checked
+	reviewComments []github.ReviewComment  // GitHub review comments (refreshed every 2m)
 
 	// Render cache.
 	lastFormattedStreamLen int // length of copilot reply buffer at last formatFile
@@ -132,18 +137,18 @@ func New(ctx *uictx.Context, repoRoot string, width, height int) Model {
 		CurrentFileIdx:  -1,
 		SelectionAnchor: -1,
 		Tree: components.FileTree{
-			Width:   35,
-			Height:  height - 2,
-			Focused: true,
+			Width:      35,
+			Height:     height - 2,
+			Focused:    true,
+			ChromeRows: 2,
 		},
 		Copilot:         cp,
 		CopilotReplyBuf: make(map[string]string),
-		Comments:        commentStoreAdapter{store: cs},
 		RenderBody:      renderMarkdownBody,
 	}
 	dv.InitSpinner()
 
-	return Model{
+	m := Model{
 		ctx:               ctx,
 		dv:                dv,
 		chromaHighlighted: make(map[int]bool),
@@ -158,12 +163,22 @@ func New(ctx *uictx.Context, repoRoot string, width, height int) Model {
 		savedLineNo:       vs.LineNo,
 		savedSide:         vs.Side,
 	}
+	m.dv.Comments = commentStoreAdapter{store: cs}
+	return m
 }
 
 func (m Model) BranchName() string              { return m.branch }
 func (m Model) DiffMode() git.DiffMode          { return m.mode }
 func (m Model) PR() *github.PullRequest         { return m.pr }
 func (m Model) Files() []github.PullRequestFile { return m.dv.Files }
+
+// CurrentFilename returns the filename currently being viewed, or "" if on overview.
+func (m Model) CurrentFilename() string {
+	if m.dv.CurrentFileIdx >= 0 && m.dv.CurrentFileIdx < len(m.dv.Files) {
+		return m.dv.Files[m.dv.CurrentFileIdx].Filename
+	}
+	return ""
+}
 
 // restoreSavedPosition finds the saved file by name and restores cursor
 // to the diff line matching the saved source line number.
@@ -301,23 +316,19 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	case tea.MouseClickMsg:
 		if msg.X < m.dv.Tree.Width {
 			if idx, ok := m.dv.Tree.EntryIndexAtY(msg.Y); ok {
-				if idx == 0 {
-					m.dv.Tree.Cursor = 0
-					m.dv.CurrentFileIdx = -1
-					m.rebuildContent()
-					m.dv.VP.GotoTop()
-					m.saveViewState()
-				} else if idx >= 2 {
-					eIdx := idx - 2
-					if eIdx >= 0 && eIdx < len(m.dv.Tree.Entries) {
-						e := m.dv.Tree.Entries[eIdx]
-						if !e.IsDir && e.FileIndex >= 0 {
-							m.dv.Tree.Cursor = idx
-							cmd := m.selectTreeEntry()
-							return m, cmd
-						}
+				if idx >= 0 && idx < len(m.dv.Tree.Entries) {
+					e := m.dv.Tree.Entries[idx]
+					if !e.IsDir && e.FileIndex >= 0 {
+						m.dv.Tree.Cursor = idx
+						cmd := m.selectTreeEntry()
+						return m, cmd
 					}
 				}
+			}
+			return m, nil
+		} else if m.dv.CurrentFileIdx >= 0 {
+			if cursor := m.dv.DiffCursorFromScreenY(msg.Y); cursor >= 0 {
+				m.dv.DiffCursor = cursor
 			}
 			return m, nil
 		}
@@ -462,11 +473,32 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	case prDetectedMsg:
 		m.pr = &msg.PR
 		m.prLoaded = true
-		return m, nil
+		return m, tea.Batch(m.fetchReviewComments(), m.reviewCommentsTimer())
 
 	case prDetectFailedMsg:
 		m.prLoaded = true
 		return m, nil
+
+	case reviewCommentsRefreshMsg:
+		m.reviewComments = msg.Comments
+		m.dv.Comments = commentStoreAdapter{store: m.commentStore, reviewComments: m.reviewComments}
+		// Re-format visible files to include new comments.
+		if m.dv.FilesHighlighted > 0 {
+			for i := 0; i < len(m.dv.Files); i++ {
+				if m.dv.FileRenderLists[i] != nil {
+					m.dv.FormatFile(i)
+				}
+			}
+			m.dv.RebuildContentIfChanged(m.buildOverviewContent, m.buildFileContent)
+		}
+		// Re-arm the timer if we still have a PR.
+		if m.pr != nil {
+			return m, m.reviewCommentsTimer()
+		}
+		return m, nil
+
+	case reviewCommentsTimerMsg:
+		return m, m.fetchReviewComments()
 
 	case stageDoneMsg:
 		m.stagingInFlight--
@@ -958,7 +990,13 @@ func (m Model) renderLayout(rightView string) string {
 	} else {
 		rightTitle = "Overview"
 	}
-	return m.dv.RenderLayout(rightView, rightTitle)
+	info := diffviewer.LayoutInfo{
+		ModeName:   m.mode.String(),
+		ModeColor:  styles.ModeColor(m.mode),
+		BranchName: m.branch,
+		PR:         m.pr,
+	}
+	return m.dv.RenderLayout(rightView, rightTitle, info)
 }
 
 // --- Content building ---
@@ -974,11 +1012,6 @@ func (m *Model) rebuildContentIfChanged() {
 func (m Model) buildOverviewContent(w int) string {
 	var content strings.Builder
 
-	// Branch + mode info.
-	branchStr := lipgloss.NewStyle().Bold(true).Render(m.branch)
-	modeStr := dimStyle.Render("(" + m.mode.String() + ")")
-	content.WriteString("\n  " + branchStr + " " + modeStr + "\n")
-
 	if len(m.dv.Files) == 0 {
 		if m.dv.FilesListLoaded {
 			content.WriteString("\n  " + dimStyle.Render("No changes") + "\n")
@@ -988,21 +1021,24 @@ func (m Model) buildOverviewContent(w int) string {
 		return content.String()
 	}
 
-	// Stats summary.
+	// Stats summary with colored +/-.
 	adds, dels := git.FilesAddedDeletedStats(m.dv.Files)
-	statsStr := fmt.Sprintf("%d files changed", len(m.dv.Files))
+	var statParts []string
+	statParts = append(statParts, fmt.Sprintf("%d files", len(m.dv.Files)))
 	if adds > 0 {
-		statsStr += fmt.Sprintf(", %d insertions(+)", adds)
+		statParts = append(statParts,
+			lipgloss.NewStyle().Foreground(lipgloss.Green).Render(fmt.Sprintf("+%d", adds)))
 	}
 	if dels > 0 {
-		statsStr += fmt.Sprintf(", %d deletions(-)", dels)
+		statParts = append(statParts,
+			lipgloss.NewStyle().Foreground(lipgloss.Red).Render(fmt.Sprintf("-%d", dels)))
 	}
-	content.WriteString("\n  " + dimStyle.Render(statsStr) + "\n")
+	content.WriteString("\n  " + strings.Join(statParts, "  ") + "\n")
 
 	// File list.
 	content.WriteString("\n")
 	for _, f := range m.dv.Files {
-		icon := "≈"
+		var icon string
 		switch f.Status {
 		case "added":
 			icon = lipgloss.NewStyle().Foreground(lipgloss.Green).Render("+")
@@ -1011,12 +1047,10 @@ func (m Model) buildOverviewContent(w int) string {
 		case "renamed":
 			icon = lipgloss.NewStyle().Foreground(lipgloss.Yellow).Render("→")
 		default:
-			icon = lipgloss.NewStyle().Foreground(lipgloss.Blue).Render("≈")
+			icon = lipgloss.NewStyle().Foreground(lipgloss.Blue).Render("~")
 		}
 		content.WriteString("  " + icon + " " + f.Filename + "\n")
 	}
-
-	content.WriteString("\n  " + dimStyle.Render("Press m to toggle diff mode") + "\n")
 	content.WriteString("\n")
 
 	return content.String()
@@ -1147,16 +1181,23 @@ func (m *Model) updateThreadHighlight() {
 	m.dv.SpliceThreadWithHighlight(m.dv.CurrentFileIdx, side, line, m.dv.ThreadCursor > 0, m.dv.ThreadCursor)
 }
 
-// commentStoreAdapter adapts a CommentStore to the CommentSource interface.
+// commentStoreAdapter adapts a CommentStore + GitHub review comments to the CommentSource interface.
 type commentStoreAdapter struct {
-	store *comments.CommentStore
+	store          *comments.CommentStore
+	reviewComments []github.ReviewComment
 }
 
 func (a commentStoreAdapter) CommentsForFile(filename string) []github.ReviewComment {
-	if a.store == nil {
-		return nil
+	var result []github.ReviewComment
+	if a.store != nil {
+		result = append(result, a.store.ForFile(filename)...)
 	}
-	return a.store.ForFile(filename)
+	for _, c := range a.reviewComments {
+		if c.Path == filename {
+			result = append(result, c)
+		}
+	}
+	return result
 }
 
 // commentsForFile returns comments for a file by index (convenience).
@@ -1165,6 +1206,35 @@ func (m Model) commentsForFile(fileIdx int) []github.ReviewComment {
 		return nil
 	}
 	return m.dv.CommentsForFile(m.dv.Files[fileIdx].Filename)
+}
+
+// fetchReviewComments fetches GitHub review comments for the detected PR.
+func (m Model) fetchReviewComments() tea.Cmd {
+	if m.pr == nil {
+		return nil
+	}
+	client := m.ctx.Client
+	owner, repo, number := m.ctx.Owner, m.ctx.Repo, m.pr.Number
+	return func() tea.Msg {
+		data, found, refetch := client.GetReviewComments(owner, repo, number)
+		if refetch != nil {
+			result, err := refetch()
+			if err == nil {
+				return reviewCommentsRefreshMsg{Comments: result}
+			}
+		}
+		if found {
+			return reviewCommentsRefreshMsg{Comments: data}
+		}
+		return nil
+	}
+}
+
+// reviewCommentsTimer returns a command that fires after 2 minutes to re-fetch comments.
+func (m Model) reviewCommentsTimer() tea.Cmd {
+	return tea.Tick(2*time.Minute, func(time.Time) tea.Msg {
+		return reviewCommentsTimerMsg{}
+	})
 }
 
 // renderMarkdownBody does lightweight inline markdown rendering suitable
@@ -1285,7 +1355,8 @@ func (m *Model) selectTreeEntry() tea.Cmd {
 		m.fileCursors[m.dv.Files[m.dv.CurrentFileIdx].Filename] = m.dv.DiffCursor
 	}
 	m.dv.ThreadCursor = 0
-	if m.dv.Tree.Cursor == 0 {
+	fileIdx := m.dv.Tree.FileIndex()
+	if fileIdx < 0 || fileIdx >= len(m.dv.Files) || fileIdx >= len(m.dv.FileDiffs) {
 		m.dv.SpinnerActive = false
 		m.dv.CurrentFileIdx = -1
 		m.rebuildContent()
@@ -1293,35 +1364,29 @@ func (m *Model) selectTreeEntry() tea.Cmd {
 		m.saveViewState()
 		return nil
 	}
-	eIdx := m.dv.Tree.Cursor - 2
-	if eIdx >= 0 && eIdx < len(m.dv.Tree.Entries) {
-		e := m.dv.Tree.Entries[eIdx]
-		if !e.IsDir && e.FileIndex >= 0 && e.FileIndex < len(m.dv.Files) && e.FileIndex < len(m.dv.FileDiffs) {
-			m.dv.CurrentFileIdx = e.FileIndex
-			if saved, ok := m.fileCursors[m.dv.Files[e.FileIndex].Filename]; ok && saved < len(m.dv.FileDiffs[e.FileIndex]) {
-				m.dv.DiffCursor = saved
-			} else {
-				m.dv.DiffCursor = m.dv.FirstNonHunkLine(e.FileIndex)
-			}
-			// If the file hasn't been highlighted yet, show a spinner
-			// and kick off highlighting for this file directly (the
-			// sequential chain may have already passed this index).
-			needsHighlight := e.FileIndex < len(m.dv.HighlightedFiles) && m.dv.HighlightedFiles[e.FileIndex].File.Filename == ""
-			if needsHighlight {
-				m.dv.SpinnerActive = true
-				m.rebuildContent()
-				m.saveViewState()
-				return tea.Batch(m.dv.Spinner.Tick, m.highlightFileCmd(e.FileIndex))
-			}
-			m.dv.SpinnerActive = false
-			if m.dv.RenderedFiles[e.FileIndex] == "" {
-				m.formatFile(e.FileIndex)
-			}
-			m.rebuildContent()
-			m.dv.ScrollToDiffCursor()
-			m.saveViewState()
-		}
+	m.dv.CurrentFileIdx = fileIdx
+	if saved, ok := m.fileCursors[m.dv.Files[fileIdx].Filename]; ok && saved < len(m.dv.FileDiffs[fileIdx]) {
+		m.dv.DiffCursor = saved
+	} else {
+		m.dv.DiffCursor = m.dv.FirstNonHunkLine(fileIdx)
 	}
+	// If the file hasn't been highlighted yet, show a spinner
+	// and kick off highlighting for this file directly (the
+	// sequential chain may have already passed this index).
+	needsHighlight := fileIdx < len(m.dv.HighlightedFiles) && m.dv.HighlightedFiles[fileIdx].File.Filename == ""
+	if needsHighlight {
+		m.dv.SpinnerActive = true
+		m.rebuildContent()
+		m.saveViewState()
+		return tea.Batch(m.dv.Spinner.Tick, m.highlightFileCmd(fileIdx))
+	}
+	m.dv.SpinnerActive = false
+	if m.dv.RenderedFiles[fileIdx] == "" {
+		m.formatFile(fileIdx)
+	}
+	m.rebuildContent()
+	m.dv.ScrollToDiffCursor()
+	m.saveViewState()
 	return nil
 }
 

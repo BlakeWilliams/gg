@@ -214,9 +214,10 @@ func New(pr github.PullRequest, ctx *uictx.Context, width, height int) Model {
 		CurrentFileIdx:  -1,
 		SelectionAnchor: -1,
 		Tree: components.FileTree{
-			Width:   35,
-			Height:  height - 2,
-			Focused: true,
+			Width:      35,
+			Height:     height - 2,
+			Focused:    true,
+			ChromeRows: 2,
 		},
 		CopilotReplyBuf: make(map[string]string),
 	}
@@ -372,22 +373,12 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	case tea.MouseClickMsg:
 		if msg.X < m.dv.Tree.Width {
 			if idx, ok := m.dv.Tree.EntryIndexAtY(msg.Y); ok {
-				if idx == 0 {
-					// Overview clicked.
-					m.dv.Tree.Cursor = 0
-					m.dv.SpinnerActive = false
-					m.dv.CurrentFileIdx = -1
-					m.rebuildContent()
-					m.dv.VP.GotoTop()
-				} else if idx >= 2 {
-					eIdx := idx - 2 // -2 for Overview + separator
-					if eIdx >= 0 && eIdx < len(m.dv.Tree.Entries) {
-						e := m.dv.Tree.Entries[eIdx]
-						if !e.IsDir && e.FileIndex >= 0 {
-							m.dv.Tree.Cursor = idx
-							cmd := m.selectTreeEntry()
-							return m, cmd
-						}
+				if idx >= 0 && idx < len(m.dv.Tree.Entries) {
+					e := m.dv.Tree.Entries[idx]
+					if !e.IsDir && e.FileIndex >= 0 {
+						m.dv.Tree.Cursor = idx
+						cmd := m.selectTreeEntry()
+						return m, cmd
 					}
 				}
 			}
@@ -737,40 +728,35 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 // selectTreeEntry updates the right panel based on the current tree cursor.
 func (m *Model) selectTreeEntry() tea.Cmd {
 	m.dv.SelectionAnchor = -1
-	if m.dv.Tree.Cursor == 0 {
-		// Overview.
+	fileIdx := m.dv.Tree.FileIndex()
+	if fileIdx < 0 {
+		// Directory or out-of-range — show overview.
 		m.dv.SpinnerActive = false
 		m.dv.CurrentFileIdx = -1
 		m.rebuildContent()
 		m.dv.VP.GotoTop()
 		return nil
 	}
-	eIdx := m.dv.Tree.Cursor - 2 // -2 for Overview + separator
-	if eIdx >= 0 && eIdx < len(m.dv.Tree.Entries) {
-		e := m.dv.Tree.Entries[eIdx]
-		if !e.IsDir && e.FileIndex >= 0 {
-			m.dv.CurrentFileIdx = e.FileIndex
-			m.dv.DiffCursor = m.dv.FirstNonHunkLine(e.FileIndex)
-			// If the file hasn't been highlighted yet, show a spinner
-			// and kick off highlighting for this file directly (the
-			// sequential chain may not have reached this index yet).
-			needsHighlight := e.FileIndex < len(m.dv.RenderedFiles) && m.dv.RenderedFiles[e.FileIndex] == "" &&
-				(e.FileIndex >= len(m.dv.HighlightedFiles) || m.dv.HighlightedFiles[e.FileIndex].File.Filename == "")
-			if needsHighlight {
-				m.dv.SpinnerActive = true
-				m.rebuildContent()
-				m.dv.VP.GotoTop()
-				return tea.Batch(m.dv.Spinner.Tick, m.highlightFileCmd(e.FileIndex))
-			}
-			m.dv.SpinnerActive = false
-			// Ensure file is formatted (may have been invalidated by resize/comment).
-			if e.FileIndex < len(m.dv.RenderedFiles) && m.dv.RenderedFiles[e.FileIndex] == "" {
-				m.formatFile(e.FileIndex)
-			}
-			m.rebuildContent()
-			m.dv.VP.GotoTop()
-		}
+	m.dv.CurrentFileIdx = fileIdx
+	m.dv.DiffCursor = m.dv.FirstNonHunkLine(fileIdx)
+	// If the file hasn't been highlighted yet, show a spinner
+	// and kick off highlighting for this file directly (the
+	// sequential chain may not have reached this index yet).
+	needsHighlight := fileIdx < len(m.dv.RenderedFiles) && m.dv.RenderedFiles[fileIdx] == "" &&
+		(fileIdx >= len(m.dv.HighlightedFiles) || m.dv.HighlightedFiles[fileIdx].File.Filename == "")
+	if needsHighlight {
+		m.dv.SpinnerActive = true
+		m.rebuildContent()
+		m.dv.VP.GotoTop()
+		return tea.Batch(m.dv.Spinner.Tick, m.highlightFileCmd(fileIdx))
 	}
+	m.dv.SpinnerActive = false
+	// Ensure file is formatted (may have been invalidated by resize/comment).
+	if fileIdx < len(m.dv.RenderedFiles) && m.dv.RenderedFiles[fileIdx] == "" {
+		m.formatFile(fileIdx)
+	}
+	m.rebuildContent()
+	m.dv.VP.GotoTop()
 	return nil
 }
 

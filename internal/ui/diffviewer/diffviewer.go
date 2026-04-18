@@ -1,6 +1,9 @@
 package diffviewer
 
 import (
+	"fmt"
+	"image/color"
+	"path"
 	"strings"
 	"time"
 
@@ -18,6 +21,15 @@ import (
 )
 
 const scrollMargin = 5
+
+// LayoutInfo carries optional metadata for the header/footer chrome.
+// Callers that don't set fields get sensible defaults (no mode, no branch, etc).
+type LayoutInfo struct {
+	ModeName    string      // e.g. "Unstaged", "Staged", "Branch"
+	ModeColor   color.Color // derived from mode; nil = no mode shown
+	BranchName  string      // shown in footer under file tree
+	PR          *github.PullRequest
+}
 
 // CopilotPendingInfo tracks a single pending Copilot reply.
 type CopilotPendingInfo struct {
@@ -104,15 +116,15 @@ func (d DiffViewer) RightPanelWidth() int {
 }
 
 func (d DiffViewer) RightPanelInnerWidth() int {
-	return d.RightPanelWidth() - 2
+	return d.RightPanelWidth() - 1 // separator column
 }
 
 func (d DiffViewer) ContentWidth() int {
-	return d.RightPanelInnerWidth()
+	return d.RightPanelInnerWidth() - 1 // -1 for scrollbar column
 }
 
 func (d DiffViewer) ViewportHeight() int {
-	return d.Height - 2
+	return d.Height - 2 // header + separator (footer only affects file tree side)
 }
 
 func (d DiffViewer) BorderStyle() lipgloss.Style {
@@ -354,6 +366,42 @@ func (d DiffViewer) CursorViewportLine() int {
 	return rel
 }
 
+// DiffCursorFromScreenY maps a screen Y coordinate to the nearest diff line
+// index, accounting for chrome rows and viewport scroll. Returns -1 if no
+// valid diff line is found.
+func (d *DiffViewer) DiffCursorFromScreenY(y int) int {
+	chromeRows := 2
+	row := y - chromeRows
+	if row < 0 || row >= d.ViewportHeight() {
+		return -1
+	}
+	absLine := d.VP.YOffset() + row
+
+	idx := d.CurrentFileIdx
+	if idx < 0 || idx >= len(d.FileDiffOffsets) {
+		return -1
+	}
+	offsets := d.FileDiffOffsets[idx]
+	diffs := d.FileDiffs[idx]
+
+	best := -1
+	bestDist := 0
+	for i, off := range offsets {
+		if i < len(diffs) && diffs[i].Type == components.LineHunk {
+			continue
+		}
+		dist := off - absLine
+		if dist < 0 {
+			dist = -dist
+		}
+		if best == -1 || dist < bestDist {
+			best = i
+			bestDist = dist
+		}
+	}
+	return best
+}
+
 // --- Cursor overlay rendering ---
 
 // OverlayDiffCursor applies cursor or selection highlighting to the viewport content.
@@ -492,107 +540,227 @@ func replaceBackground(inner string, colors styles.DiffColors, selBg string) str
 // --- Layout rendering ---
 
 // RenderLayout composes the file tree (left) and diff view (right) into the final output.
-func (d DiffViewer) RenderLayout(rightView string, rightTitle string) string {
+func (d DiffViewer) RenderLayout(rightView string, rightTitle string, info LayoutInfo) string {
 	treeW := d.Tree.Width
-	innerTreeW := treeW - 2
-	innerTreeH := d.Height - 2
+	chromeRows := 2 // header + separator (footer only affects left panel)
 
-	bc := d.BorderStyle()
-	var treeBorderStyle lipgloss.Style
+	// Chrome color: use bar background from terminal, fall back to BrightBlack.
+	var chromeClr color.Color = lipgloss.BrightBlack
+	if d.Ctx.ChromeColor != nil {
+		chromeClr = d.Ctx.ChromeColor
+	}
+	chrome := lipgloss.NewStyle().Foreground(chromeClr)
+	dim := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
+	bold := lipgloss.NewStyle().Bold(true)
+
+	// Active panel gets bright title, inactive gets dim.
+	var treeTitleStyle, rightTitleStyle lipgloss.Style
 	if d.Tree.Focused {
-		treeBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Yellow)
+		treeTitleStyle = bold.Foreground(lipgloss.BrightWhite)
+		rightTitleStyle = dim
 	} else {
-		treeBorderStyle = bc
+		treeTitleStyle = dim
+		rightTitleStyle = bold.Foreground(lipgloss.BrightWhite)
 	}
 
-	// Tree border.
-	titleStr := " " + lipgloss.NewStyle().Bold(true).Render("Files") + " "
-	titleW := lipgloss.Width(titleStr)
-	fillW := treeW - 3 - titleW
-	if fillW < 0 {
-		fillW = 0
-	}
-	topBorder := treeBorderStyle.Render("╭─") + titleStr + treeBorderStyle.Render(strings.Repeat("─", fillW)+"╮")
-	bw := treeW - 2
-	if bw < 0 {
-		bw = 0
-	}
-	bottomBorder := treeBorderStyle.Render("╰" + strings.Repeat("─", bw) + "╯")
-	sideBorderL := treeBorderStyle.Render("│")
-	sideBorderR := treeBorderStyle.Render("│")
+	sep := chrome.Render("│")
+	rightW := d.RightPanelWidth()
 
-	// Temporarily set tree dimensions for rendering.
+	// === Header: left panel ===
+	// " N Files ... MODE_TEXT "
+	var treeLabel string
+	n := len(d.Files)
+	if n == 0 {
+		treeLabel = treeTitleStyle.Render("Files")
+	} else if n == 1 {
+		treeLabel = treeTitleStyle.Render(fmt.Sprintf("%d File", n))
+	} else {
+		treeLabel = treeTitleStyle.Render(fmt.Sprintf("%d Files", n))
+	}
+
+	var modeLabel string
+	if info.ModeName != "" && info.ModeColor != nil {
+		modeStyle := lipgloss.NewStyle().Foreground(info.ModeColor)
+		modeLabel = modeStyle.Render(strings.ToUpper(info.ModeName))
+	}
+
+	treeLabelW := lipgloss.Width(treeLabel)
+	modeLabelW := lipgloss.Width(modeLabel)
+	treeHeaderPad := treeW - 1 - treeLabelW - modeLabelW - 1 // -1 leading space, -1 for sep
+	if treeHeaderPad < 0 {
+		treeHeaderPad = 0
+	}
+	treeHeader := " " + treeLabel + strings.Repeat(" ", treeHeaderPad) + modeLabel
+
+	// === Header: right panel ===
+	// " dir/filename ... +N -M  PR #42  ◀ 42% "
+	var rightLabel string
+	var rightTrailer string // right-aligned: stats + PR + scroll
+	if rightTitle == "Overview" {
+		rightLabel = rightTitleStyle.Render("Overview")
+	} else {
+		dir, file := path.Split(rightTitle)
+		if dir != "" {
+			rightLabel = dim.Render(dir) + rightTitleStyle.Render(file)
+		} else {
+			rightLabel = rightTitleStyle.Render(rightTitle)
+		}
+	}
+
+	// Build right-aligned trailer parts.
+	var trailerParts []string
+
+	// File stats (+N -M).
+	if d.CurrentFileIdx >= 0 && d.CurrentFileIdx < len(d.Files) {
+		f := d.Files[d.CurrentFileIdx]
+		green := lipgloss.NewStyle().Foreground(lipgloss.Green)
+		red := lipgloss.NewStyle().Foreground(lipgloss.Red)
+		var statParts []string
+		if f.Additions > 0 {
+			statParts = append(statParts, green.Render(fmt.Sprintf("+%d", f.Additions)))
+		}
+		if f.Deletions > 0 {
+			statParts = append(statParts, red.Render(fmt.Sprintf("-%d", f.Deletions)))
+		}
+		if len(statParts) > 0 {
+			trailerParts = append(trailerParts, strings.Join(statParts, " "))
+		}
+	}
+
+	// PR badge — rendered in footer next to branch name, not in header.
+
+	if len(trailerParts) > 0 {
+		rightTrailer = strings.Join(trailerParts, dim.Render("  "))
+	}
+
+	rightLabelW := lipgloss.Width(rightLabel)
+	rightTrailerW := lipgloss.Width(rightTrailer)
+	rightHeaderGap := rightW - 2 - rightLabelW - rightTrailerW // -2 for leading/trailing space
+	if rightHeaderGap < 0 {
+		rightHeaderGap = 0
+	}
+	rightHeader := " " + rightLabel + strings.Repeat(" ", rightHeaderGap) + rightTrailer + " "
+	headerLine := treeHeader + sep + rightHeader
+
+	// Separator row: thin horizontal rule.
+	treeFill := treeW - 1
+	if treeFill < 0 {
+		treeFill = 0
+	}
+	rightFill := rightW - 1
+	if rightFill < 0 {
+		rightFill = 0
+	}
+	separatorLine := chrome.Render(strings.Repeat("─", treeFill) + "┼" + strings.Repeat("─", rightFill))
+
+	// Content area.
+	contentH := d.Height - chromeRows
 	tree := d.Tree
-	tree.Width = innerTreeW
-	tree.Height = innerTreeH
+	tree.Width = treeW - 1
+	tree.Height = contentH - 2 // tree loses 2 rows for footer separator + branch
 	tree.CurrentFileIdx = d.CurrentFileIdx
 	treeContentLines := tree.View()
 	rightLines := strings.Split(rightView, "\n")
 
-	// Right panel border.
-	rightW := d.RightPanelWidth()
-	innerRightW := rightW - 2
-	var rightBorderStyle lipgloss.Style
-	if !d.Tree.Focused {
-		rightBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Yellow)
-	} else {
-		rightBorderStyle = bc
-	}
+	innerRightW := rightW - 1
 
-	rtTitle := " " + lipgloss.NewStyle().Bold(true).Render(rightTitle) + " "
-	rtW := lipgloss.Width(rtTitle)
-	rtFill := rightW - 3 - rtW
-	if rtFill < 0 {
-		rtFill = 0
+	// Scrollbar: compute thumb position and size.
+	totalLines := d.VP.TotalLineCount()
+	vpH := contentH
+	var thumbStart, thumbLen int
+	if totalLines <= vpH || totalLines == 0 {
+		// Content fits — no scrollbar needed.
+		thumbStart = -1
+		thumbLen = 0
+	} else {
+		thumbLen = vpH * vpH / totalLines
+		if thumbLen < 1 {
+			thumbLen = 1
+		}
+		scrollable := totalLines - vpH
+		offset := d.VP.YOffset()
+		if offset > scrollable {
+			offset = scrollable
+		}
+		thumbStart = offset * (vpH - thumbLen) / scrollable
 	}
-	rightTop := rightBorderStyle.Render("╭─") + rtTitle + rightBorderStyle.Render(strings.Repeat("─", rtFill)+"╮")
-	rbw := rightW - 2
-	if rbw < 0 {
-		rbw = 0
-	}
-	rightBottom := rightBorderStyle.Render("╰" + strings.Repeat("─", rbw) + "╯")
-	rightSideL := rightBorderStyle.Render("│")
-	rightSideR := rightBorderStyle.Render("│")
+	// Scrollbar styles: track matches border color, thumb slightly lighter.
+	trackChar := chrome.Render("│")
+	thumbColor := uictx.BrightnessModify(chromeClr, 40)
+	thumbChar := lipgloss.NewStyle().Foreground(thumbColor).Render("┃")
 
 	var b strings.Builder
-	for i := 0; i < d.Height; i++ {
-		var treeLine string
-		if i == 0 {
-			treeLine = topBorder
-		} else if i == d.Height-1 {
-			treeLine = bottomBorder
-		} else {
-			tIdx := i - 1
-			cl := ""
-			if tIdx < len(treeContentLines) {
-				cl = treeContentLines[tIdx]
+	b.WriteString(headerLine)
+	b.WriteString("\n")
+	b.WriteString(separatorLine)
+	b.WriteString("\n")
+
+	for i := 0; i < contentH; i++ {
+		// Left panel: tree content for most rows, footer for last 2.
+		var leftPart string
+		if i == contentH-2 {
+			// Footer separator (only on tree side).
+			leftPart = chrome.Render(strings.Repeat("─", treeW-1))
+		} else if i == contentH-1 {
+			// Branch name (left) + PR badge (right).
+			branchText := ""
+			if info.BranchName != "" {
+				branchText = dim.Render(" " + info.BranchName)
 			}
-			treeLine = sideBorderL + cl + sideBorderR
+			prText := ""
+			if info.PR != nil {
+				prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%d", info.PR.RepoOwner(), info.PR.RepoName(), info.PR.Number)
+				prStyle := lipgloss.NewStyle().
+					Foreground(lipgloss.Cyan).
+					Hyperlink(prURL)
+				prText = prStyle.Render(fmt.Sprintf("PR#%d", info.PR.Number)) + " "
+			}
+			branchW := lipgloss.Width(branchText)
+			prW := lipgloss.Width(prText)
+			gap := treeW - 1 - branchW - prW
+			if gap < 0 {
+				gap = 0
+			}
+			leftPart = branchText + strings.Repeat(" ", gap) + prText
+		} else {
+			tl := ""
+			if i < len(treeContentLines) {
+				tl = treeContentLines[i]
+			}
+			tlW := lipgloss.Width(tl)
+			treePad := treeW - 1 - tlW
+			if treePad < 0 {
+				treePad = 0
+			}
+			leftPart = tl + strings.Repeat(" ", treePad)
 		}
 
-		var rightLine string
-		if i == 0 {
-			rightLine = rightTop
-		} else if i == d.Height-1 {
-			rightLine = rightBottom
-		} else {
-			rIdx := i - 1
-			rl := ""
-			if rIdx < len(rightLines) {
-				rl = rightLines[rIdx]
-			}
-			rlW := lipgloss.Width(rl)
-			if rlW < innerRightW {
-				rl += strings.Repeat(" ", innerRightW-rlW)
-			}
-			rightLine = rightSideL + rl + rightSideR
+		rl := ""
+		if i < len(rightLines) {
+			rl = rightLines[i]
+		}
+		rlW := lipgloss.Width(rl)
+		contentW := innerRightW - 1 // -1 for scrollbar column
+		if rlW < contentW {
+			rl += strings.Repeat(" ", contentW-rlW)
 		}
 
-		b.WriteString(treeLine + rightLine)
-		if i < d.Height-1 {
+		// Scrollbar column.
+		var scrollCol string
+		if thumbStart < 0 {
+			scrollCol = " " // no scrollbar needed
+		} else if i >= thumbStart && i < thumbStart+thumbLen {
+			scrollCol = thumbChar
+		} else {
+			scrollCol = trackChar
+		}
+
+		b.WriteString(leftPart + sep + rl + scrollCol)
+		if i < contentH-1 {
 			b.WriteString("\n")
 		}
 	}
+
 	return b.String()
 }
 

@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"image/color"
 	"os"
 	"strconv"
 	"strings"
@@ -12,11 +13,8 @@ import (
 	"github.com/blakewilliams/ghq/internal/terminal"
 	"github.com/blakewilliams/ghq/internal/review/copilot"
 	"github.com/blakewilliams/ghq/internal/ui/commandbar"
-		inboxui "github.com/blakewilliams/ghq/internal/inbox/ui"
 	"github.com/blakewilliams/ghq/internal/ui/localdiff"
 	"github.com/blakewilliams/ghq/internal/ui/picker"
-	"github.com/blakewilliams/ghq/internal/ui/prdetail"
-	"github.com/blakewilliams/ghq/internal/ui/prlist"
 	"github.com/blakewilliams/ghq/internal/ui/styles"
 	"github.com/blakewilliams/ghq/internal/ui/uictx"
 	tea "charm.land/bubbletea/v2"
@@ -67,29 +65,27 @@ const (
 	modeCopilotChat
 )
 
-const chromeHeight = 2
+const chromeHeight = 0 // no status bar — info is in the layout header/footer
 
 
 type Model struct {
-	activeView uictx.View
-	prList     prlist.Model // retained so we can restore it on back-navigation
-	history    []uictx.View // back stack (views we navigated away from)
-	forward    []uictx.View // forward stack (views we went back from)
-	mode       inputMode
-	commandBar commandbar.Model
+	activeView  uictx.View
+	mode        inputMode
+	commandBar  commandbar.Model
 	picker      picker.Model
-	pickerKind  string // "command", "help", "view" — routes ResultMsg
+	pickerKind  string // "command", "help" — routes ResultMsg
 	copilotChat    copilot.ChatModel
 	chatClient     *copilot.Client // shared copilot client for chat
 	chatInitialized bool
 	ctx         *uictx.Context
 	quitPending bool // true after first ctrl+c
 	palette     terminal.Palette
-	repoRoot    string // local git repo root, if any
-	startupMode string // from CLI arg
-	startupPR   int    // specific PR number from CLI arg
+	repoRoot    string      // local git repo root, if any
+	hasDarkBg   bool        // true when terminal has a dark background
+	termBg      color.Color // actual terminal background color
 	width       int
 	height      int
+	windowTitle string
 }
 
 func (m Model) nwo() string {
@@ -104,9 +100,7 @@ type AppConfig struct {
 	Client   *github.CachedClient
 	Owner    string
 	Repo     string
-	RepoRoot string // local git repo root, if any
-	Mode     string // "inbox", "pr", "diff", "pulls", or "" (show picker)
-	PRNumber int    // specific PR number for "pr" mode
+	RepoRoot string // local git repo root
 }
 
 // NewApp creates and returns a new top-level UI model.
@@ -117,63 +111,21 @@ func NewApp(cfg AppConfig) Model {
 		commandBar:  commandbar.New(),
 		ctx:         ctx,
 		repoRoot:    cfg.RepoRoot,
-		startupMode: cfg.Mode,
-		startupPR:   cfg.PRNumber,
-	}
-
-	// If a mode was specified, open that view directly.
-	switch cfg.Mode {
-	case "diff":
-		if cfg.RepoRoot != "" {
-			m.activeView = localdiff.New(ctx, cfg.RepoRoot, 0, 0)
-		} else {
-			m.activeView = inboxui.New(ctx, m.nwo())
-		}
-	case "inbox":
-		m.activeView = inboxui.New(ctx, m.nwo())
-	case "pr":
-		// PR mode with specific number, will fetch in Init.
-		// Show empty view while loading to avoid flashing inbox.
-		m.activeView = emptyView{}
-	case "pulls":
-		// Show the PR list for the specified repo.
-		m.activeView = prlist.New(ctx)
-	default:
-		// No mode specified — show startup picker over blank screen.
-		m.activeView = emptyView{}
+		hasDarkBg:   true, // assume dark until terminal responds
+		activeView:  localdiff.New(ctx, cfg.RepoRoot, 0, 0),
+		windowTitle: "gg",
 	}
 
 	return m
 }
 
-type startupPickerMsg struct{}
-
 func (m Model) Init() tea.Cmd {
-	cmds := []tea.Cmd{
+	return tea.Batch(
 		fetchAuthenticatedUser(m.ctx.Client),
 		gcTickCmd(m.ctx.Client),
 		queryPaletteCmd(),
 		tea.RequestBackgroundColor,
-	}
-
-	switch m.startupMode {
-	case "pr":
-		if m.startupPR > 0 {
-			// Fetch specific PR by number.
-			cmds = append(cmds, uictx.FetchPR(m.ctx.Client, m.ctx.Owner, m.ctx.Repo, m.startupPR))
-		} else if m.repoRoot != "" && m.ctx.Owner != "" {
-			// Fetch the PR for the current branch.
-			branch, _ := git.CurrentBranch(m.repoRoot)
-			if branch != "" {
-				cmds = append(cmds, uictx.FetchPRByBranch(m.ctx.Client, m.ctx.Owner, m.ctx.Repo, branch))
-			}
-		}
-	case "":
-		// No mode — show startup picker after first render.
-		cmds = append(cmds, func() tea.Msg { return startupPickerMsg{} })
-	}
-
-	return tea.Batch(cmds...)
+	)
 }
 
 // queryPaletteCmd sends OSC 4 queries through Bubble Tea's output buffer.
@@ -216,6 +168,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.activeView, cmd = m.activeView.Update(contentMsg)
 		return m, cmd
 
+	case tea.BackgroundColorMsg:
+		m.hasDarkBg = msg.IsDark()
+		m.termBg = msg.Color
+		m.ctx.ChromeColor = m.chromeColor()
+		return m, nil
+
 	case commandbar.CommandMsg:
 		m.mode = modeNormal
 		return m.handleCommand(msg)
@@ -226,12 +184,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case quitTimeoutMsg:
 		m.quitPending = false
-		return m, nil
-
-	case startupPickerMsg:
-		m.mode = modePicker
-		m.pickerKind = "startup"
-		m.picker = picker.New("Open", m.startupPickerItems(), m.pickerInnerWidth(), m.height-chromeHeight)
 		return m, nil
 
 	case tea.KeyPressMsg:
@@ -290,26 +242,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "C":
 			return m.openCopilotChat()
-		case "m":
-			// In prdetail, m goes back to localdiff.
-			if _, ok := m.activeView.(prdetail.Model); ok && m.repoRoot != "" {
-				if len(m.history) > 0 {
-					return m.navigateBack()
-				}
-			}
-		case "<":
-			if len(m.history) > 0 {
-				return m.navigateBack()
-			}
-		case ">":
-			if len(m.forward) > 0 {
-				return m.navigateForward()
-			}
 		}
 
 	case picker.ResultMsg:
 		m.mode = modeNormal
-		kind := m.pickerKind
 		m.pickerKind = ""
 
 		if !msg.Selected && msg.Value != "" {
@@ -323,30 +259,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !msg.Selected || msg.Value == "" {
 			return m, nil
 		}
-
-		switch kind {
-		case "command", "startup":
-			return m.handleCommand(commandbar.CommandMsg{Command: msg.Value})
-		case "view":
-			return m.handleViewPickerResult(msg.Value)
-		}
-		return m, nil
+		return m.handleCommand(commandbar.CommandMsg{Command: msg.Value})
 
 	case copilot.CloseMsg:
 		m.mode = modeNormal
 		return m, nil
-
-	case localdiff.OpenViewPickerMsg:
-		m.mode = modePicker
-		m.pickerKind = "view"
-		m.picker = picker.New("View", msg.Items, m.pickerInnerWidth(), m.height-chromeHeight)
-		return m, nil
-
-	case localdiff.SwitchToPRMsg:
-		m.history = append(m.history, m.activeView)
-		m.forward = nil
-		m.activeView = m.newPRDetail(msg.PR)
-		return m, m.activeView.Init()
 
 	// Route copilot messages by comment ID — "chat" goes to chat, others to active view.
 	case copilot.ReplyMsg:
@@ -355,7 +272,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.copilotChat, cmd = m.copilotChat.Update(msg)
 			return m, cmd
 		}
-		// Inline comment reply — forward to active view.
 		var cmd tea.Cmd
 		m.activeView, cmd = m.activeView.Update(msg)
 		return m, cmd
@@ -376,7 +292,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.copilotChat, cmd = m.copilotChat.Update(msg)
 			return m, cmd
 		}
-		return m, nil // ignore tool events for inline comments
+		return m, nil
 
 	default:
 		if m.mode == modeCommand {
@@ -397,22 +313,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case userLoadedMsg:
 		m.ctx.Username = msg.User.Login
-		// Now that we have the username, init the home view.
-		return m, m.activeView.Init()
-
-	case inboxui.PRSelectedMsg:
-		m.history = append(m.history, m.activeView)
-		m.forward = nil
-		return m, uictx.FetchPR(m.ctx.Client, msg.Owner, msg.Repo, msg.Number)
-
-	case uictx.PRLoadedMsg:
-		m.activeView = m.newPRDetail(msg.PR)
-		return m, m.activeView.Init()
-
-	case prlist.PRSelectedMsg:
-		m.history = append(m.history, m.activeView)
-		m.forward = nil
-		m.activeView = m.newPRDetail(msg.PR)
 		return m, m.activeView.Init()
 	}
 
@@ -420,33 +320,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.activeView, cmd = m.activeView.Update(msg)
 	return m, cmd
-}
-
-func (m Model) navigateBack() (tea.Model, tea.Cmd) {
-	prev := m.history[len(m.history)-1]
-	m.history = m.history[:len(m.history)-1]
-	m.forward = append(m.forward, m.activeView)
-	m.activeView = prev
-	// Restore prList reference if we're going back to the list.
-	if pl, ok := prev.(prlist.Model); ok {
-		m.prList = pl
-	}
-	resize := tea.WindowSizeMsg{Width: m.width, Height: m.height - chromeHeight}
-	m.activeView, _ = m.activeView.Update(resize)
-	return m, nil
-}
-
-func (m Model) navigateForward() (tea.Model, tea.Cmd) {
-	next := m.forward[len(m.forward)-1]
-	m.forward = m.forward[:len(m.forward)-1]
-	m.history = append(m.history, m.activeView)
-	m.activeView = next
-	if pl, ok := m.activeView.(prlist.Model); ok {
-		m.prList = pl
-	}
-	resize := tea.WindowSizeMsg{Width: m.width, Height: m.height - chromeHeight}
-	m.activeView, _ = m.activeView.Update(resize)
-	return m, nil
 }
 
 func (m Model) handleCommand(msg commandbar.CommandMsg) (tea.Model, tea.Cmd) {
@@ -461,56 +334,8 @@ func (m Model) handleCommand(msg commandbar.CommandMsg) (tea.Model, tea.Cmd) {
 	case "q", "quit":
 		return m, tea.Quit
 	case "refresh":
-		if _, ok := m.activeView.(prlist.Model); ok {
-			m.ctx.Client.InvalidateAll()
-			return m, prlist.ListPullRequests(m.ctx.Client, m.ctx.Owner, m.ctx.Repo)
-		}
-		if _, ok := m.activeView.(localdiff.Model); ok {
-			m.activeView = localdiff.New(m.ctx, m.repoRoot, m.width, m.height-chromeHeight)
-			return m, m.activeView.Init()
-		}
-	case "back":
-		if len(m.history) > 0 {
-			return m.navigateBack()
-		}
-	case "local":
-		if m.repoRoot != "" {
-			if _, ok := m.activeView.(localdiff.Model); !ok {
-				m.history = append(m.history, m.activeView)
-				m.forward = nil
-				m.activeView = localdiff.New(m.ctx, m.repoRoot, m.width, m.height-chromeHeight)
-				return m, m.activeView.Init()
-			}
-		}
-	case "inbox":
-		if _, ok := m.activeView.(inboxui.Model); !ok {
-			m.history = append(m.history, m.activeView)
-			m.forward = nil
-			nwo := ""
-			if m.ctx.Owner != "" {
-				nwo = m.ctx.Owner + "/" + m.ctx.Repo
-			}
-			h := inboxui.New(m.ctx, nwo)
-			m.activeView = h
-			resize := tea.WindowSizeMsg{Width: m.width, Height: m.height - chromeHeight}
-			m.activeView, _ = m.activeView.Update(resize)
-			return m, m.activeView.Init()
-		}
-	case "pr":
-		// Open the PR for the current branch.
-		if m.repoRoot != "" {
-			branch := ""
-			if ld, ok := m.activeView.(localdiff.Model); ok {
-				branch = ld.BranchName()
-			} else {
-				branch, _ = git.CurrentBranch(m.repoRoot)
-			}
-			if branch != "" {
-				m.history = append(m.history, m.activeView)
-				m.forward = nil
-				return m, uictx.FetchPRByBranch(m.ctx.Client, m.ctx.Owner, m.ctx.Repo, branch)
-			}
-		}
+		m.activeView = localdiff.New(m.ctx, m.repoRoot, m.width, m.height-chromeHeight)
+		return m, m.activeView.Init()
 	case "working":
 		var cmd tea.Cmd
 		m.activeView, cmd = m.activeView.Update(localdiff.SwitchModeMsg{Mode: git.DiffWorking})
@@ -528,9 +353,24 @@ func (m Model) handleCommand(msg commandbar.CommandMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) View() tea.View {
-	header := m.renderHeader()
+	// Update window title from active view.
+	switch v := m.activeView.(type) {
+	case localdiff.Model:
+		title := "gg • " + v.BranchName()
+		if f := v.CurrentFilename(); f != "" {
+			title += " • " + f
+		}
+		m.windowTitle = title
+	}
 
-	contentHeight := m.height - chromeHeight
+	// Reserve a row for command bar / quit hint when active.
+	barActive := m.quitPending || m.mode == modeCommand
+	barHeight := 0
+	if barActive {
+		barHeight = 1
+	}
+
+	contentHeight := m.height - barHeight
 	if contentHeight < 0 {
 		contentHeight = 0
 	}
@@ -544,98 +384,31 @@ func (m Model) View() tea.View {
 		content = m.renderChatOverlay(content, contentHeight)
 	}
 
-	var bar string
-	if m.quitPending {
-		bar = styles.StatusBarKey.Render("Press ctrl+c again to quit")
-	} else if m.mode == modeCommand {
-		bar = m.commandBar.View()
+	var output string
+	if barActive {
+		var bar string
+		if m.quitPending {
+			bar = styles.StatusBarKey.Render("Press ctrl+c again to quit")
+		} else {
+			bar = m.commandBar.View()
+		}
+		output = content + "\n" + bar
 	} else {
-		bar = m.renderStatusBar()
+		output = content
 	}
 
-	v := tea.NewView(header + "\n" + content + "\n" + bar)
+	v := tea.NewView(output)
 	v.AltScreen = true
 	v.MouseMode = tea.MouseModeCellMotion
+	v.WindowTitle = m.windowTitle
+	// OSC 0 for iTerm2 compatibility (OSC 2 alone doesn't override job name).
+	fmt.Fprintf(os.Stderr, "\033]0;%s\007", m.windowTitle)
 	return v
-}
-
-func (m Model) renderHeader() string {
-	sep := styles.HeaderSep.Render(" / ")
-
-	// Always show repo name if available.
-	repo := m.ctx.Owner + "/" + m.ctx.Repo
-	var crumb string
-
-	switch v := m.activeView.(type) {
-	case inboxui.Model:
-		if repo != "" {
-			crumb = " " + styles.HeaderRepo.Render(repo) + sep + styles.HeaderActive.Render("Inbox")
-		} else {
-			crumb = " " + styles.HeaderActive.Render("Inbox")
-		}
-	case localdiff.Model:
-		dot := styles.HeaderSep.Render(" · ")
-		crumb = " "
-		if repo != "" {
-			crumb += styles.HeaderRepo.Render(repo) + sep
-		}
-		crumb += styles.HeaderActive.Render(v.BranchName()) + dot + styles.HeaderSection.Render(v.DiffMode().String())
-		if pr := v.PR(); pr != nil {
-			prBadge := styles.HeaderSep.Render(fmt.Sprintf(" PR #%d", pr.Number))
-			gap := m.width - lipgloss.Width(crumb) - lipgloss.Width(prBadge) - 1
-			if gap > 0 {
-				crumb += strings.Repeat(" ", gap) + prBadge
-			}
-		}
-	case prlist.Model:
-		crumb = " " + styles.HeaderRepo.Render(repo) + sep + styles.HeaderActive.Render("Pulls")
-	case prdetail.Model:
-		crumb = " " + styles.HeaderRepo.Render(v.RepoFullName()) + sep +
-			styles.HeaderSection.Render("Pulls") + sep +
-			styles.HeaderActive.Render(fmt.Sprintf("#%d %s", v.PRNumber(), v.PRTitle()))
-	default:
-		crumb = " " + styles.HeaderActive.Render("ghq")
-	}
-
-	return styles.HeaderBar.Width(m.width).Render(crumb)
-}
-
-func (m Model) renderStatusBar() string {
-	var left, right string
-	sep := styles.StatusBarHint.Render("  ")
-
-	switch v := m.activeView.(type) {
-	case inboxui.Model:
-		leftHints, rightHints := v.StatusHints()
-		leftHints = append([]string{formatHints([]string{":  cmd"})}, leftHints...)
-		left = strings.Join(leftHints, sep)
-		right = strings.Join(rightHints, sep)
-	case localdiff.Model:
-		leftHints, rightHints := v.StatusHints()
-		leftHints = append([]string{formatHints([]string{":  cmd"})}, leftHints...)
-		left = strings.Join(leftHints, sep)
-		right = strings.Join(rightHints, sep)
-	case prlist.Model:
-		left = formatHints([]string{":  cmd", "/  filter", "enter  open"})
-	case prdetail.Model:
-		leftHints, rightHints := v.StatusHints()
-		leftHints = append([]string{styles.StatusBarKey.Render("<") + " " + styles.StatusBarHint.Render("back")}, leftHints...)
-		left = strings.Join(leftHints, sep)
-		right = strings.Join(rightHints, sep)
-	}
-
-	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
-	if gap < 0 {
-		gap = 0
-	}
-
-	return left + strings.Repeat(" ", gap) + right
 }
 
 func formatHints(hints []string) string {
 	var parts []string
 	for _, h := range hints {
-		// Split on first space: "key desc"
 		idx := strings.IndexByte(h, ' ')
 		if idx > 0 {
 			key := h[:idx]
@@ -650,44 +423,6 @@ func formatHints(hints []string) string {
 
 func hint(key, desc string) string {
 	return styles.StatusBarKey.Render(key) + " " + styles.StatusBarHint.Render(desc)
-}
-
-// newPRDetail creates a prdetail.Model and sets local context if applicable.
-func (m Model) newPRDetail(pr github.PullRequest) prdetail.Model {
-	pd := prdetail.New(pr, m.ctx, m.width, m.height-chromeHeight)
-	if m.repoRoot != "" {
-		branch, _ := git.CurrentBranch(m.repoRoot)
-		if branch == pr.Head.Ref {
-			pd.SetLocalContext(m.repoRoot)
-		}
-	}
-	return pd
-}
-
-func (m Model) handleViewPickerResult(value string) (tea.Model, tea.Cmd) {
-	switch value {
-	case "working":
-		var cmd tea.Cmd
-		m.activeView, cmd = m.activeView.Update(localdiff.SwitchModeMsg{Mode: git.DiffWorking})
-		return m, cmd
-	case "staged":
-		var cmd tea.Cmd
-		m.activeView, cmd = m.activeView.Update(localdiff.SwitchModeMsg{Mode: git.DiffStaged})
-		return m, cmd
-	case "branch":
-		var cmd tea.Cmd
-		m.activeView, cmd = m.activeView.Update(localdiff.SwitchModeMsg{Mode: git.DiffBranch})
-		return m, cmd
-	case "pr":
-		if ld, ok := m.activeView.(localdiff.Model); ok && ld.PR() != nil {
-			m.history = append(m.history, m.activeView)
-			m.forward = nil
-			pr := *ld.PR()
-			m.activeView = m.newPRDetail(pr)
-			return m, m.activeView.Init()
-		}
-	}
-	return m, nil
 }
 
 func (m Model) openCopilotChat() (tea.Model, tea.Cmd) {
@@ -715,9 +450,6 @@ func (m Model) openCopilotChat() (tea.Model, tea.Cmd) {
 		if v.PR() != nil {
 			ctx.PRNumber = v.PR().Number
 		}
-	case prdetail.Model:
-		ctx.Files = v.Files()
-		ctx.PRNumber = v.PRNumber()
 	}
 
 	chatW := m.width * 2 / 3
@@ -822,62 +554,30 @@ func (m Model) renderChatOverlay(bg string, bgHeight int) string {
 	return strings.Join(bgLines, "\n")
 }
 
-func (m Model) startupPickerItems() []picker.Item {
-	var items []picker.Item
-	items = append(items, picker.Item{
-		Label: "Inbox", Description: "PR inbox", Value: "inbox",
-		Keywords: []string{"home", "notifications"},
-	})
-	if m.repoRoot != "" {
-		items = append(items, picker.Item{
-			Label: "Local Diff", Description: "Review local changes", Value: "local",
-			Keywords: []string{"diff", "changes", "working", "staged"},
-		})
-	}
-	if m.ctx.Owner != "" && m.repoRoot != "" {
-		items = append(items, picker.Item{
-			Label: "Pull Request", Description: "Open PR for current branch", Value: "pr",
-			Keywords: []string{"review", "branch"},
-		})
-	}
-	return items
-}
-
 func (m Model) commandPickerItems() []picker.Item {
 	items := []picker.Item{
-		{Label: "Inbox", Description: "Go to PR inbox", Value: "inbox", Keywords: []string{"home", "notifications"}},
-		{Label: "Refresh", Description: "Reload current view", Value: "refresh"},
-		{Label: "Quit", Description: "Exit ghq", Value: "quit", Keywords: []string{"exit", "close"}},
+		{Label: "Working Tree", Description: "Uncommitted changes", Value: "working", Keywords: []string{"mode", "unstaged"}},
+		{Label: "Staged", Description: "Staged changes", Value: "staged", Keywords: []string{"mode", "cached", "index"}},
 	}
-	if m.repoRoot != "" {
-		items = append([]picker.Item{
-			{Label: "Local Diff", Description: "Local changes view", Value: "local", Keywords: []string{"diff", "changes", "working"}},
-			{Label: "Open PR", Description: "PR for current branch", Value: "pr", Keywords: []string{"pull request", "branch"}},
-		}, items...)
 
-		// Mode switching (available when in localdiff).
-		if _, ok := m.activeView.(localdiff.Model); ok {
-			items = append(items,
-				picker.Item{Label: "Working Tree", Description: "Uncommitted changes", Value: "working", Keywords: []string{"mode", "unstaged"}},
-				picker.Item{Label: "Staged", Description: "Staged changes", Value: "staged", Keywords: []string{"mode", "cached", "index"}},
-			)
-			branch, _ := git.CurrentBranch(m.repoRoot)
-			defaultBranch, _ := git.DefaultBranch(m.repoRoot)
-			if branch != defaultBranch {
-				items = append(items, picker.Item{Label: "Branch Diff", Description: "vs " + defaultBranch, Value: "branch", Keywords: []string{"mode", "compare"}})
-			}
-		}
+	branch, _ := git.CurrentBranch(m.repoRoot)
+	defaultBranch, _ := git.DefaultBranch(m.repoRoot)
+	if branch != defaultBranch {
+		items = append(items, picker.Item{Label: "Branch Diff", Description: "vs " + defaultBranch, Value: "branch", Keywords: []string{"mode", "compare"}})
 	}
+
+	items = append(items,
+		picker.Item{Label: "Refresh", Description: "Reload current view", Value: "refresh"},
+		picker.Item{Label: "Quit", Description: "Exit gg", Value: "quit", Keywords: []string{"exit", "close"}},
+	)
 	return items
 }
 
 func (m Model) helpPickerItems() []picker.Item {
-	// Global keys.
 	items := []picker.Item{
 		{Label: ":", Description: "Open command picker", Keywords: []string{"command", "menu"}},
 		{Label: "?", Description: "Open help", Keywords: []string{"keybindings", "shortcuts"}},
-		{Label: "<", Description: "Navigate back"},
-		{Label: ">", Description: "Navigate forward"},
+		{Label: "C", Description: "Copilot chat", Keywords: []string{"ai", "copilot"}},
 		{Label: "ctrl+c", Description: "Quit"},
 	}
 
