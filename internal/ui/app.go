@@ -444,14 +444,14 @@ func (m Model) barBackground() color.Color {
 	// Shift by ~8% of the 0-255 range (≈20 units).
 	if m.hasDarkBg {
 		return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x",
-			clampByte(int(r>>8)+20),
-			clampByte(int(g>>8)+20),
-			clampByte(int(b>>8)+20)))
+			clampByte(int(r>>8)+13),
+			clampByte(int(g>>8)+13),
+			clampByte(int(b>>8)+13)))
 	}
 	return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x",
-		clampByte(int(r>>8)-20),
-		clampByte(int(g>>8)-20),
-		clampByte(int(b>>8)-20)))
+		clampByte(int(r>>8)-13),
+		clampByte(int(g>>8)-13),
+		clampByte(int(b>>8)-13)))
 }
 
 func clampByte(v int) int {
