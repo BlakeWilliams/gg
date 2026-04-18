@@ -184,6 +184,7 @@ func New(ctx *uictx.Context, repoRoot string, width, height int) Model {
 		savedSide:     commentViewState.Side,
 	}
 	m.dv.Comments = commentStoreAdapter{store: cs}
+	m.dv.HelpMode = ctx.Config.HelpMode
 	return m
 }
 
@@ -1176,10 +1177,13 @@ func (m Model) renderLayout(rightView string) string {
 		rightTitle = "Overview"
 	}
 	info := diffviewer.LayoutInfo{
-		ModeName:   m.mode.String(),
-		ModeColor:  styles.ModeColor(m.mode),
-		BranchName: m.branchData.branch,
-		PR:         m.branchData.pr,
+		ModeName:     m.mode.String(),
+		ModeColor:    styles.ModeColor(m.mode),
+		BranchName:   m.branchData.branch,
+		PR:           m.branchData.pr,
+		HelpMode:     m.ctx.Config.HelpMode,
+		ModeShortcut: "m",
+		HelpLine:     m.dv.HelpLine,
 	}
 	return m.dv.RenderLayout(rightView, rightTitle, info)
 }
@@ -1187,11 +1191,13 @@ func (m Model) renderLayout(rightView string) string {
 // --- Content building ---
 
 func (m *Model) rebuildContent() {
+	m.dv.HelpLine = m.helpLine()
 	m.dv.RebuildContent(m.buildOverviewContent, m.buildFileContent)
 	m.updateCommentCounts()
 }
 
 func (m *Model) rebuildContentIfChanged() {
+	m.dv.HelpLine = m.helpLine()
 	m.dv.RebuildContentIfChanged(m.buildOverviewContent, m.buildFileContent)
 	m.updateCommentCounts()
 }
@@ -1295,6 +1301,72 @@ func (m *Model) markCurrentThreadRead() {
 	m.readState.MarkReadInt(comments.IDToInt(rootID))
 	m.readState.Save()
 	m.updateCommentCounts()
+}
+
+// helpLine returns the contextual help text shown in the right-pane footer
+// when help mode is enabled. Returns "" when help mode is off so the row
+// is not reserved.
+func (m Model) helpLine() string {
+	if !m.ctx.Config.HelpMode {
+		return ""
+	}
+	hint := func(key, desc string) string {
+		return styles.StatusBarKey.Render(key) + " " + styles.StatusBarHint.Render(desc)
+	}
+	sep := styles.StatusBarHint.Render("  ")
+
+	var parts []string
+
+	if m.dv.Composing {
+		parts = append(parts,
+			hint("esc", "cancel"),
+			hint("enter", "submit"),
+			hint("shift+enter", "newline"),
+		)
+		return strings.Join(parts, sep)
+	}
+
+	if m.dv.ThreadCursor > 0 {
+		parts = append(parts,
+			hint("j/k", "navigate"),
+			hint("r", "reply"),
+			hint("x", "resolve"),
+			hint("esc", "exit thread"),
+		)
+		return strings.Join(parts, sep)
+	}
+
+	if m.dv.Tree.Focused {
+		parts = append(parts,
+			hint("j/k", "navigate"),
+			hint("enter", "open file"),
+			hint("l", "focus diff"),
+			hint("ctrl+j/k", "next/prev file"),
+		)
+	} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
+		parts = append(parts,
+			hint("j/k", "navigate"),
+			hint("J/K", "select range"),
+			hint("ctrl+j/k", "next/prev file"),
+		)
+		switch m.mode {
+		case git.DiffWorking:
+			parts = append(parts, hint("s", "stage line"), hint("S", "stage hunk"))
+		case git.DiffStaged:
+			parts = append(parts, hint("u", "unstage line"), hint("U", "unstage hunk"))
+		}
+		parts = append(parts, hint("a", "comment"))
+		if m.cursorHasThread() {
+			parts = append(parts, hint("r", "reply"), hint("x", "resolve"))
+		}
+	} else {
+		parts = append(parts,
+			hint("j/k", "navigate tree"),
+			hint("enter", "open file"),
+			hint("ctrl+j/k", "next/prev file"),
+		)
+	}
+	return strings.Join(parts, sep)
 }
 
 func (m Model) buildOverviewContent(w int) string {

@@ -28,6 +28,22 @@ type LayoutInfo struct {
 	ModeColor   color.Color // derived from mode; nil = no mode shown
 	BranchName  string      // shown in footer under file tree
 	PR          *github.PullRequest
+	// ModeShortcut, when non-empty and HelpMode is on, is rendered in gray
+	// next to the mode label (e.g. "BRANCH m") to hint at the cycle key.
+	ModeShortcut string
+	// HelpLine is the contextual help text shown at the bottom of the right
+	// panel when HelpMode is on. Empty disables the row.
+	HelpLine string
+	HelpMode bool
+}
+
+// helpFooterRows returns the number of rows the help footer steals from
+// the right-pane viewport.
+func (i LayoutInfo) helpFooterRows() int {
+	if i.HelpMode && i.HelpLine != "" {
+		return 1
+	}
+	return 0
 }
 
 // CopilotPendingInfo tracks a single pending Copilot reply.
@@ -94,6 +110,12 @@ type DiffViewer struct {
 	Spinner       spinner.Model
 	SpinnerActive bool
 
+	// Help mode chrome (right-pane footer with contextual key hints).
+	// When HelpMode is true and HelpLine is non-empty, the bottom row of the
+	// right pane is reserved for the help line and the viewport shrinks by 1.
+	HelpMode bool
+	HelpLine string
+
 	// Internal
 	WaitingG    bool // true after first "g" keypress, waiting for second "g" to trigger gg (go to top)
 	LastContent string
@@ -135,7 +157,16 @@ func (d DiffViewer) ContentWidth() int {
 }
 
 func (d DiffViewer) ViewportHeight() int {
-	return d.Height - 2 // header + separator (footer only affects file tree side)
+	return d.Height - 2 - d.helpRowCount() // header + separator (- help row)
+}
+
+// helpRowCount returns the number of bottom rows reserved for the help line
+// in the right pane.
+func (d DiffViewer) helpRowCount() int {
+	if d.HelpMode && d.HelpLine != "" {
+		return 1
+	}
+	return 0
 }
 
 func (d DiffViewer) BorderStyle() lipgloss.Style {
@@ -600,6 +631,9 @@ func (d DiffViewer) RenderLayout(rightView string, rightTitle string, info Layou
 	if info.ModeName != "" && info.ModeColor != nil {
 		modeStyle := lipgloss.NewStyle().Foreground(info.ModeColor)
 		modeLabel = modeStyle.Render(strings.ToUpper(info.ModeName))
+		if info.HelpMode && info.ModeShortcut != "" {
+			modeLabel += " " + dim.Render(info.ModeShortcut)
+		}
 	}
 
 	treeLabelW := lipgloss.Width(treeLabel)
@@ -681,6 +715,10 @@ func (d DiffViewer) RenderLayout(rightView string, rightTitle string, info Layou
 		copilotFooterRows = 2 // separator + status line
 	}
 
+	// Help footer: 1 row reserved at the bottom of the right panel for
+	// contextual key hints when help mode is enabled.
+	helpRows := info.helpFooterRows()
+
 	tree := d.Tree
 	tree.Width = treeW - 1
 	tree.Height = contentH - 2 - copilotFooterRows // tree loses rows for footer(s)
@@ -690,9 +728,10 @@ func (d DiffViewer) RenderLayout(rightView string, rightTitle string, info Layou
 
 	innerRightW := rightW - 1
 
-	// Scrollbar: compute thumb position and size.
+	// Scrollbar: compute thumb position and size. The viewport content
+	// lives in (contentH - helpRows) rows on the right side.
 	totalLines := d.VP.TotalLineCount()
-	vpH := contentH
+	vpH := contentH - helpRows
 	var thumbStart, thumbLen int
 	if totalLines <= vpH || totalLines == 0 {
 		// Content fits — no scrollbar needed.
@@ -799,23 +838,27 @@ func (d DiffViewer) RenderLayout(rightView string, rightTitle string, info Layou
 		}
 
 		rl := ""
-		if i < len(rightLines) {
-			rl = rightLines[i]
-		}
-		rlW := lipgloss.Width(rl)
 		contentW := innerRightW - 1 // -1 for scrollbar column
-		if rlW < contentW {
-			rl += strings.Repeat(" ", contentW-rlW)
-		}
-
-		// Scrollbar column.
 		var scrollCol string
-		if thumbStart < 0 {
-			scrollCol = " " // no scrollbar needed
-		} else if i >= thumbStart && i < thumbStart+thumbLen {
-			scrollCol = thumbChar
+		if helpRows > 0 && i >= contentH-helpRows {
+			// Right-pane help footer row.
+			rl = renderHelpLine(info.HelpLine, contentW, dim)
+			scrollCol = " "
 		} else {
-			scrollCol = trackChar
+			if i < len(rightLines) {
+				rl = rightLines[i]
+			}
+			rlW := lipgloss.Width(rl)
+			if rlW < contentW {
+				rl += strings.Repeat(" ", contentW-rlW)
+			}
+			if thumbStart < 0 {
+				scrollCol = " "
+			} else if i >= thumbStart && i < thumbStart+thumbLen {
+				scrollCol = thumbChar
+			} else {
+				scrollCol = trackChar
+			}
 		}
 
 		b.WriteString(leftPart + sep + rl + scrollCol)
@@ -825,6 +868,28 @@ func (d DiffViewer) RenderLayout(rightView string, rightTitle string, info Layou
 	}
 
 	return b.String()
+}
+
+// renderHelpLine pads the help line out to width w. It is rendered with the
+// dim style; embedded ANSI is preserved as-is.
+func renderHelpLine(s string, w int, dim lipgloss.Style) string {
+	// Reserve a leading space so the text doesn't sit flush against the
+	// vertical separator.
+	prefix := " "
+	body := s
+	usable := w - lipgloss.Width(prefix)
+	if usable < 0 {
+		usable = 0
+	}
+	if lipgloss.Width(body) > usable {
+		// Truncate with no ellipsis to keep things minimal.
+		body = lipgloss.NewStyle().MaxWidth(usable).Render(body)
+	}
+	pad := usable - lipgloss.Width(body)
+	if pad < 0 {
+		pad = 0
+	}
+	return prefix + body + strings.Repeat(" ", pad)
 }
 
 // --- File formatting ---
@@ -1128,7 +1193,7 @@ func (d *DiffViewer) ThreadParentLineType(fileIdx int, side string, line int) co
 // buildOverview is called when CurrentFileIdx == -1, buildFile otherwise.
 func (d *DiffViewer) RebuildContent(buildOverview func(w int) string, buildFile func(w int) string) {
 	innerW := d.RightPanelInnerWidth()
-	innerH := d.Height - 2
+	innerH := d.Height - 2 - d.helpRowCount()
 
 	if !d.VPReady {
 		d.VP = viewport.New()
@@ -1149,7 +1214,7 @@ func (d *DiffViewer) RebuildContent(buildOverview func(w int) string, buildFile 
 // RebuildContentIfChanged only updates the viewport if the content changed.
 func (d *DiffViewer) RebuildContentIfChanged(buildOverview func(w int) string, buildFile func(w int) string) {
 	innerW := d.RightPanelInnerWidth()
-	innerH := d.Height - 2
+	innerH := d.Height - 2 - d.helpRowCount()
 
 	if !d.VPReady {
 		d.VP = viewport.New()

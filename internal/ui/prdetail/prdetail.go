@@ -222,6 +222,7 @@ func New(pr github.PullRequest, ctx *uictx.Context, width, height int) Model {
 		CopilotState: diffviewer.NewCopilotState(),
 	}
 	dv.InitSpinner()
+	dv.HelpMode = ctx.Config.HelpMode
 
 	return Model{
 		pr:            pr,
@@ -353,7 +354,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		m.dv.Height = msg.Height
 		m.dv.Tree.Height = msg.Height - 2
 		m.dv.VP.SetWidth(m.dv.RightPanelInnerWidth())
-		m.dv.VP.SetHeight(m.dv.Height - 2)
+		m.dv.VP.SetHeight(m.dv.ViewportHeight())
 		body := m.pr.Body
 		width := m.descWidth()
 		prNumber := m.pr.Number
@@ -1404,7 +1405,60 @@ func (m Model) descWidth() int {
 }
 
 func (m *Model) rebuildContent() {
+	m.dv.HelpLine = m.helpLine()
 	m.dv.RebuildContent(m.buildOverviewContent, m.buildFileContent)
+}
+
+// helpLine returns the contextual help text for the right-pane footer
+// when help mode is enabled.
+func (m Model) helpLine() string {
+	if !m.ctx.Config.HelpMode {
+		return ""
+	}
+	hint := func(key, desc string) string {
+		return styles.StatusBarKey.Render(key) + " " + styles.StatusBarHint.Render(desc)
+	}
+	sep := styles.StatusBarHint.Render("  ")
+
+	var parts []string
+	if m.dv.Composing {
+		parts = append(parts,
+			hint("esc", "cancel"),
+			hint("enter", "submit local"),
+			hint("alt+enter", "submit to GitHub"),
+			hint("ctrl+g", "$EDITOR"),
+		)
+		return strings.Join(parts, sep)
+	}
+	if m.showSidebar {
+		parts = append(parts,
+			hint("j/k", "scroll"),
+			hint("esc", "close"),
+		)
+		return strings.Join(parts, sep)
+	}
+	if m.dv.Tree.Focused {
+		parts = append(parts,
+			hint("j/k", "navigate"),
+			hint("enter", "open file"),
+			hint("l", "focus diff"),
+			hint("ctrl+j/k", "next/prev file"),
+		)
+	} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
+		parts = append(parts,
+			hint("j/k", "navigate"),
+			hint("J/K", "select range"),
+			hint("a", "comment"),
+			hint("ctrl+j/k", "next/prev file"),
+			hint("c/r/s", "comments/reviews/checks"),
+		)
+	} else {
+		parts = append(parts,
+			hint("j/k", "scroll"),
+			hint("c/r/s", "comments/reviews/checks"),
+		)
+	}
+	return strings.Join(parts, sep)
 }
 
 func (m Model) buildOverviewContent(w int) string {
