@@ -164,6 +164,42 @@ func (m Model) BranchName() string              { return m.branch }
 func (m Model) DiffMode() git.DiffMode          { return m.mode }
 func (m Model) PR() *github.PullRequest         { return m.pr }
 func (m Model) Files() []github.PullRequestFile { return m.dv.Files }
+func (m Model) TreeWidth() int                  { return m.dv.Tree.Width }
+
+// CurrentFile returns the filename being viewed, or "" for overview.
+func (m Model) CurrentFile() string {
+	if m.dv.CurrentFileIdx >= 0 && m.dv.CurrentFileIdx < len(m.dv.Files) {
+		return m.dv.Files[m.dv.CurrentFileIdx].Filename
+	}
+	return ""
+}
+
+// CurrentFileStats returns additions and deletions for the current file.
+func (m Model) CurrentFileStats() (additions, deletions int) {
+	if m.dv.CurrentFileIdx >= 0 && m.dv.CurrentFileIdx < len(m.dv.Files) {
+		f := m.dv.Files[m.dv.CurrentFileIdx]
+		return f.Additions, f.Deletions
+	}
+	return 0, 0
+}
+
+// ScrollPercent returns the viewport scroll position as a string.
+// Returns "Top", "Bot", "All", or "N%".
+func (m Model) ScrollPercent() string {
+	if m.dv.VP.TotalLineCount() == 0 {
+		return "All"
+	}
+	if m.dv.VP.AtTop() && m.dv.VP.AtBottom() {
+		return "All"
+	}
+	if m.dv.VP.AtTop() {
+		return "Top"
+	}
+	if m.dv.VP.AtBottom() {
+		return "Bot"
+	}
+	return fmt.Sprintf("%d%%", int(m.dv.VP.ScrollPercent()*100))
+}
 
 // restoreSavedPosition finds the saved file by name and restores cursor
 // to the diff line matching the saved source line number.
@@ -301,21 +337,12 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 	case tea.MouseClickMsg:
 		if msg.X < m.dv.Tree.Width {
 			if idx, ok := m.dv.Tree.EntryIndexAtY(msg.Y); ok {
-				if idx == 0 {
-					m.dv.Tree.Cursor = 0
-					m.dv.CurrentFileIdx = -1
-					m.rebuildContent()
-					m.dv.VP.GotoTop()
-					m.saveViewState()
-				} else if idx >= 2 {
-					eIdx := idx - 2
-					if eIdx >= 0 && eIdx < len(m.dv.Tree.Entries) {
-						e := m.dv.Tree.Entries[eIdx]
-						if !e.IsDir && e.FileIndex >= 0 {
-							m.dv.Tree.Cursor = idx
-							cmd := m.selectTreeEntry()
-							return m, cmd
-						}
+				if idx >= 0 && idx < len(m.dv.Tree.Entries) {
+					e := m.dv.Tree.Entries[idx]
+					if !e.IsDir && e.FileIndex >= 0 {
+						m.dv.Tree.Cursor = idx
+						cmd := m.selectTreeEntry()
+						return m, cmd
 					}
 				}
 			}
@@ -974,11 +1001,6 @@ func (m *Model) rebuildContentIfChanged() {
 func (m Model) buildOverviewContent(w int) string {
 	var content strings.Builder
 
-	// Branch + mode info.
-	branchStr := lipgloss.NewStyle().Bold(true).Render(m.branch)
-	modeStr := dimStyle.Render("(" + m.mode.String() + ")")
-	content.WriteString("\n  " + branchStr + " " + modeStr + "\n")
-
 	if len(m.dv.Files) == 0 {
 		if m.dv.FilesListLoaded {
 			content.WriteString("\n  " + dimStyle.Render("No changes") + "\n")
@@ -988,21 +1010,24 @@ func (m Model) buildOverviewContent(w int) string {
 		return content.String()
 	}
 
-	// Stats summary.
+	// Stats summary with colored +/-.
 	adds, dels := git.FilesAddedDeletedStats(m.dv.Files)
-	statsStr := fmt.Sprintf("%d files changed", len(m.dv.Files))
+	var statParts []string
+	statParts = append(statParts, fmt.Sprintf("%d files", len(m.dv.Files)))
 	if adds > 0 {
-		statsStr += fmt.Sprintf(", %d insertions(+)", adds)
+		statParts = append(statParts,
+			lipgloss.NewStyle().Foreground(lipgloss.Green).Render(fmt.Sprintf("+%d", adds)))
 	}
 	if dels > 0 {
-		statsStr += fmt.Sprintf(", %d deletions(-)", dels)
+		statParts = append(statParts,
+			lipgloss.NewStyle().Foreground(lipgloss.Red).Render(fmt.Sprintf("-%d", dels)))
 	}
-	content.WriteString("\n  " + dimStyle.Render(statsStr) + "\n")
+	content.WriteString("\n  " + strings.Join(statParts, "  ") + "\n")
 
 	// File list.
 	content.WriteString("\n")
 	for _, f := range m.dv.Files {
-		icon := "≈"
+		var icon string
 		switch f.Status {
 		case "added":
 			icon = lipgloss.NewStyle().Foreground(lipgloss.Green).Render("+")
@@ -1011,12 +1036,10 @@ func (m Model) buildOverviewContent(w int) string {
 		case "renamed":
 			icon = lipgloss.NewStyle().Foreground(lipgloss.Yellow).Render("→")
 		default:
-			icon = lipgloss.NewStyle().Foreground(lipgloss.Blue).Render("≈")
+			icon = lipgloss.NewStyle().Foreground(lipgloss.Blue).Render("~")
 		}
 		content.WriteString("  " + icon + " " + f.Filename + "\n")
 	}
-
-	content.WriteString("\n  " + dimStyle.Render("Press m to toggle diff mode") + "\n")
 	content.WriteString("\n")
 
 	return content.String()
@@ -1285,7 +1308,8 @@ func (m *Model) selectTreeEntry() tea.Cmd {
 		m.fileCursors[m.dv.Files[m.dv.CurrentFileIdx].Filename] = m.dv.DiffCursor
 	}
 	m.dv.ThreadCursor = 0
-	if m.dv.Tree.Cursor == 0 {
+	fileIdx := m.dv.Tree.FileIndex()
+	if fileIdx < 0 || fileIdx >= len(m.dv.Files) || fileIdx >= len(m.dv.FileDiffs) {
 		m.dv.SpinnerActive = false
 		m.dv.CurrentFileIdx = -1
 		m.rebuildContent()
@@ -1293,35 +1317,29 @@ func (m *Model) selectTreeEntry() tea.Cmd {
 		m.saveViewState()
 		return nil
 	}
-	eIdx := m.dv.Tree.Cursor - 2
-	if eIdx >= 0 && eIdx < len(m.dv.Tree.Entries) {
-		e := m.dv.Tree.Entries[eIdx]
-		if !e.IsDir && e.FileIndex >= 0 && e.FileIndex < len(m.dv.Files) && e.FileIndex < len(m.dv.FileDiffs) {
-			m.dv.CurrentFileIdx = e.FileIndex
-			if saved, ok := m.fileCursors[m.dv.Files[e.FileIndex].Filename]; ok && saved < len(m.dv.FileDiffs[e.FileIndex]) {
-				m.dv.DiffCursor = saved
-			} else {
-				m.dv.DiffCursor = m.dv.FirstNonHunkLine(e.FileIndex)
-			}
-			// If the file hasn't been highlighted yet, show a spinner
-			// and kick off highlighting for this file directly (the
-			// sequential chain may have already passed this index).
-			needsHighlight := e.FileIndex < len(m.dv.HighlightedFiles) && m.dv.HighlightedFiles[e.FileIndex].File.Filename == ""
-			if needsHighlight {
-				m.dv.SpinnerActive = true
-				m.rebuildContent()
-				m.saveViewState()
-				return tea.Batch(m.dv.Spinner.Tick, m.highlightFileCmd(e.FileIndex))
-			}
-			m.dv.SpinnerActive = false
-			if m.dv.RenderedFiles[e.FileIndex] == "" {
-				m.formatFile(e.FileIndex)
-			}
-			m.rebuildContent()
-			m.dv.ScrollToDiffCursor()
-			m.saveViewState()
-		}
+	m.dv.CurrentFileIdx = fileIdx
+	if saved, ok := m.fileCursors[m.dv.Files[fileIdx].Filename]; ok && saved < len(m.dv.FileDiffs[fileIdx]) {
+		m.dv.DiffCursor = saved
+	} else {
+		m.dv.DiffCursor = m.dv.FirstNonHunkLine(fileIdx)
 	}
+	// If the file hasn't been highlighted yet, show a spinner
+	// and kick off highlighting for this file directly (the
+	// sequential chain may have already passed this index).
+	needsHighlight := fileIdx < len(m.dv.HighlightedFiles) && m.dv.HighlightedFiles[fileIdx].File.Filename == ""
+	if needsHighlight {
+		m.dv.SpinnerActive = true
+		m.rebuildContent()
+		m.saveViewState()
+		return tea.Batch(m.dv.Spinner.Tick, m.highlightFileCmd(fileIdx))
+	}
+	m.dv.SpinnerActive = false
+	if m.dv.RenderedFiles[fileIdx] == "" {
+		m.formatFile(fileIdx)
+	}
+	m.rebuildContent()
+	m.dv.ScrollToDiffCursor()
+	m.saveViewState()
 	return nil
 }
 

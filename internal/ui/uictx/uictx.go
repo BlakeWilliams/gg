@@ -1,6 +1,8 @@
 package uictx
 
 import (
+	"image/color"
+
 	tea "charm.land/bubbletea/v2"
 	"github.com/blakewilliams/ghq/internal/github"
 	"github.com/blakewilliams/ghq/internal/ui/styles"
@@ -66,6 +68,7 @@ func CachedCmd[T any](data T, found bool, refetch func() (T, error), wrap func(T
 type Context struct {
 	Client     *github.CachedClient
 	DiffColors styles.DiffColors
+	ChromeColor color.Color // separator/header color derived from terminal bg
 	Username   string
 	Owner      string // repo owner (from flag or detected)
 	Repo       string // repo name

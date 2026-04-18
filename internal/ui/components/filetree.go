@@ -136,11 +136,7 @@ func BuildFileTree(files []github.PullRequestFile) []FileTreeEntry {
 
 // RenderFileTree renders the file tree as exactly `height` lines.
 // Each line is padded to `width`. The cursor is kept visible.
-// currentFileIdx of -1 means "Description" is the selected entry.
-// The first entry (index 0 in display) is always "Description".
-// Tree entries start at display index 1.
 func RenderFileTree(entries []FileTreeEntry, files []github.PullRequestFile, cursor int, currentFileIdx int, width, height int) []string {
-	// If no entries yet, show skeleton file placeholders.
 	loading := len(entries) == 0
 	skeletonCount := 8
 	entryCount := len(entries)
@@ -148,8 +144,7 @@ func RenderFileTree(entries []FileTreeEntry, files []github.PullRequestFile, cur
 		entryCount = skeletonCount
 	}
 
-	// Total display count: 1 (Description) + 1 (separator) + entries/skeletons
-	totalEntries := 2 + entryCount
+	totalEntries := entryCount
 	lines := make([]string, height)
 
 	// Scroll window: keep cursor visible, centered when possible.
@@ -171,51 +166,24 @@ func RenderFileTree(entries []FileTreeEntry, files []github.PullRequestFile, cur
 			continue
 		}
 
-		if idx == 0 {
-			// Description entry — bold with icon.
-			isCursor := cursor == 0
-			isCurrent := currentFileIdx == -1
-			overviewStyle := lipgloss.NewStyle().Bold(true)
-			var line string
-			if isCursor {
-				line = treeSelected.Render(iconPointer + " " + iconDescription + " Description")
-			} else if isCurrent {
-				line = overviewStyle.Foreground(lipgloss.Magenta).Render("  " + iconDescription + " Description")
-			} else {
-				line = overviewStyle.Render("  " + iconDescription + " Description")
-			}
-			lines[row] = padTo(line, width)
-			continue
-		}
-
-		if idx == 1 {
-			// Separator line between Description and files.
-			sep := treeDim.Render("  " + strings.Repeat("─", width-4))
-			lines[row] = padTo(sep, width)
-			continue
-		}
-
-		eIdx := idx - 2 // offset by 2 for Description + separator
-
 		if loading {
-			// Skeleton file entry.
-			if eIdx >= skeletonCount {
+			if idx >= skeletonCount {
 				lines[row] = strings.Repeat(" ", width)
 				continue
 			}
 			skeletonWidths := []int{12, 18, 10, 15, 20, 8, 14, 16}
-			sw := skeletonWidths[eIdx%len(skeletonWidths)]
+			sw := skeletonWidths[idx%len(skeletonWidths)]
 			line := "  " + treeDim.Render("  "+strings.Repeat("─", sw))
 			lines[row] = padTo(line, width)
 			continue
 		}
 
-		if eIdx >= len(entries) {
+		if idx >= len(entries) {
 			lines[row] = strings.Repeat(" ", width)
 			continue
 		}
 
-		e := entries[eIdx]
+		e := entries[idx]
 		depthPad := strings.Repeat(" ", e.Depth*2)
 
 		var line string
@@ -321,7 +289,7 @@ func (t FileTree) HandleKey(msg tea.KeyPressMsg) (FileTree, tea.Cmd, bool) {
 		t.MoveCursorBy(-t.Height)
 		return t, nil, true
 	case "G":
-		t.MoveCursorBy(2 + len(t.Entries))
+		t.MoveCursorBy(len(t.Entries))
 		return t, nil, true
 	case "enter":
 		return t, t.selectCmd(), true
@@ -345,7 +313,7 @@ func (t *FileTree) SelectFile(fileIdx int) {
 	}
 	for i, e := range t.Entries {
 		if !e.IsDir && e.FileIndex == fileIdx {
-			t.Cursor = i + 2
+			t.Cursor = i
 			return
 		}
 	}
@@ -353,19 +321,11 @@ func (t *FileTree) SelectFile(fileIdx int) {
 
 // MoveSelection moves to the next/prev selectable file and produces FileSelectedMsg.
 func (t *FileTree) MoveSelection(delta int) tea.Cmd {
-	totalEntries := 2 + len(t.Entries)
+	totalEntries := len(t.Entries)
 	newCursor := t.Cursor + delta
 
 	for newCursor >= 0 && newCursor < totalEntries {
-		if newCursor == 0 {
-			break
-		}
-		if newCursor == 1 {
-			newCursor += delta
-			continue
-		}
-		eIdx := newCursor - 2
-		if eIdx >= 0 && eIdx < len(t.Entries) && !t.Entries[eIdx].IsDir {
+		if newCursor < len(t.Entries) && !t.Entries[newCursor].IsDir {
 			break
 		}
 		newCursor += delta
@@ -378,17 +338,14 @@ func (t *FileTree) MoveSelection(delta int) tea.Cmd {
 	return t.selectCmd()
 }
 
-// FileIndexAtCursor returns the file index at the current cursor, or -1 for overview.
+// fileIndexAtCursor returns the file index at the current cursor, or -1.
 func (t FileTree) fileIndexAtCursor() int {
-	if t.Cursor < 2 {
+	if t.Cursor < 0 || t.Cursor >= len(t.Entries) {
 		return -1
 	}
-	eIdx := t.Cursor - 2
-	if eIdx >= 0 && eIdx < len(t.Entries) {
-		e := t.Entries[eIdx]
-		if !e.IsDir {
-			return e.FileIndex
-		}
+	e := t.Entries[t.Cursor]
+	if !e.IsDir {
+		return e.FileIndex
 	}
 	return -1
 }
@@ -402,7 +359,7 @@ func (t FileTree) FileIndex() int {
 func (t FileTree) IndexForFile(fileIdx int) int {
 	for i, e := range t.Entries {
 		if !e.IsDir && e.FileIndex == fileIdx {
-			return i + 2
+			return i
 		}
 	}
 	return 0
@@ -410,15 +367,10 @@ func (t FileTree) IndexForFile(fileIdx int) int {
 
 // EntryIndexAtY maps a mouse Y coordinate to a tree entry index.
 func (t FileTree) EntryIndexAtY(y int) (int, bool) {
-	idx := y - 1
-	if idx < 0 {
+	if y < 0 || y >= len(t.Entries) {
 		return 0, false
 	}
-	totalEntries := 2 + len(t.Entries)
-	if idx >= totalEntries {
-		return 0, false
-	}
-	return idx, true
+	return y, true
 }
 
 // HandleMouseClick processes a click in the tree area.
@@ -436,7 +388,7 @@ func (t FileTree) HandleMouseClick(msg tea.MouseClickMsg) (FileTree, tea.Cmd, bo
 }
 
 func (t *FileTree) MoveCursorBy(delta int) {
-	totalEntries := 2 + len(t.Entries)
+	totalEntries := len(t.Entries)
 	newCursor := t.Cursor + delta
 
 	if newCursor < 0 {
@@ -451,15 +403,7 @@ func (t *FileTree) MoveCursorBy(delta int) {
 		dir = -1
 	}
 	for newCursor >= 0 && newCursor < totalEntries {
-		if newCursor == 0 {
-			break
-		}
-		if newCursor == 1 {
-			newCursor += dir
-			continue
-		}
-		eIdx := newCursor - 2
-		if eIdx >= 0 && eIdx < len(t.Entries) && !t.Entries[eIdx].IsDir {
+		if !t.Entries[newCursor].IsDir {
 			break
 		}
 		newCursor += dir

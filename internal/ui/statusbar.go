@@ -26,39 +26,72 @@ func (m Model) renderStatusBar() string {
 	branch := ld.BranchName()
 	mode := ld.DiffMode()
 	modeBg := styles.ModeColor(mode)
+	treeW := ld.TreeWidth()
+	rightW := m.width - treeW
 
 	modeStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Black).Background(modeBg)
 
-	// Bar background derived from terminal bg.
 	barBg := m.barBackground()
 	barFg := m.barForeground()
 	barStyle := lipgloss.NewStyle().Foreground(barFg).Background(barBg)
-	branchStyle := lipgloss.NewStyle().Foreground(barFg).Background(barBg)
 
-	// Left: MODE ▶ • branch
+	// === Left panel (under file tree): MODE ▶ branch ===
 	modeText := modeStyle.Render(" " + strings.ToUpper(mode.String()) + " ")
 	modeToBar := lipgloss.NewStyle().Foreground(modeBg).Background(barBg).Render(plRight)
-	branchText := branchStyle.Render(" \u2022 " + branch + " ")
+	branchText := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack).Background(barBg).Render(" " + branch)
 
-	left := modeText + modeToBar + branchText
+	leftContent := modeText + modeToBar + branchText
+	leftContentW := lipgloss.Width(leftContent)
+	leftPad := treeW - leftContentW - 1 // -1 for separator
+	if leftPad < 0 {
+		leftPad = 0
+	}
+	leftPanel := leftContent + barStyle.Render(strings.Repeat(" ", leftPad))
 
-	// Right side: PR badge
-	var right string
+	// Footer separator: slightly lighter than bar bg, but darker than panel chrome.
+	// Midpoint between barBg and chromeColor.
+	var sepColor color.Color = lipgloss.BrightBlack
+	if m.ctx.ChromeColor != nil && barBg != nil {
+		cr, cg, cb, _ := m.ctx.ChromeColor.RGBA()
+		br, bg2, bb, _ := barBg.RGBA()
+		mr := (int(cr>>8) + int(br>>8)) / 2
+		mg := (int(cg>>8) + int(bg2>>8)) / 2
+		mb := (int(cb>>8) + int(bb>>8)) / 2
+		sepColor = lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", mr, mg, mb))
+	}
+	sep := lipgloss.NewStyle().Foreground(sepColor).Background(barBg).Render("│")
+
+	// === Right panel (under diff): scroll position ===
+
+	// Scroll position badge on far right (powerline style).
+	scrollText := ld.ScrollPercent()
+	scrollBg := modeBg
+	scrollStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Black).Background(scrollBg)
+
+	// PR badge (between stats and scroll).
+	var prBadge string
+	var scrollBadge string
 	if pr := ld.PR(); pr != nil {
 		prBg := lipgloss.Cyan
 		prStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Black).Background(prBg)
 		barToPr := lipgloss.NewStyle().Foreground(prBg).Background(barBg).Render(plLeft)
-		right = barToPr + prStyle.Render(fmt.Sprintf(" PR #%d ", pr.Number))
+		prToScroll := lipgloss.NewStyle().Foreground(scrollBg).Background(prBg).Render(plLeft)
+		prBadge = barToPr + prStyle.Render(fmt.Sprintf(" PR #%d ", pr.Number))
+		scrollBadge = prToScroll + scrollStyle.Render(" "+scrollText+" ")
+	} else {
+		barToScroll := lipgloss.NewStyle().Foreground(scrollBg).Background(barBg).Render(plLeft)
+		scrollBadge = barToScroll + scrollStyle.Render(" "+scrollText+" ")
 	}
 
-	leftW := lipgloss.Width(left)
-	rightW := lipgloss.Width(right)
-	gap := m.width - leftW - rightW
-	if gap < 0 {
-		gap = 0
+	scrollBadgeW := lipgloss.Width(scrollBadge)
+	prBadgeW := lipgloss.Width(prBadge)
+	rightGap := rightW - 1 - prBadgeW - scrollBadgeW // -1 for separator
+	if rightGap < 0 {
+		rightGap = 0
 	}
+	rightPanel := barStyle.Render(strings.Repeat(" ", rightGap)) + prBadge + scrollBadge
 
-	return left + barStyle.Render(strings.Repeat(" ", gap)) + right
+	return leftPanel + sep + rightPanel
 }
 
 // brightnessModify applies lualine's brightness_modifier formula:
@@ -105,6 +138,19 @@ func (m Model) barForeground() color.Color {
 	pct := 500.0
 	if !m.hasDarkBg {
 		pct = -60.0
+	}
+	rr, gg, bb := brightnessModify(float64(r>>8), float64(g>>8), float64(b>>8), pct)
+	return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", rr, gg, bb))
+}
+
+// chromeColor computes the border/separator color: slightly lighter than
+// barBackground so the separator is visible against the status bar.
+func (m Model) chromeColor() color.Color {
+	bg := m.barBackground()
+	r, g, b, _ := bg.RGBA()
+	pct := 40.0
+	if !m.hasDarkBg {
+		pct = -20.0
 	}
 	rr, gg, bb := brightnessModify(float64(r>>8), float64(g>>8), float64(b>>8), pct)
 	return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", rr, gg, bb))

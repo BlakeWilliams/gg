@@ -169,6 +169,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.BackgroundColorMsg:
 		m.hasDarkBg = msg.IsDark()
 		m.termBg = msg.Color
+		m.ctx.ChromeColor = m.chromeColor()
 		return m, nil
 
 	case commandbar.CommandMsg:

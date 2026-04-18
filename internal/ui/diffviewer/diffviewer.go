@@ -1,6 +1,9 @@
 package diffviewer
 
 import (
+	"fmt"
+	"image/color"
+	"path"
 	"strings"
 	"time"
 
@@ -104,7 +107,7 @@ func (d DiffViewer) RightPanelWidth() int {
 }
 
 func (d DiffViewer) RightPanelInnerWidth() int {
-	return d.RightPanelWidth() - 2
+	return d.RightPanelWidth() - 1 // separator column
 }
 
 func (d DiffViewer) ContentWidth() int {
@@ -494,102 +497,137 @@ func replaceBackground(inner string, colors styles.DiffColors, selBg string) str
 // RenderLayout composes the file tree (left) and diff view (right) into the final output.
 func (d DiffViewer) RenderLayout(rightView string, rightTitle string) string {
 	treeW := d.Tree.Width
-	innerTreeW := treeW - 2
-	innerTreeH := d.Height - 2
+	chromeRows := 2 // header + separator
 
-	bc := d.BorderStyle()
-	var treeBorderStyle lipgloss.Style
+	// Chrome color: use bar background from terminal, fall back to BrightBlack.
+	var chromeColor color.Color = lipgloss.BrightBlack
+	if d.Ctx.ChromeColor != nil {
+		chromeColor = d.Ctx.ChromeColor
+	}
+	chrome := lipgloss.NewStyle().Foreground(chromeColor)
+	dim := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
+	bold := lipgloss.NewStyle().Bold(true)
+
+	// Active panel gets bright title, inactive gets dim.
+	var treeTitleStyle, rightTitleStyle lipgloss.Style
 	if d.Tree.Focused {
-		treeBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Yellow)
+		treeTitleStyle = bold.Foreground(lipgloss.BrightWhite)
+		rightTitleStyle = dim
 	} else {
-		treeBorderStyle = bc
+		treeTitleStyle = dim
+		rightTitleStyle = bold.Foreground(lipgloss.BrightWhite)
 	}
 
-	// Tree border.
-	titleStr := " " + lipgloss.NewStyle().Bold(true).Render("Files") + " "
-	titleW := lipgloss.Width(titleStr)
-	fillW := treeW - 3 - titleW
-	if fillW < 0 {
-		fillW = 0
-	}
-	topBorder := treeBorderStyle.Render("╭─") + titleStr + treeBorderStyle.Render(strings.Repeat("─", fillW)+"╮")
-	bw := treeW - 2
-	if bw < 0 {
-		bw = 0
-	}
-	bottomBorder := treeBorderStyle.Render("╰" + strings.Repeat("─", bw) + "╯")
-	sideBorderL := treeBorderStyle.Render("│")
-	sideBorderR := treeBorderStyle.Render("│")
+	sep := chrome.Render("│")
+	rightW := d.RightPanelWidth()
 
-	// Temporarily set tree dimensions for rendering.
+	// File count header with proper pluralization.
+	var treeLabel string
+	n := len(d.Files)
+	if n == 0 {
+		treeLabel = treeTitleStyle.Render("Files")
+	} else if n == 1 {
+		treeLabel = treeTitleStyle.Render(fmt.Sprintf("%d File", n))
+	} else {
+		treeLabel = treeTitleStyle.Render(fmt.Sprintf("%d Files", n))
+	}
+
+	// Right title: breadcrumb style (dim dir / bold filename).
+	var rightLabel string
+	var statsLabel string
+	if rightTitle == "Overview" {
+		rightLabel = rightTitleStyle.Render("Overview")
+	} else {
+		dir, file := path.Split(rightTitle)
+		if dir != "" {
+			rightLabel = dim.Render(dir) + rightTitleStyle.Render(file)
+		} else {
+			rightLabel = rightTitleStyle.Render(rightTitle)
+		}
+		// File stats: +N -M right-aligned.
+		if d.CurrentFileIdx >= 0 && d.CurrentFileIdx < len(d.Files) {
+			f := d.Files[d.CurrentFileIdx]
+			green := lipgloss.NewStyle().Foreground(lipgloss.Green)
+			red := lipgloss.NewStyle().Foreground(lipgloss.Red)
+			var parts []string
+			if f.Additions > 0 {
+				parts = append(parts, green.Render(fmt.Sprintf("+%d", f.Additions)))
+			}
+			if f.Deletions > 0 {
+				parts = append(parts, red.Render(fmt.Sprintf("-%d", f.Deletions)))
+			}
+			if len(parts) > 0 {
+				statsLabel = strings.Join(parts, " ")
+			}
+		}
+	}
+
+	// Header row.
+	treeHeaderW := lipgloss.Width(treeLabel)
+	treeHeaderPad := treeW - 1 - treeHeaderW - 1
+	if treeHeaderPad < 0 {
+		treeHeaderPad = 0
+	}
+	rightLabelW := lipgloss.Width(rightLabel)
+	statsLabelW := lipgloss.Width(statsLabel)
+	// " rightLabel ...gap... statsLabel " within rightW columns (minus sep)
+	rightHeaderGap := rightW - 2 - rightLabelW - statsLabelW // -2 for leading/trailing space
+	if rightHeaderGap < 0 {
+		rightHeaderGap = 0
+	}
+	rightHeader := " " + rightLabel + strings.Repeat(" ", rightHeaderGap) + statsLabel + " "
+	headerLine := " " + treeLabel + strings.Repeat(" ", treeHeaderPad) + sep + rightHeader
+
+	// Separator row: thin horizontal rule.
+	treeFill := treeW - 1
+	if treeFill < 0 {
+		treeFill = 0
+	}
+	rightFill := rightW - 1
+	if rightFill < 0 {
+		rightFill = 0
+	}
+	separatorLine := chrome.Render(strings.Repeat("─", treeFill) + "┼" + strings.Repeat("─", rightFill))
+
+	// Content area.
+	contentH := d.Height - chromeRows
 	tree := d.Tree
-	tree.Width = innerTreeW
-	tree.Height = innerTreeH
+	tree.Width = treeW - 1
+	tree.Height = contentH
 	tree.CurrentFileIdx = d.CurrentFileIdx
 	treeContentLines := tree.View()
 	rightLines := strings.Split(rightView, "\n")
 
-	// Right panel border.
-	rightW := d.RightPanelWidth()
-	innerRightW := rightW - 2
-	var rightBorderStyle lipgloss.Style
-	if !d.Tree.Focused {
-		rightBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Yellow)
-	} else {
-		rightBorderStyle = bc
-	}
-
-	rtTitle := " " + lipgloss.NewStyle().Bold(true).Render(rightTitle) + " "
-	rtW := lipgloss.Width(rtTitle)
-	rtFill := rightW - 3 - rtW
-	if rtFill < 0 {
-		rtFill = 0
-	}
-	rightTop := rightBorderStyle.Render("╭─") + rtTitle + rightBorderStyle.Render(strings.Repeat("─", rtFill)+"╮")
-	rbw := rightW - 2
-	if rbw < 0 {
-		rbw = 0
-	}
-	rightBottom := rightBorderStyle.Render("╰" + strings.Repeat("─", rbw) + "╯")
-	rightSideL := rightBorderStyle.Render("│")
-	rightSideR := rightBorderStyle.Render("│")
+	innerRightW := rightW - 1
 
 	var b strings.Builder
-	for i := 0; i < d.Height; i++ {
-		var treeLine string
-		if i == 0 {
-			treeLine = topBorder
-		} else if i == d.Height-1 {
-			treeLine = bottomBorder
-		} else {
-			tIdx := i - 1
-			cl := ""
-			if tIdx < len(treeContentLines) {
-				cl = treeContentLines[tIdx]
-			}
-			treeLine = sideBorderL + cl + sideBorderR
+	b.WriteString(headerLine)
+	b.WriteString("\n")
+	b.WriteString(separatorLine)
+	b.WriteString("\n")
+
+	for i := 0; i < contentH; i++ {
+		tl := ""
+		if i < len(treeContentLines) {
+			tl = treeContentLines[i]
+		}
+		tlW := lipgloss.Width(tl)
+		treePad := treeW - 1 - tlW
+		if treePad < 0 {
+			treePad = 0
 		}
 
-		var rightLine string
-		if i == 0 {
-			rightLine = rightTop
-		} else if i == d.Height-1 {
-			rightLine = rightBottom
-		} else {
-			rIdx := i - 1
-			rl := ""
-			if rIdx < len(rightLines) {
-				rl = rightLines[rIdx]
-			}
-			rlW := lipgloss.Width(rl)
-			if rlW < innerRightW {
-				rl += strings.Repeat(" ", innerRightW-rlW)
-			}
-			rightLine = rightSideL + rl + rightSideR
+		rl := ""
+		if i < len(rightLines) {
+			rl = rightLines[i]
+		}
+		rlW := lipgloss.Width(rl)
+		if rlW < innerRightW {
+			rl += strings.Repeat(" ", innerRightW-rlW)
 		}
 
-		b.WriteString(treeLine + rightLine)
-		if i < d.Height-1 {
+		b.WriteString(tl + strings.Repeat(" ", treePad) + sep + rl)
+		if i < contentH-1 {
 			b.WriteString("\n")
 		}
 	}
