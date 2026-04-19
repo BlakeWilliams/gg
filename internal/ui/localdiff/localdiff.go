@@ -1095,9 +1095,9 @@ func (m Model) KeyBindings() []uictx.KeyBinding {
 		{Key: "J / K", Description: "Extend selection range"},
 		{Key: "h / l", Description: "Focus left / right pane"},
 		{Key: "f", Description: "Toggle tree focus"},
-		{Key: "^j / k", Description: "Previous / next file"},
-		{Key: "^d / u", Description: "Scroll half page down / up"},
-		{Key: "^f / b", Description: "Scroll full page down / up"},
+		{Key: "^j / ^k", Description: "Previous / next file"},
+		{Key: "^d / ^u", Description: "Scroll half page down / up"},
+		{Key: "^f / ^b", Description: "Scroll full page down / up"},
 		{Key: "g g", Description: "Go to top"},
 		{Key: "G", Description: "Go to bottom"},
 		{Key: "m", Description: "Cycle diff mode (working/staged/branch)", Keywords: []string{"toggle"}},
@@ -1126,7 +1126,7 @@ func (m Model) StatusHints() (left, right []string) {
 		left = append(left, styles.StatusBarKey.Render("f")+" "+styles.StatusBarHint.Render("focus tree"))
 	}
 	left = append(left, styles.StatusBarKey.Render("h/l")+" "+styles.StatusBarHint.Render("panes"))
-	left = append(left, styles.StatusBarKey.Render("^j/k")+" "+styles.StatusBarHint.Render("files"))
+	left = append(left, styles.StatusBarKey.Render("^j/^k")+" "+styles.StatusBarHint.Render("files"))
 	if !m.dv.Tree.Focused && m.dv.CurrentFileIdx >= 0 {
 		left = append(left, styles.StatusBarKey.Render("J/K")+" "+styles.StatusBarHint.Render("select range"))
 		if m.dv.ThreadCursor > 0 {
@@ -1340,7 +1340,7 @@ func (m Model) helpLine() string {
 		parts = append(parts,
 			hint("j/k", "navigate"),
 			hint("l", "focus diff"),
-			hint("^j/k", "next/prev file"),
+			hint("^j/^k", "next/prev file"),
 		)
 		switch m.mode {
 		case git.DiffWorking:
@@ -1353,7 +1353,7 @@ func (m Model) helpLine() string {
 		parts = append(parts,
 			hint("j/k", "navigate"),
 			hint("J/K", "select range"),
-			hint("^j/k", "next/prev file"),
+			hint("^j/^k", "next/prev file"),
 		)
 		switch m.mode {
 		case git.DiffWorking:
@@ -1369,7 +1369,7 @@ func (m Model) helpLine() string {
 		parts = append(parts,
 			hint("j/k", "navigate tree"),
 			hint("enter", "open file"),
-			hint("^j/k", "next/prev file"),
+			hint("^j/^k", "next/prev file"),
 		)
 	}
 	return strings.Join(parts, sep)
