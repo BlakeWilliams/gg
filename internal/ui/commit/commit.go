@@ -21,6 +21,8 @@ const (
 	ActionCommit       Action = iota // commit only
 	ActionCommitPush                 // commit + push
 	ActionCommitPushPR               // commit + push + open PR
+	ActionPush                       // push only (no commit)
+	ActionPushPR                     // push + open PR (no commit)
 )
 
 func (a Action) String() string {
@@ -31,8 +33,17 @@ func (a Action) String() string {
 		return "Commit & Push"
 	case ActionCommitPushPR:
 		return "Commit, Push & Open PR"
+	case ActionPush:
+		return "Push"
+	case ActionPushPR:
+		return "Push & Open PR"
 	}
 	return ""
+}
+
+// NeedsCommit returns true if this action requires a commit message.
+func (a Action) NeedsCommit() bool {
+	return a == ActionCommit || a == ActionCommitPush || a == ActionCommitPushPR
 }
 
 // DoneMsg is sent when the commit flow completes successfully.
@@ -122,7 +133,21 @@ func (m Model) maxTextareaHeight() int {
 }
 
 func (m *Model) resizeTextarea() {
-	lines := strings.Count(m.input.Value(), "\n") + 1
+	val := m.input.Value()
+	taWidth := m.width - 6
+	if taWidth < 1 {
+		taWidth = 1
+	}
+	// Count visual lines: each hard line wraps at textarea width.
+	lines := 0
+	for _, line := range strings.Split(val, "\n") {
+		w := lipgloss.Width(line)
+		if w == 0 {
+			lines++
+		} else {
+			lines += (w + taWidth - 1) / taWidth
+		}
+	}
 	if lines < 3 {
 		lines = 3
 	}
@@ -138,8 +163,16 @@ func (m Model) Title() string {
 	return m.action.String()
 }
 
-// Init starts the commit message generation.
+// Init starts the commit flow.
 func (m Model) Init() tea.Cmd {
+	if !m.action.NeedsCommit() {
+		// Push-only actions skip straight to executing.
+		m.phase = phaseExecuting
+		return tea.Batch(
+			m.executeAction(""),
+			tea.Tick(150*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} }),
+		)
+	}
 	return tea.Batch(
 		m.generateMessage(),
 		tea.Tick(150*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} }),
@@ -147,7 +180,23 @@ func (m Model) Init() tea.Cmd {
 }
 
 func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
+	var cmd tea.Cmd
+
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		modalW := msg.Width / 2
+		if modalW < 60 {
+			modalW = 60
+		}
+		if modalW > msg.Width-4 {
+			modalW = msg.Width - 4
+		}
+		m.width = modalW
+		m.height = msg.Height
+		m.input.SetWidth(m.width - 6)
+		m.resizeTextarea()
+		return m, nil
+
 	case tea.KeyPressMsg:
 		if m.phase == phaseExecuting || m.phase == phaseGenerating {
 			if msg.String() == "esc" {
@@ -174,7 +223,6 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			return m, m.openEditor()
 		}
 
-		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
 		m.resizeTextarea()
 		return m, cmd
@@ -221,8 +269,8 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	}
 
 	if m.phase == phaseEditing {
-		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
+		m.resizeTextarea()
 		return m, cmd
 	}
 	return m, nil
@@ -314,19 +362,20 @@ func (m Model) executeAction(message string) tea.Cmd {
 			body = strings.TrimSpace(message[idx+1:])
 		}
 
-		if err := git.Commit(m.repoRoot, message); err != nil {
-			return execResultMsg{err: fmt.Errorf("commit failed: %w", err)}
-		}
-
-		if m.action == ActionCommit {
-			return execResultMsg{}
+		if m.action.NeedsCommit() {
+			if err := git.Commit(m.repoRoot, message); err != nil {
+				return execResultMsg{err: fmt.Errorf("commit failed: %w", err)}
+			}
+			if m.action == ActionCommit {
+				return execResultMsg{}
+			}
 		}
 
 		if err := git.Push(m.repoRoot); err != nil {
 			return execResultMsg{err: fmt.Errorf("push failed: %w", err)}
 		}
 
-		if m.action == ActionCommitPush {
+		if m.action == ActionCommitPush || m.action == ActionPush {
 			return execResultMsg{}
 		}
 
@@ -372,7 +421,20 @@ func (m Model) View() string {
 		if m.genErr != nil {
 			b.WriteString(errStyle.Render("  "+m.genErr.Error()) + "\n")
 		}
-		b.WriteString(dimStyle.Render("  ctrl+s confirm • ctrl+e $EDITOR • esc cancel") + "\n")
+		btnStyle := lipgloss.NewStyle().Background(lipgloss.Green).Foreground(lipgloss.Black).Bold(true)
+		escStyle := lipgloss.NewStyle().Background(lipgloss.White).Foreground(lipgloss.Black)
+		btn := btnStyle.Render(" ctrl+s ")
+		esc := escStyle.Render(" esc ")
+		left := dimStyle.Render("  ctrl+e $EDITOR")
+		leftW := lipgloss.Width(left)
+		rightBtns := esc + " " + btn
+		rightW := lipgloss.Width(rightBtns)
+		innerW := m.width - 6
+		gap := innerW - leftW - rightW
+		if gap < 1 {
+			gap = 1
+		}
+		b.WriteString(left + strings.Repeat(" ", gap) + rightBtns + "\n")
 	}
 
 	return b.String()

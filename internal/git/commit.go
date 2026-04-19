@@ -53,3 +53,14 @@ func HasStagedChanges(dir string) bool {
 	cmd := exec.Command("git", "-C", dir, "diff", "--cached", "--quiet")
 	return cmd.Run() != nil // exit 1 means there are changes
 }
+
+// HasUnpushedCommits returns true if the current branch has commits not yet pushed.
+func HasUnpushedCommits(dir string) bool {
+	cmd := exec.Command("git", "-C", dir, "log", "--oneline", "@{u}..HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		// No upstream set — treat as having unpushed commits.
+		return true
+	}
+	return len(strings.TrimSpace(string(out))) > 0
+}

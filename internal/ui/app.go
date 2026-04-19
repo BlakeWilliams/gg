@@ -208,6 +208,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.commandBar.SetWidth(msg.Width)
+		if m.mode == modeCommit {
+			m.commitModel, _ = m.commitModel.Update(msg)
+		}
 		contentMsg := tea.WindowSizeMsg{Width: msg.Width, Height: msg.Height - chromeHeight}
 		var cmd tea.Cmd
 		m.activeView, cmd = m.activeView.Update(contentMsg)
@@ -307,12 +310,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.repoRoot == "" {
 				return m, nil
 			}
-			if !git.HasStagedChanges(m.repoRoot) {
+			items := m.commitPickerItems()
+			if len(items) == 0 {
 				return m, nil
 			}
 			m.mode = modePicker
 			m.pickerKind = "commit"
-			m.picker = picker.New("Commit", m.commitPickerItems(), m.pickerInnerWidth(), m.height-chromeHeight)
+			m.picker = picker.New("Git", items, m.pickerInnerWidth(), m.height-chromeHeight)
 			return m, nil
 		}
 
@@ -634,22 +638,28 @@ func (m Model) openCommitFlow(action string) (tea.Model, tea.Cmd) {
 		commitAction = commit.ActionCommitPush
 	case "commit-push-pr":
 		commitAction = commit.ActionCommitPushPR
+	case "push":
+		commitAction = commit.ActionPush
+	case "push-pr":
+		commitAction = commit.ActionPushPR
 	default:
 		return m, nil
 	}
 
-	// Reuse or create the copilot client.
-	if m.chatClient == nil {
-		repoRoot := m.repoRoot
-		if repoRoot == "" {
-			repoRoot = "."
+	// Push-only actions don't need copilot.
+	if commitAction.NeedsCommit() {
+		if m.chatClient == nil {
+			repoRoot := m.repoRoot
+			if repoRoot == "" {
+				repoRoot = "."
+			}
+			cp, err := copilot.New(repoRoot)
+			if err != nil {
+				return m, nil
+			}
+			go cp.Start()
+			m.chatClient = agents.New(cp)
 		}
-		cp, err := copilot.New(repoRoot)
-		if err != nil {
-			return m, nil
-		}
-		go cp.Start()
-		m.chatClient = agents.New(cp)
 	}
 
 	branch, _ := git.CurrentBranch(m.repoRoot)
@@ -657,22 +667,31 @@ func (m Model) openCommitFlow(action string) (tea.Model, tea.Cmd) {
 	if modalW < 60 {
 		modalW = 60
 	}
-	modalH := m.height / 2
-	if modalH < 12 {
-		modalH = 12
-	}
 
-	m.commitModel = commit.New(m.chatClient, commitAction, m.repoRoot, branch, "", modalW, modalH)
+	m.commitModel = commit.New(m.chatClient, commitAction, m.repoRoot, branch, "", modalW, m.height)
 	m.mode = modeCommit
 	return m, m.commitModel.Init()
 }
 
 func (m Model) commitPickerItems() []picker.Item {
-	return []picker.Item{
-		{Label: "Commit", Description: "Commit staged changes", Value: "commit", Keywords: []string{"git"}},
-		{Label: "Commit & Push", Description: "Commit and push to remote", Value: "commit-push", Keywords: []string{"git", "push"}},
-		{Label: "Commit, Push & Open PR", Description: "Commit, push, and open a pull request", Value: "commit-push-pr", Keywords: []string{"git", "push", "pr", "pull request"}},
+	hasStaged := git.HasStagedChanges(m.repoRoot)
+	hasUnpushed := git.HasUnpushedCommits(m.repoRoot)
+
+	var items []picker.Item
+	if hasStaged {
+		items = append(items,
+			picker.Item{Label: "Commit", Description: "Commit staged changes", Value: "commit", Keywords: []string{"git"}},
+			picker.Item{Label: "Commit & Push", Description: "Commit and push to remote", Value: "commit-push", Keywords: []string{"git", "push"}},
+			picker.Item{Label: "Commit, Push & Open PR", Description: "Commit, push, and open a pull request", Value: "commit-push-pr", Keywords: []string{"git", "push", "pr", "pull request"}},
+		)
 	}
+	if hasUnpushed || hasStaged {
+		items = append(items,
+			picker.Item{Label: "Push", Description: "Push to remote", Value: "push", Keywords: []string{"git", "push"}},
+			picker.Item{Label: "Push & Open PR", Description: "Push and open a pull request", Value: "push-pr", Keywords: []string{"git", "push", "pr", "pull request"}},
+		)
+	}
+	return items
 }
 
 func (m Model) renderCommitOverlay(bg string, bgHeight int) string {
