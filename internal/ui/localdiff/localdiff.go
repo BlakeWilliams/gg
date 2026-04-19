@@ -646,6 +646,14 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 				m.spliceThreadForComment(fileIdx, commentID)
 			}
 		}
+
+		// Re-apply thread highlight if dirty files wiped it.
+		if m.dv.ThreadCursor > 0 {
+			if _, ok := dirtyFiles[m.dv.CurrentFileIdx]; ok {
+				m.updateThreadHighlight()
+			}
+		}
+
 		m.rebuildContentIfChanged()
 
 		// Clamp ThreadCursor if the thread shrank (e.g. copilot reply completed/errored).
@@ -1193,7 +1201,9 @@ func (m Model) View() string {
 	}
 	rightView := m.dv.VP.View()
 	if m.dv.CurrentFileIdx >= 0 {
-		rightView = m.dv.OverlaySearchMatches(rightView)
+		if !m.dv.Composing {
+			rightView = m.dv.OverlaySearchMatches(rightView)
+		}
 		rightView = m.dv.OverlayDiffCursor(rightView)
 	}
 	view := m.renderLayout(rightView)

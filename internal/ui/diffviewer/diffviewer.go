@@ -534,7 +534,7 @@ func (d DiffViewer) OverlaySearchMatches(view string) string {
 		}
 
 		raw := diffs[diffIdx].Content
-		inner = highlightSearchSpans(inner, raw, d.SearchPattern, gutterW, yellowBg, colors.SearchMatchFg, lineBg, colors)
+		inner = highlightSearchSpans(inner, raw, d.SearchPattern, gutterW, yellowBg, colors.SearchMatchFg, lineBg)
 
 		lines[rel] = prefix + inner + suffix
 
@@ -554,8 +554,7 @@ func (d DiffViewer) OverlaySearchMatches(view string) string {
 // matches against; gutterW is the number of visual columns at the start of
 // inner that precede the code (line numbers + sign character).
 // restoreBg is the ANSI code to resume after the match (the line's own bg).
-// colors is used to find and replace existing bg codes in the match portion.
-func highlightSearchSpans(inner, raw string, pattern *regexp.Regexp, gutterW int, bgCode, fgCode, restoreBg string, colors styles.DiffColors) string {
+func highlightSearchSpans(inner, raw string, pattern *regexp.Regexp, gutterW int, bgCode, fgCode, restoreBg string) string {
 	locs := pattern.FindAllStringIndex(raw, -1)
 	if len(locs) == 0 {
 		return inner

@@ -4,8 +4,6 @@ import (
 	"regexp"
 	"strings"
 	"testing"
-
-	"github.com/blakewilliams/ghq/internal/ui/styles"
 )
 
 func TestByteToVisual(t *testing.T) {
@@ -46,7 +44,7 @@ func TestHighlightSearchSpans_PlainText(t *testing.T) {
 	resetCode := "\033[0m"
 	gutterW := 11
 
-	result := highlightSearchSpans(inner, raw, pattern, gutterW, bgCode, "", resetCode, styles.DiffColors{})
+	result := highlightSearchSpans(inner, raw, pattern, gutterW, bgCode, "", resetCode)
 
 	// "hello" is at positions 5-10 in raw, so visual 16-21 in inner
 	// Result should contain the yellow bg wrapping "hello"
@@ -73,7 +71,7 @@ func TestHighlightSearchSpans_WithTabs(t *testing.T) {
 	resetCode := "\033[0m"
 	gutterW := 11
 
-	result := highlightSearchSpans(inner, raw, pattern, gutterW, bgCode, "", resetCode, styles.DiffColors{})
+	result := highlightSearchSpans(inner, raw, pattern, gutterW, bgCode, "", resetCode)
 
 	// "hello" is at byte offset 6-11 in raw ("\tfunc " = 6 bytes)
 	// Visual: tab=4 + "func " = 9, so visual offset 9-14 in code
@@ -101,7 +99,7 @@ func TestHighlightSearchSpans_WithANSI(t *testing.T) {
 	resetCode := "\033[0m"
 	gutterW := 11
 
-	result := highlightSearchSpans(inner, raw, pattern, gutterW, bgCode, "", resetCode, styles.DiffColors{})
+	result := highlightSearchSpans(inner, raw, pattern, gutterW, bgCode, "", resetCode)
 
 	// The result should contain the yellow bg code
 	if !strings.Contains(result, bgCode) {
@@ -128,7 +126,7 @@ func TestHighlightSearchSpans_MultipleMatches(t *testing.T) {
 	resetCode := "\033[0m"
 	gutterW := 11
 
-	result := highlightSearchSpans(inner, raw, pattern, gutterW, bgCode, "", resetCode, styles.DiffColors{})
+	result := highlightSearchSpans(inner, raw, pattern, gutterW, bgCode, "", resetCode)
 
 	// Should have 3 highlighted "foo" spans
 	count := strings.Count(result, bgCode+"foo"+resetCode)
@@ -146,7 +144,7 @@ func TestHighlightSearchSpans_NoMatch(t *testing.T) {
 	resetCode := "\033[0m"
 	gutterW := 11
 
-	result := highlightSearchSpans(inner, raw, pattern, gutterW, bgCode, "", resetCode, styles.DiffColors{})
+	result := highlightSearchSpans(inner, raw, pattern, gutterW, bgCode, "", resetCode)
 
 	if result != inner {
 		t.Errorf("expected unchanged inner when no match, got: %q", result)
@@ -165,10 +163,9 @@ func TestHighlightSearchSpans_ReplacesExistingBg(t *testing.T) {
 	raw := "func hello() {"
 
 	pattern := regexp.MustCompile("(?i)hello")
-	colors := styles.DiffColors{AddBg: addBg}
 	gutterW := 11
 
-	result := highlightSearchSpans(inner, raw, pattern, gutterW, yellowBg, "", addBg, colors)
+	result := highlightSearchSpans(inner, raw, pattern, gutterW, yellowBg, "", addBg)
 
 	// The yellow bg must appear in the result.
 	if !strings.Contains(result, yellowBg) {
