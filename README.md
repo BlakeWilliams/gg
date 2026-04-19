@@ -34,6 +34,12 @@ Just run `ghq` in a branch with changes.
 - `u` / `U` — unstage line or hunk (staged view)
 - `m` — cycle view: working → staged → branch
 
+**Search**
+
+- `/` — open search, type query, press `enter` to confirm
+- `n` / `N` — next/previous match
+- `esc` — clear search
+
 **Actions**
 
 - `enter` — ask Copilot about current line

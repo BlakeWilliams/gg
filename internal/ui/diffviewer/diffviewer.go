@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image/color"
 	"path"
+	"regexp"
 	"strings"
 
 	"charm.land/bubbles/v2/spinner"
@@ -84,13 +85,15 @@ type DiffViewer struct {
 	ThreadCursor    int
 
 	// Comment composing
-	Composing        bool
-	CommentInput     textarea.Model
-	CommentFile      string
-	CommentLine      int
-	CommentSide      string
-	CommentStartLine int
-	CommentStartSide string
+	Composing           bool
+	CommentInput        textarea.Model
+	CommentFile         string
+	CommentLine         int
+	CommentSide         string
+	CommentStartLine    int
+	CommentStartSide    string
+	CommentBoxInsertPos int // rendered line after which the comment box was inserted
+	CommentBoxLines     int // number of lines the comment box occupies
 
 	// Copilot state
 	Agent        *agents.Client
@@ -125,6 +128,13 @@ type DiffViewer struct {
 	// falls inside a comment thread. 1-based comment index, or 0 if not in a thread.
 	// Callers read this to decide whether to enter/update thread highlighting.
 	SnapThreadComment int
+
+	// Search
+	Searching      bool           // true while the search popup is open
+	SearchQuery    string         // current typed query (while popup is open)
+	SearchPattern  *regexp.Regexp // compiled regex from last confirmed search
+	SearchMatches  []int          // diffLine indices in current file that match
+	SearchMatchIdx int            // current position in SearchMatches (-1 = none)
 }
 
 // CommentSource provides comments for a file. Each view implements this
@@ -474,7 +484,8 @@ func (d DiffViewer) OverlayDiffCursor(view string) string {
 	return strings.Join(lines, "\n")
 }
 
-// ApplyCursorHighlight applies the cursor background to a single rendered line.
+
+
 func (d DiffViewer) ApplyCursorHighlight(line string) string {
 	idx := d.CurrentFileIdx
 	if idx >= len(d.FileDiffs) || d.DiffCursor >= len(d.FileDiffs[idx]) {

@@ -600,6 +600,12 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		return m.handleCommentKey(msg)
 	}
 
+	// When searching, route all keys to the search handler.
+	if m.dv.Searching {
+		m.dv.HandleSearchKey(msg.String(), msg.Text)
+		return m, nil, true
+	}
+
 	// Close modal on esc.
 	if msg.String() == "esc" && m.showSidebar {
 		m.showSidebar = false
@@ -656,6 +662,21 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		if !m.showSidebar && m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
 			return m.openCommentInput()
 		}
+	case "/":
+		if !m.dv.Tree.Focused && m.dv.CurrentFileIdx >= 0 {
+			m.dv.StartSearch()
+			return m, nil, true
+		}
+	case "n":
+		if !m.dv.Tree.Focused && m.dv.SearchPattern != nil && len(m.dv.SearchMatches) > 0 {
+			m.dv.SearchNext()
+			return m, nil, true
+		}
+	case "N":
+		if !m.dv.Tree.Focused && m.dv.SearchPattern != nil && len(m.dv.SearchMatches) > 0 {
+			m.dv.SearchPrev()
+			return m, nil, true
+		}
 	case "ctrl+d", "ctrl+u", "ctrl+f", "ctrl+b":
 		if m.dv.HandleNavKey(msg.String()) == diffviewer.KeyHandled {
 			return m, nil, true
@@ -699,6 +720,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 // selectTreeEntry updates the right panel based on the current tree cursor.
 func (m *Model) selectTreeEntry() tea.Cmd {
 	m.dv.SelectionAnchor = -1
+	// Don't clear search — re-run after switching files.
 	fileIdx := m.dv.Tree.FileIndex()
 	if fileIdx < 0 {
 		// Directory or out-of-range — show overview.
@@ -1406,6 +1428,9 @@ func (m Model) descWidth() int {
 
 func (m *Model) rebuildContent() {
 	m.dv.HelpLine = m.helpLine()
+	if m.dv.SearchPattern != nil {
+		m.dv.RunSearch()
+	}
 	m.dv.RebuildContent(m.buildOverviewContent, m.buildFileContent)
 }
 

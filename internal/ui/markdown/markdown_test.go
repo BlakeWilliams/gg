@@ -5,6 +5,9 @@ import (
 	"testing"
 
 	"charm.land/lipgloss/v2"
+	xansi "github.com/charmbracelet/x/ansi"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/blakewilliams/ghq/internal/github"
 	"github.com/blakewilliams/ghq/internal/ui/components"
@@ -31,9 +34,7 @@ func TestRenderBody_CodeBlock(t *testing.T) {
 
 	for i, line := range strings.Split(result, "\n") {
 		visW := lipgloss.Width(line)
-		if visW > width {
-			t.Errorf("line %d exceeds width %d (got %d): %q", i, width, visW, stripANSI(line))
-		}
+		assert.LessOrEqualf(t, visW, width, "line %d: %q", i, xansi.Strip(line))
 	}
 }
 
@@ -44,9 +45,7 @@ func TestRenderBody_NoPadding(t *testing.T) {
 	result := r.RenderBody("Short.", 80, "")
 
 	for i, line := range strings.Split(result, "\n") {
-		if strings.HasSuffix(line, "  ") {
-			t.Errorf("line %d has trailing padding: %q", i, stripANSI(line))
-		}
+		assert.Falsef(t, strings.HasSuffix(line, "  "), "line %d has trailing padding: %q", i, xansi.Strip(line))
 	}
 }
 
@@ -62,9 +61,7 @@ func TestRenderBody_NoTrailingBlanks(t *testing.T) {
 
 	// Last line should have visible content, not be blank.
 	last := lines[len(lines)-1]
-	if strings.TrimSpace(stripANSI(last)) == "" {
-		t.Errorf("last line is blank (would push border): %q", last)
-	}
+	assert.NotEmptyf(t, strings.TrimSpace(xansi.Strip(last)), "last line is blank (would push border): %q", last)
 }
 
 // TestRenderBody_ResetNormalization verifies that both \033[m and
@@ -77,15 +74,14 @@ func TestRenderBody_ResetNormalization(t *testing.T) {
 	result := r.RenderBody(body, 60, bg)
 
 	// After normalization, there should be no bare \033[m (only \033[0m+bg).
-	if strings.Contains(result, "\033[m") && !strings.Contains(result, "\033[0m") {
-		t.Error("found bare \\033[m without normalization to \\033[0m")
-	}
+	assert.False(t, strings.Contains(result, "\033[m") && !strings.Contains(result, "\033[0m"),
+		"found bare \\033[m without normalization to \\033[0m")
 
 	// Every \033[0m should be followed by bg.
 	resetCount := strings.Count(result, "\033[0m")
 	resetBgCount := strings.Count(result, "\033[0m"+bg)
-	if resetCount > 0 && resetBgCount != resetCount {
-		t.Errorf("not all resets have bg: %d resets, %d with bg", resetCount, resetBgCount)
+	if resetCount > 0 {
+		assert.Equalf(t, resetCount, resetBgCount, "not all resets have bg: %d resets, %d with bg", resetCount, resetBgCount)
 	}
 }
 
@@ -95,11 +91,9 @@ func TestRenderBody_InlineCode(t *testing.T) {
 	body := "Use `fmt.Println` to print and `os.Exit(1)` to quit."
 
 	result := r.RenderBody(body, 60, "\033[48;5;22m")
-	plain := stripANSI(result)
+	plain := xansi.Strip(result)
 
-	if !strings.Contains(plain, "fmt.Println") {
-		t.Errorf("expected inline code in output: %q", plain)
-	}
+	assert.Contains(t, plain, "fmt.Println")
 }
 
 // TestRenderBody_NoBg verifies that passing empty bg still works.
@@ -107,13 +101,10 @@ func TestRenderBody_NoBg(t *testing.T) {
 	r := NewRenderer(nil)
 	result := r.RenderBody("Some **bold** and `code`.", 60, "")
 
-	if result == "" {
-		t.Error("expected non-empty output")
-	}
-	plain := stripANSI(result)
-	if !strings.Contains(plain, "bold") || !strings.Contains(plain, "code") {
-		t.Errorf("missing content: %q", plain)
-	}
+	assert.NotEmpty(t, result)
+	plain := xansi.Strip(result)
+	assert.Contains(t, plain, "bold")
+	assert.Contains(t, plain, "code")
 }
 
 // TestRenderBody_StreamingPartialFence verifies that a body with an
@@ -123,9 +114,7 @@ func TestRenderBody_StreamingPartialFence(t *testing.T) {
 	body := "Here:\n```go\nfunc hello() {"
 
 	result := r.RenderBody(body, 60, "\033[48;5;22m")
-	if result == "" {
-		t.Error("expected non-empty output for partial fence")
-	}
+	assert.NotEmpty(t, result, "expected non-empty output for partial fence")
 }
 
 // TestCloseOpenFences verifies fence balancing for streaming content.
@@ -146,10 +135,7 @@ func TestCloseOpenFences(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := CloseOpenFences(tt.input)
 			hasSuffix := len(result) > len(tt.input)
-			if hasSuffix != tt.expect {
-				t.Errorf("got modified=%v, want=%v\ninput:  %q\nresult: %q",
-					hasSuffix, tt.expect, tt.input, result)
-			}
+			assert.Equalf(t, tt.expect, hasSuffix, "input: %q\nresult: %q", tt.input, result)
 		})
 	}
 }
@@ -163,9 +149,8 @@ func TestRenderBody_ChromaHighlighting(t *testing.T) {
 	result := r.RenderBody(body, 60, "")
 
 	// Chroma should produce 38;2;... (truecolor) or 38;5;... (256-color) codes.
-	if !strings.Contains(result, "\033[38;2;") && !strings.Contains(result, "\033[38;5;") {
-		t.Errorf("expected chroma syntax highlighting (truecolor/256) in output, got: %q", result)
-	}
+	assert.Truef(t, strings.Contains(result, "\033[38;2;") || strings.Contains(result, "\033[38;5;"),
+		"expected chroma syntax highlighting (truecolor/256) in output, got: %q", result)
 }
 
 // TestCommentThread_WithMarkdownRenderer renders a comment thread through the
@@ -201,28 +186,22 @@ func TestCommentThread_WithMarkdownRenderer(t *testing.T) {
 	rendered := thread.Render(rc)
 	lines := strings.Split(rendered, "\n")
 
-	if len(lines) < 3 {
-		t.Fatalf("expected at least 3 lines, got %d", len(lines))
-	}
+	require.GreaterOrEqual(t, len(lines), 3)
 
 	for i, line := range lines {
 		if line == "" {
 			continue
 		}
 		visW := lipgloss.Width(line)
-		if visW > width {
-			t.Errorf("line %d exceeds width %d (got %d): %q", i, width, visW, stripANSI(line))
-		}
+		assert.LessOrEqualf(t, visW, width, "line %d: %q", i, xansi.Strip(line))
 	}
 
 	// Body lines should have matching │ borders.
 	for i, line := range lines {
-		plain := stripANSI(line)
+		plain := xansi.Strip(line)
 		if strings.Contains(plain, "│") {
 			count := strings.Count(plain, "│")
-			if count != 2 {
-				t.Errorf("line %d: expected 2 │ borders, got %d: %q", i, count, plain)
-			}
+			assert.Equalf(t, 2, count, "line %d: expected 2 │ borders: %q", i, plain)
 		}
 	}
 
@@ -231,24 +210,22 @@ func TestCommentThread_WithMarkdownRenderer(t *testing.T) {
 	lastNonEmpty := ""
 	secondLast := ""
 	for _, line := range lines {
-		if strings.TrimSpace(stripANSI(line)) != "" {
+		if strings.TrimSpace(xansi.Strip(line)) != "" {
 			secondLast = lastNonEmpty
 			lastNonEmpty = line
 		}
 	}
-	plainLast := stripANSI(lastNonEmpty)
-	if !strings.Contains(plainLast, "╰") {
-		t.Errorf("last non-empty line missing ╰ border: %q", plainLast)
-	}
+	plainLast := xansi.Strip(lastNonEmpty)
+	assert.Containsf(t, plainLast, "╰", "last non-empty line missing ╰ border: %q", plainLast)
 	// The line before the closing border should not be blank inside the box.
 	if secondLast != "" {
-		plainSecond := stripANSI(secondLast)
+		plainSecond := xansi.Strip(secondLast)
 		inner := strings.TrimLeft(plainSecond, " ")
 		if strings.HasPrefix(inner, "│") {
 			// Extract content between │ borders.
 			parts := strings.SplitN(inner, "│", 3)
-			if len(parts) >= 2 && strings.TrimSpace(parts[1]) == "" {
-				t.Errorf("blank body line before closing border: %q", plainSecond)
+			if len(parts) >= 2 {
+				assert.NotEmptyf(t, strings.TrimSpace(parts[1]), "blank body line before closing border: %q", plainSecond)
 			}
 		}
 	}
@@ -288,9 +265,7 @@ func TestCommentThread_NarrowWidth(t *testing.T) {
 			continue
 		}
 		visW := lipgloss.Width(line)
-		if visW > width {
-			t.Errorf("line %d exceeds width %d (got %d): %q", i, width, visW, stripANSI(line))
-		}
+		assert.LessOrEqualf(t, visW, width, "line %d: %q", i, xansi.Strip(line))
 	}
 }
 
@@ -333,24 +308,18 @@ func TestCommentThread_TabIndentedCode(t *testing.T) {
 				continue
 			}
 			// No tabs should survive.
-			if strings.Contains(line, "\t") {
-				t.Errorf("w=%d line %d: tab character in output: %q", width, i, stripANSI(line))
-			}
+			assert.Falsef(t, strings.Contains(line, "\t"), "w=%d line %d: tab character in output: %q", width, i, xansi.Strip(line))
 			// Every line must fit within width.
 			visW := lipgloss.Width(line)
-			if visW > width {
-				t.Errorf("w=%d line %d: exceeds width %d (got %d): %q", width, i, width, visW, stripANSI(line))
-			}
+			assert.LessOrEqualf(t, visW, width, "w=%d line %d: %q", width, i, xansi.Strip(line))
 		}
 
 		// Every body line (with │) must have exactly 2 borders.
 		for i, line := range lines {
-			plain := stripANSI(line)
+			plain := xansi.Strip(line)
 			if strings.Contains(plain, "│") {
 				count := strings.Count(plain, "│")
-				if count != 2 {
-					t.Errorf("w=%d line %d: expected 2 │ borders, got %d: %q", width, i, count, plain)
-				}
+				assert.Equalf(t, 2, count, "w=%d line %d: expected 2 │ borders: %q", width, i, plain)
 			}
 		}
 	}
