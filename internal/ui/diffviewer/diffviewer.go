@@ -16,7 +16,6 @@ import (
 	"github.com/blakewilliams/ghq/internal/review/agents"
 	"github.com/blakewilliams/ghq/internal/review/comments"
 	"github.com/blakewilliams/ghq/internal/ui/components"
-	"github.com/blakewilliams/ghq/internal/ui/styles"
 	"github.com/blakewilliams/ghq/internal/ui/uictx"
 )
 
@@ -92,8 +91,6 @@ type DiffViewer struct {
 	CommentSide         string
 	CommentStartLine    int
 	CommentStartSide    string
-	CommentBoxInsertPos int // rendered line after which the comment box was inserted
-	CommentBoxLines     int // number of lines the comment box occupies
 
 	// Copilot state
 	Agent        *agents.Client
@@ -107,7 +104,7 @@ type DiffViewer struct {
 	RenderBody func(body string, width int, bg string) string
 
 	// Render lists per file (structural render items).
-	FileRenderLists []*components.FileRenderList
+	FileRenderers []*components.FileRenderList
 
 	// Loading spinner (shown while highlighting is in progress for current file).
 	Spinner       spinner.Model
@@ -141,6 +138,27 @@ type DiffViewer struct {
 // to return comments from its backing store (local CommentStore, GitHub API, etc).
 type CommentSource interface {
 	CommentsForFile(filename string) []github.ReviewComment
+}
+
+// ReconcileAndSync runs state reconciliation on the current file's render list,
+// dirtying only the items whose highlight state changed (cursor, selection,
+// search). If any items were dirtied, it re-syncs the rendered content to the
+// viewport. This is the SOLE sync point — callers never need to manually bump
+// or sync.
+func (d *DiffViewer) ReconcileAndSync() {
+	idx := d.CurrentFileIdx
+	if idx < 0 || idx >= len(d.FileRenderers) || d.FileRenderers[idx] == nil {
+		return
+	}
+	if idx >= len(d.FileDiffs) {
+		return
+	}
+	list := d.FileRenderers[idx]
+	rc := d.renderContext(d.FileDiffs[idx])
+	dirtied := list.ReconcileHighlights(rc)
+	if dirtied || list.IsDirty() {
+		d.syncFromRenderList(idx, rc)
+	}
 }
 
 // BlockSource is an optional extension of CommentSource that provides
@@ -379,23 +397,6 @@ func (d *DiffViewer) SyncDiffCursorToViewport() {
 	d.DiffCursor, d.SnapThreadComment = d.snapTarget(idx, center)
 }
 
-// CursorViewportLine returns the cursor's Y position in the viewport, or -1 if not visible.
-func (d DiffViewer) CursorViewportLine() int {
-	idx := d.CurrentFileIdx
-	if idx < 0 || idx >= len(d.FileDiffOffsets) {
-		return -1
-	}
-	if d.DiffCursor >= len(d.FileDiffOffsets[idx]) {
-		return -1
-	}
-	absLine := d.FileDiffOffsets[idx][d.DiffCursor]
-	rel := absLine - d.VP.YOffset()
-	if rel < 0 || rel >= d.ViewportHeight() {
-		return -1
-	}
-	return rel
-}
-
 // DiffCursorFromScreenY maps a screen Y coordinate to the nearest diff line
 // index, accounting for chrome rows and viewport scroll. Returns -1 if no
 // valid diff line is found. Sets SnapThreadComment if the position falls
@@ -430,9 +431,9 @@ func (d *DiffViewer) snapTarget(fileIdx int, targetAbs int) (diffIdx int, thread
 	}
 
 	// Check if target falls inside a comment thread.
-	if fileIdx < len(d.FileRenderLists) && d.FileRenderLists[fileIdx] != nil {
+	if fileIdx < len(d.FileRenderers) && d.FileRenderers[fileIdx] != nil {
 		rc := d.RenderContextForFile(fileIdx)
-		if item, offset := d.FileRenderLists[fileIdx].ItemAtLine(targetAbs, rc); item != nil {
+		if item, offset := d.FileRenderers[fileIdx].ItemAtLine(targetAbs, rc); item != nil {
 			if ct, ok := item.(*components.CommentThreadItem); ok {
 				ci := ct.CommentIndexAtOffset(offset, rc)
 				if ci > 0 {
@@ -461,140 +462,6 @@ func (d *DiffViewer) snapTarget(fileIdx int, targetAbs int) (diffIdx int, thread
 		}
 	}
 	return best, 0
-}
-
-// OverlayDiffCursor applies cursor or selection highlighting to the viewport content.
-func (d DiffViewer) OverlayDiffCursor(view string) string {
-	if !d.FilesListLoaded || !d.HasDiffLines() {
-		return view
-	}
-
-	if d.SelectionAnchor >= 0 && d.SelectionAnchor != d.DiffCursor {
-		return d.overlaySelectionRange(view)
-	}
-
-	vLine := d.CursorViewportLine()
-	if vLine < 0 {
-		return view
-	}
-	lines := strings.Split(view, "\n")
-	if vLine < len(lines) {
-		lines[vLine] = d.ApplyCursorHighlight(lines[vLine])
-	}
-	return strings.Join(lines, "\n")
-}
-
-
-
-func (d DiffViewer) ApplyCursorHighlight(line string) string {
-	idx := d.CurrentFileIdx
-	if idx >= len(d.FileDiffs) || d.DiffCursor >= len(d.FileDiffs[idx]) {
-		return line
-	}
-	dl := d.FileDiffs[idx][d.DiffCursor]
-	if dl.Type == components.LineHunk {
-		return line
-	}
-
-	prefix, inner, suffix := SplitDiffBorders(line)
-
-	inner = strings.Replace(inner, "\033[1m+\033[0m", "\033[1m>\033[0m", 1)
-	inner = strings.Replace(inner, "\033[1m-\033[0m", "\033[1m>\033[0m", 1)
-
-	colors := d.Ctx.DiffColors
-	var selBg string
-	switch dl.Type {
-	case components.LineAdd:
-		selBg = colors.SelectedAddBg
-	case components.LineDel:
-		selBg = colors.SelectedDelBg
-	default:
-		selBg = colors.SelectedCtxBg
-	}
-
-	if selBg != "" {
-		inner = replaceBackground(inner, colors, selBg)
-	}
-
-	return prefix + inner + suffix
-}
-
-func (d DiffViewer) overlaySelectionRange(view string) string {
-	idx := d.CurrentFileIdx
-	if idx < 0 || idx >= len(d.FileDiffOffsets) {
-		return view
-	}
-
-	selStart, selEnd := d.SelectionAnchor, d.DiffCursor
-	if selStart > selEnd {
-		selStart, selEnd = selEnd, selStart
-	}
-
-	offsets := d.FileDiffOffsets[idx]
-	diffs := d.FileDiffs[idx]
-	vpTop := d.VP.YOffset()
-
-	lines := strings.Split(view, "\n")
-
-	for i := selStart; i <= selEnd; i++ {
-		if i >= len(offsets) || i >= len(diffs) {
-			continue
-		}
-		if diffs[i].Type == components.LineHunk {
-			continue
-		}
-		absLine := offsets[i]
-		rel := absLine - vpTop
-		if rel < 0 || rel >= len(lines) {
-			continue
-		}
-		lines[rel] = d.ApplySelectionHighlight(lines[rel], diffs[i])
-	}
-
-	return strings.Join(lines, "\n")
-}
-
-// ApplySelectionHighlight applies selection background to a diff line.
-func (d DiffViewer) ApplySelectionHighlight(line string, dl components.DiffLine) string {
-	if dl.Type == components.LineHunk {
-		return line
-	}
-
-	prefix, inner, suffix := SplitDiffBorders(line)
-
-	inner = strings.Replace(inner, "\033[1m+\033[0m", "\033[1m>\033[0m", 1)
-	inner = strings.Replace(inner, "\033[1m-\033[0m", "\033[1m>\033[0m", 1)
-
-	colors := d.Ctx.DiffColors
-	var selBg string
-	switch dl.Type {
-	case components.LineAdd:
-		selBg = colors.SelectedAddBg
-	case components.LineDel:
-		selBg = colors.SelectedDelBg
-	default:
-		selBg = colors.SelectedCtxBg
-	}
-
-	if selBg != "" {
-		inner = replaceBackground(inner, colors, selBg)
-	}
-
-	return prefix + inner + suffix
-}
-
-// replaceBackground swaps diff bg colors for selected bg in an ANSI string.
-func replaceBackground(inner string, colors styles.DiffColors, selBg string) string {
-	if colors.AddBg != "" {
-		inner = strings.ReplaceAll(inner, colors.AddBg, selBg)
-	}
-	if colors.DelBg != "" {
-		inner = strings.ReplaceAll(inner, colors.DelBg, selBg)
-	}
-	inner = strings.ReplaceAll(inner, "\033[0m", "\033[0m"+selBg)
-	inner = strings.ReplaceAll(inner, "\033[m", "\033[m"+selBg)
-	inner = selBg + inner + "\033[0m"
-	return inner
 }
 
 // --- Layout rendering ---
@@ -913,12 +780,38 @@ func renderHelpLine(s string, w int, dim lipgloss.Style) string {
 // the given diff lines (needed for gutter column width).
 func (d *DiffViewer) renderContext(diffLines []components.DiffLine) components.RenderContext {
 	colW := components.GutterColWidth(diffLines)
+
+	// Build search matches map for this file's diff lines.
+	var searchMatches map[int]int
+	if d.SearchPattern != nil && len(d.SearchMatches) > 0 {
+		searchMatches = make(map[int]int, len(d.SearchMatches))
+		for i, idx := range d.SearchMatches {
+			searchMatches[idx] = i + 1 // 1-based match number
+		}
+	}
+
+	cursorLine := d.DiffCursor
+	selStart := -1
+	selEnd := -1
+	if d.SelectionAnchor >= 0 {
+		selStart = d.SelectionAnchor
+		selEnd = d.DiffCursor
+		if selStart > selEnd {
+			selStart, selEnd = selEnd, selStart
+		}
+	}
+
 	return components.RenderContext{
-		Width:      d.ContentWidth(),
-		Colors:     d.Ctx.DiffColors,
-		ColW:       colW,
-		RenderBody: d.RenderBody,
-		AnimFrame:  d.CopilotState.Dots,
+		Width:          d.ContentWidth(),
+		Colors:         d.Ctx.DiffColors,
+		ColW:           colW,
+		RenderBody:     d.RenderBody,
+		AnimFrame:      d.CopilotState.Dots,
+		CursorLine:     cursorLine,
+		SelectionStart: selStart,
+		SelectionEnd:   selEnd,
+		SearchPattern:  d.SearchPattern,
+		SearchMatches:  searchMatches,
 	}
 }
 
@@ -950,7 +843,7 @@ func (d DiffViewer) blocksForFile(filename string) map[int][]comments.ContentBlo
 // syncFromRenderList derives RenderedFiles and FileDiffOffsets
 // from the render list for the given file index.
 func (d *DiffViewer) syncFromRenderList(index int, rc components.RenderContext) {
-	list := d.FileRenderLists[index]
+	list := d.FileRenderers[index]
 	if index < len(d.RenderedFiles) {
 		d.RenderedFiles[index] = list.String(rc)
 	}
@@ -988,8 +881,8 @@ func (d *DiffViewer) FormatFile(index int) {
 	components.FormatDiffLinesFromHL(diffLines, hl.HlLines, hl.HlLinesOld, hl.Filename, d.ContentWidth(), d.Ctx.DiffColors, colW)
 
 	// Build the render list and derive all cached fields from it.
-	if index < len(d.FileRenderLists) {
-		d.FileRenderLists[index] = components.BuildRenderList(diffLines, fileComments, opts)
+	if index < len(d.FileRenderers) {
+		d.FileRenderers[index] = components.BuildRenderList(diffLines, fileComments, opts)
 		rc := d.renderContext(diffLines)
 		d.syncFromRenderList(index, rc)
 	}
@@ -1016,8 +909,8 @@ func (d *DiffViewer) FormatFileWithComments(index int, fileComments []github.Rev
 	colW := components.GutterColWidth(diffLines)
 	components.FormatDiffLinesFromHL(diffLines, hl.HlLines, hl.HlLinesOld, hl.Filename, d.ContentWidth(), d.Ctx.DiffColors, colW)
 
-	if index < len(d.FileRenderLists) {
-		d.FileRenderLists[index] = components.BuildRenderList(diffLines, fileComments, opts)
+	if index < len(d.FileRenderers) {
+		d.FileRenderers[index] = components.BuildRenderList(diffLines, fileComments, opts)
 		rc := d.renderContext(diffLines)
 		d.syncFromRenderList(index, rc)
 	}
@@ -1028,7 +921,7 @@ func (d *DiffViewer) ReformatAllFiles() {
 	for i := range d.RenderedFiles {
 		d.RenderedFiles[i] = ""
 	}
-	for _, list := range d.FileRenderLists {
+	for _, list := range d.FileRenderers {
 		if list != nil {
 			list.InvalidateAll()
 		}
@@ -1046,11 +939,11 @@ func (d *DiffViewer) SpliceThreadForComment(fileIdx int, side string, line int) 
 // SpliceThreadWithHighlight replaces a comment thread in the render list with
 // updated content (e.g. highlight state change, new reply).
 func (d *DiffViewer) SpliceThreadWithHighlight(fileIdx int, side string, line int, highlighted bool, hlIdx int) {
-	if fileIdx < 0 || fileIdx >= len(d.FileRenderLists) || d.FileRenderLists[fileIdx] == nil {
+	if fileIdx < 0 || fileIdx >= len(d.FileRenderers) || d.FileRenderers[fileIdx] == nil {
 		d.FormatFile(fileIdx)
 		return
 	}
-	list := d.FileRenderLists[fileIdx]
+	list := d.FileRenderers[fileIdx]
 	ti := list.FindThread(side, line)
 	if ti < 0 {
 		d.FormatFile(fileIdx)
@@ -1105,10 +998,10 @@ func (d *DiffViewer) SpliceThreadWithHighlight(fileIdx int, side string, line in
 // RemoveThread removes a comment thread from the render list.
 // Returns true if the thread was found and removed.
 func (d *DiffViewer) RemoveThread(fileIdx int, side string, line int) bool {
-	if fileIdx < 0 || fileIdx >= len(d.FileRenderLists) || d.FileRenderLists[fileIdx] == nil {
+	if fileIdx < 0 || fileIdx >= len(d.FileRenderers) || d.FileRenderers[fileIdx] == nil {
 		return false
 	}
-	list := d.FileRenderLists[fileIdx]
+	list := d.FileRenderers[fileIdx]
 	if !list.RemoveThread(side, line) {
 		return false
 	}
@@ -1121,7 +1014,7 @@ func (d *DiffViewer) RemoveThread(fileIdx int, side string, line int) bool {
 // InsertThread inserts a new comment thread into the render list.
 // Returns true if the thread was successfully inserted.
 func (d *DiffViewer) InsertThread(fileIdx int, diffLineIdx int, side string, line int, comments []github.ReviewComment) bool {
-	if fileIdx < 0 || fileIdx >= len(d.FileRenderLists) || d.FileRenderLists[fileIdx] == nil {
+	if fileIdx < 0 || fileIdx >= len(d.FileRenderers) || d.FileRenderers[fileIdx] == nil {
 		return false
 	}
 
@@ -1131,7 +1024,7 @@ func (d *DiffViewer) InsertThread(fileIdx int, diffLineIdx int, side string, lin
 	}
 
 	item := components.NewCommentThreadItem(diffLineIdx, side, line, components.ReviewCommentsToRender(comments), lt)
-	d.FileRenderLists[fileIdx].InsertAfterDiffLine(diffLineIdx, item)
+	d.FileRenderers[fileIdx].InsertAfterDiffLine(diffLineIdx, item)
 
 	rc := d.renderContext(d.FileDiffs[fileIdx])
 	d.syncFromRenderList(fileIdx, rc)
@@ -1152,23 +1045,23 @@ func (d DiffViewer) FileIndexForPath(path string) int {
 // comment thread at (side, line) for the given file index.
 // Returns -1 if the thread or render list is not found.
 func (d *DiffViewer) ThreadEndOffset(fileIdx int, side string, line int) int {
-	if fileIdx < 0 || fileIdx >= len(d.FileRenderLists) || d.FileRenderLists[fileIdx] == nil {
+	if fileIdx < 0 || fileIdx >= len(d.FileRenderers) || d.FileRenderers[fileIdx] == nil {
 		return -1
 	}
 	if fileIdx >= len(d.FileDiffs) {
 		return -1
 	}
 	rc := d.renderContext(d.FileDiffs[fileIdx])
-	return d.FileRenderLists[fileIdx].ThreadEndOffset(side, line, rc)
+	return d.FileRenderers[fileIdx].ThreadEndOffset(side, line, rc)
 }
 
 // SetThreadOpenBottom sets or clears the OpenBottom flag on a thread, invalidates
 // it, and re-syncs the render list so that RenderedFiles and offsets are updated.
 func (d *DiffViewer) SetThreadOpenBottom(fileIdx int, side string, line int, open bool) {
-	if fileIdx < 0 || fileIdx >= len(d.FileRenderLists) || d.FileRenderLists[fileIdx] == nil {
+	if fileIdx < 0 || fileIdx >= len(d.FileRenderers) || d.FileRenderers[fileIdx] == nil {
 		return
 	}
-	list := d.FileRenderLists[fileIdx]
+	list := d.FileRenderers[fileIdx]
 	ti := list.FindThread(side, line)
 	if ti < 0 {
 		return
@@ -1187,10 +1080,10 @@ func (d *DiffViewer) SetThreadOpenBottom(fileIdx int, side string, line int, ope
 // ThreadParentLineType returns the ParentLineType of the comment thread at (side, line)
 // for the given file. Returns LineContext if the thread is not found.
 func (d *DiffViewer) ThreadParentLineType(fileIdx int, side string, line int) components.LineType {
-	if fileIdx < 0 || fileIdx >= len(d.FileRenderLists) || d.FileRenderLists[fileIdx] == nil {
+	if fileIdx < 0 || fileIdx >= len(d.FileRenderers) || d.FileRenderers[fileIdx] == nil {
 		return components.LineContext
 	}
-	list := d.FileRenderLists[fileIdx]
+	list := d.FileRenderers[fileIdx]
 	ti := list.FindThread(side, line)
 	if ti < 0 {
 		return components.LineContext
@@ -1256,7 +1149,7 @@ func (d *DiffViewer) InitFileSlices(n int) {
 	d.RenderedFiles = make([]string, n)
 	d.FileDiffs = make([][]components.DiffLine, n)
 	d.FileDiffOffsets = make([][]int, n)
-	d.FileRenderLists = make([]*components.FileRenderList, n)
+	d.FileRenderers = make([]*components.FileRenderList, n)
 }
 
 // --- Spinner helpers ---
@@ -1288,40 +1181,6 @@ func (d DiffViewer) SpinnerView() string {
 	}
 	b.WriteString(strings.Repeat(" ", leftPad) + label)
 	return b.String()
-}
-
-// --- Standalone helpers ---
-
-// SplitDiffBorders splits a rendered diff line into border prefix, inner content, and border suffix.
-func SplitDiffBorders(line string) (prefix, inner, suffix string) {
-	const borderChar = "│"
-
-	firstIdx := strings.Index(line, borderChar)
-	if firstIdx < 0 {
-		return "", line, ""
-	}
-
-	lastIdx := strings.LastIndex(line, borderChar)
-	if lastIdx == firstIdx {
-		return "", line, ""
-	}
-
-	prefixEnd := firstIdx + len(borderChar)
-	if prefixEnd < len(line) && line[prefixEnd] == '\033' {
-		if i := strings.IndexByte(line[prefixEnd:], 'm'); i >= 0 {
-			prefixEnd += i + 1
-		}
-	}
-
-	suffixStart := lastIdx
-	for i := lastIdx - 1; i >= prefixEnd; i-- {
-		if line[i] == '\033' {
-			suffixStart = i
-			break
-		}
-	}
-
-	return line[:prefixEnd], line[prefixEnd:suffixStart], line[suffixStart:]
 }
 
 // KeyResult is returned by HandleNavKey to indicate what happened.

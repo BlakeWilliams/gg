@@ -206,7 +206,9 @@ func BuildRenderList(diffLines []DiffLine, comments []github.ReviewComment, opts
 		}
 	}
 
-	return &FileRenderList{Items: items, dirty: true}
+	list := &FileRenderList{Items: items, dirty: true, hasDirtyItems: true}
+	list.BuildDiffLineMap()
+	return list
 }
 
 // renderThread builds the RenderComment slice for a given key,
@@ -465,16 +467,19 @@ func injectBackground(highlighted string, bgCode string) string {
 // wrapRenderedLine splits a rendered diff line into multiple lines if it
 // exceeds the target width. The first segment keeps the original gutter;
 // continuation segments get a blank gutter with matching background.
-func wrapRenderedLine(rendered string, targetW int, lt LineType, colors styles.DiffColors, gutterW int) []string {
-	// Determine the background code for padding.
-	var bgCode string
-	switch lt {
-	case LineAdd:
-		bgCode = colors.AddBg
-	case LineDel:
-		bgCode = colors.DelBg
-	case LineHunk:
-		bgCode = colors.HunkBg
+func wrapRenderedLine(rendered string, targetW int, lt LineType, colors styles.DiffColors, gutterW int, effectiveBg string) []string {
+	// Use the caller-supplied effectiveBg if present (e.g. selection bg),
+	// otherwise derive from the line type.
+	bgCode := effectiveBg
+	if bgCode == "" {
+		switch lt {
+		case LineAdd:
+			bgCode = colors.AddBg
+		case LineDel:
+			bgCode = colors.DelBg
+		case LineHunk:
+			bgCode = colors.HunkBg
+		}
 	}
 
 	visW := lipgloss.Width(rendered)
@@ -548,11 +553,11 @@ func padToWidth(s string, targetWidth int) string {
 // padWithBg pads a line to targetWidth with the background color, then resets.
 func padWithBg(s string, targetWidth int, bgCode string) string {
 	currentWidth := lipgloss.Width(s)
-	pad := ""
-	if currentWidth < targetWidth {
-		pad = strings.Repeat(" ", targetWidth-currentWidth)
+	if currentWidth >= targetWidth {
+		return s + "\033[0m"
 	}
-	return s + pad + "\033[0m"
+	pad := strings.Repeat(" ", targetWidth-currentWidth)
+	return s + bgCode + pad + "\033[0m"
 }
 
 // --- Helpers ---

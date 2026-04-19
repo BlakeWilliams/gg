@@ -367,7 +367,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		m.dv.RenderedFiles = make([]string, len(msg.files))
 		m.dv.FileDiffs = make([][]components.DiffLine, len(msg.files))
 		m.dv.FileDiffOffsets = make([][]int, len(msg.files))
-		m.dv.FileRenderLists = make([]*components.FileRenderList, len(msg.files))
+		m.dv.FileRenderers = make([]*components.FileRenderList, len(msg.files))
 		m.rebuildFilePathIndex()
 		m.dv.FilesListLoaded = true
 
@@ -504,7 +504,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		// Re-format visible files to include new comments.
 		if m.dv.FilesHighlighted > 0 {
 			for i := 0; i < len(m.dv.Files); i++ {
-				if m.dv.FileRenderLists[i] != nil {
+				if m.dv.FileRenderers[i] != nil {
 					m.dv.FormatFile(i)
 				}
 			}
@@ -736,6 +736,8 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 				savedOffset := m.dv.VP.YOffset()
 				m.rebuildContent()
 				m.dv.VP.SetYOffset(savedOffset)
+			} else {
+				m.rebuildContentIfChanged()
 			}
 		}
 		return m, cmd
@@ -756,6 +758,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 	// When searching, route all keys to the search handler.
 	if m.dv.Searching {
 		m.dv.HandleSearchKey(msg.String(), msg.Text)
+		m.rebuildContentIfChanged()
 		return m, nil, true
 	}
 
@@ -987,6 +990,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			}
 		}
 		if m.dv.HandleNavKey(msg.String()) == diffviewer.KeyHandled {
+			m.rebuildContentIfChanged()
 			return m, nil, true
 		}
 	case "enter":
@@ -1086,11 +1090,13 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 	case "n":
 		if !m.dv.Tree.Focused && m.dv.SearchPattern != nil && len(m.dv.SearchMatches) > 0 {
 			m.dv.SearchNext()
+			m.rebuildContentIfChanged()
 			return m, nil, true
 		}
 	case "N":
 		if !m.dv.Tree.Focused && m.dv.SearchPattern != nil && len(m.dv.SearchMatches) > 0 {
 			m.dv.SearchPrev()
+			m.rebuildContentIfChanged()
 			return m, nil, true
 		}
 	case "esc":
@@ -1115,6 +1121,8 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 				savedOffset := m.dv.VP.YOffset()
 				m.rebuildContent()
 				m.dv.VP.SetYOffset(savedOffset)
+			} else {
+				m.rebuildContentIfChanged()
 			}
 			return m, nil, true
 		}
@@ -1201,10 +1209,6 @@ func (m Model) View() string {
 		return ""
 	}
 	rightView := m.dv.VP.View()
-	if m.dv.CurrentFileIdx >= 0 {
-		rightView = m.dv.OverlaySearchMatches(rightView)
-		rightView = m.dv.OverlayDiffCursor(rightView)
-	}
 	view := m.renderLayout(rightView)
 	if m.dv.Searching {
 		view = m.dv.RenderSearchPopup(view, m.dv.Height)
@@ -1238,6 +1242,7 @@ func (m *Model) rebuildContent() {
 	if m.dv.SearchPattern != nil {
 		m.dv.RunSearch()
 	}
+	m.dv.ReconcileAndSync()
 	m.dv.RebuildContent(m.buildOverviewContent, m.buildFileContent)
 	m.updateCommentCounts()
 }
@@ -1247,6 +1252,7 @@ func (m *Model) rebuildContentIfChanged() {
 	if m.dv.SearchPattern != nil {
 		m.dv.RunSearch()
 	}
+	m.dv.ReconcileAndSync()
 	m.dv.RebuildContentIfChanged(m.buildOverviewContent, m.buildFileContent)
 	m.updateCommentCounts()
 }
@@ -1497,9 +1503,6 @@ func (m *Model) buildVirtualFileContent(idx, w int) string {
 
 	if m.dv.Composing && m.dv.HasDiffLines() {
 		rendered = m.insertCommentBox(rendered, idx)
-	} else {
-		m.dv.CommentBoxInsertPos = -1
-		m.dv.CommentBoxLines = 0
 	}
 
 	return rendered + "\n" + strings.Repeat("\n", m.dv.Height/2)
@@ -1804,10 +1807,10 @@ func (m Model) threadCommentCount() int {
 		return 0
 	}
 	idx := m.dv.CurrentFileIdx
-	if idx < 0 || idx >= len(m.dv.FileRenderLists) || m.dv.FileRenderLists[idx] == nil {
+	if idx < 0 || idx >= len(m.dv.FileRenderers) || m.dv.FileRenderers[idx] == nil {
 		return 0
 	}
-	return m.dv.FileRenderLists[idx].ThreadCommentCount(side, line)
+	return m.dv.FileRenderers[idx].ThreadCommentCount(side, line)
 }
 
 // threadInfoForDiffLine returns the line number and side for a comment thread
@@ -1835,10 +1838,10 @@ func (m Model) diffLineHasThread(diffLineIdx int) bool {
 		return false
 	}
 	idx := m.dv.CurrentFileIdx
-	if idx < 0 || idx >= len(m.dv.FileRenderLists) || m.dv.FileRenderLists[idx] == nil {
+	if idx < 0 || idx >= len(m.dv.FileRenderers) || m.dv.FileRenderers[idx] == nil {
 		return false
 	}
-	return m.dv.FileRenderLists[idx].FindThread(side, line) >= 0
+	return m.dv.FileRenderers[idx].FindThread(side, line) >= 0
 }
 
 // threadCommentCountAt returns the number of comments in the thread at the
@@ -1849,10 +1852,10 @@ func (m Model) threadCommentCountAt(diffLineIdx int) int {
 		return 0
 	}
 	idx := m.dv.CurrentFileIdx
-	if idx < 0 || idx >= len(m.dv.FileRenderLists) || m.dv.FileRenderLists[idx] == nil {
+	if idx < 0 || idx >= len(m.dv.FileRenderers) || m.dv.FileRenderers[idx] == nil {
 		return 0
 	}
-	return m.dv.FileRenderLists[idx].ThreadCommentCount(side, line)
+	return m.dv.FileRenderers[idx].ThreadCommentCount(side, line)
 }
 
 // prevNonHunkLine finds the previous non-hunk diff line before fromIdx.
@@ -1961,7 +1964,7 @@ func (m *Model) scrollToShowComment() {
 // scrollToThreadCursor scrolls the viewport to show the selected comment.
 func (m *Model) scrollToThreadCursor() {
 	idx := m.dv.CurrentFileIdx
-	if idx < 0 || idx >= len(m.dv.FileRenderLists) || m.dv.FileRenderLists[idx] == nil {
+	if idx < 0 || idx >= len(m.dv.FileRenderers) || m.dv.FileRenderers[idx] == nil {
 		return
 	}
 
@@ -1971,7 +1974,7 @@ func (m *Model) scrollToThreadCursor() {
 	}
 
 	rc := m.dv.RenderContextForFile(idx)
-	targetLine, _ := m.dv.FileRenderLists[idx].ThreadCommentOffset(side, line, m.dv.ThreadCursor-1, rc)
+	targetLine, _ := m.dv.FileRenderers[idx].ThreadCommentOffset(side, line, m.dv.ThreadCursor-1, rc)
 	if targetLine < 0 {
 		return
 	}
@@ -1995,7 +1998,7 @@ func (m *Model) scrollToThreadCursor() {
 // the currently selected comment (threadCursor). Returns (-1,-1) if unknown.
 func (m Model) currentCommentRange() (start, end int) {
 	idx := m.dv.CurrentFileIdx
-	if idx < 0 || idx >= len(m.dv.FileRenderLists) || m.dv.FileRenderLists[idx] == nil {
+	if idx < 0 || idx >= len(m.dv.FileRenderers) || m.dv.FileRenderers[idx] == nil {
 		return -1, -1
 	}
 	_, line, side, ok := m.cursorThreadInfo()
@@ -2005,7 +2008,7 @@ func (m Model) currentCommentRange() (start, end int) {
 
 	ci := m.dv.ThreadCursor - 1
 	rc := m.dv.RenderContextForFile(idx)
-	list := m.dv.FileRenderLists[idx]
+	list := m.dv.FileRenderers[idx]
 	offset, height := list.ThreadCommentOffset(side, line, ci, rc)
 	if offset < 0 {
 		return -1, -1
@@ -2310,8 +2313,6 @@ func (m *Model) insertCommentBox(rendered string, fileIdx int) string {
 		cursorRenderedLine = m.dv.FileDiffOffsets[fileIdx][m.dv.DiffCursor]
 	}
 	if cursorRenderedLine < 0 || cursorRenderedLine >= len(lines) {
-		m.dv.CommentBoxInsertPos = -1
-		m.dv.CommentBoxLines = 0
 		return rendered
 	}
 
@@ -2328,10 +2329,6 @@ func (m *Model) insertCommentBox(rendered string, fileIdx int) string {
 
 	inputBox := m.renderCommentBox()
 	inputLines := strings.Split(inputBox, "\n")
-
-	// Record insertion info so search overlay can adjust offsets.
-	m.dv.CommentBoxInsertPos = insertAt
-	m.dv.CommentBoxLines = len(inputLines)
 
 	after := make([]string, len(lines)-insertAt-1)
 	copy(after, lines[insertAt+1:])
@@ -2890,7 +2887,7 @@ func (m *Model) removeDiffLines(fileIdx, start, end int) {
 		m.dv.HighlightedFiles = append(m.dv.HighlightedFiles[:fileIdx], m.dv.HighlightedFiles[fileIdx+1:]...)
 		m.dv.RenderedFiles = append(m.dv.RenderedFiles[:fileIdx], m.dv.RenderedFiles[fileIdx+1:]...)
 		m.dv.FileDiffOffsets = append(m.dv.FileDiffOffsets[:fileIdx], m.dv.FileDiffOffsets[fileIdx+1:]...)
-		m.dv.FileRenderLists = append(m.dv.FileRenderLists[:fileIdx], m.dv.FileRenderLists[fileIdx+1:]...)
+		m.dv.FileRenderers = append(m.dv.FileRenderers[:fileIdx], m.dv.FileRenderers[fileIdx+1:]...)
 		m.dv.Tree.Files = m.dv.Files
 		m.dv.Tree.Entries = components.BuildFileTree(m.dv.Files)
 		m.dv.SelectionAnchor = -1

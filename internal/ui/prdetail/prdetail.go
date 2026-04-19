@@ -584,6 +584,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		// If the main viewport scrolled, sync the diff cursor within the current file.
 		if vp == &m.dv.VP && m.dv.VP.YOffset() != prevOffset && m.dv.CurrentFileIdx >= 0 {
 			m.dv.SyncDiffCursorToViewport()
+			m.rebuildContentIfChanged()
 		}
 		return m, cmd
 	}
@@ -603,6 +604,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 	// When searching, route all keys to the search handler.
 	if m.dv.Searching {
 		m.dv.HandleSearchKey(msg.String(), msg.Text)
+		m.rebuildContentIfChanged()
 		return m, nil, true
 	}
 
@@ -645,6 +647,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			return m, nil, false // let viewport scroll
 		}
 		if m.dv.HandleNavKey(msg.String()) == diffviewer.KeyHandled {
+			m.rebuildContentIfChanged()
 			return m, nil, true
 		}
 	case "enter":
@@ -670,15 +673,18 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 	case "n":
 		if !m.dv.Tree.Focused && m.dv.SearchPattern != nil && len(m.dv.SearchMatches) > 0 {
 			m.dv.SearchNext()
+			m.rebuildContentIfChanged()
 			return m, nil, true
 		}
 	case "N":
 		if !m.dv.Tree.Focused && m.dv.SearchPattern != nil && len(m.dv.SearchMatches) > 0 {
 			m.dv.SearchPrev()
+			m.rebuildContentIfChanged()
 			return m, nil, true
 		}
 	case "ctrl+d", "ctrl+u", "ctrl+f", "ctrl+b":
 		if m.dv.HandleNavKey(msg.String()) == diffviewer.KeyHandled {
+			m.rebuildContentIfChanged()
 			return m, nil, true
 		}
 	case "G":
@@ -692,6 +698,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 				m.dv.SyncDiffCursorToViewport()
 			}
 		}
+		m.rebuildContentIfChanged()
 		return m, nil, true
 	case "g":
 		if m.dv.WaitingG {
@@ -704,6 +711,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 					m.dv.SyncDiffCursorToViewport()
 				}
 			}
+			m.rebuildContentIfChanged()
 			return m, nil, true
 		}
 		m.dv.WaitingG = true
@@ -1431,7 +1439,17 @@ func (m *Model) rebuildContent() {
 	if m.dv.SearchPattern != nil {
 		m.dv.RunSearch()
 	}
+	m.dv.ReconcileAndSync()
 	m.dv.RebuildContent(m.buildOverviewContent, m.buildFileContent)
+}
+
+func (m *Model) rebuildContentIfChanged() {
+	m.dv.HelpLine = m.helpLine()
+	if m.dv.SearchPattern != nil {
+		m.dv.RunSearch()
+	}
+	m.dv.ReconcileAndSync()
+	m.dv.RebuildContentIfChanged(m.buildOverviewContent, m.buildFileContent)
 }
 
 // helpLine returns the contextual help text for the right-pane footer

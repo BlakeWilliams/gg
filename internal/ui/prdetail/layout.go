@@ -7,12 +7,8 @@ func (m Model) View() string {
 		return ""
 	}
 
-	// Right panel content with cursor overlay.
+	// Right panel content — highlights are baked into rendered lines.
 	rightView := m.dv.VP.View()
-	if m.dv.CurrentFileIdx >= 0 {
-		rightView = m.dv.OverlaySearchMatches(rightView)
-		rightView = m.dv.OverlayDiffCursor(rightView)
-	}
 
 	// Determine right panel title.
 	var rightTitle string

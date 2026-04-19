@@ -1,6 +1,7 @@
 package components
 
 import (
+	"regexp"
 	"strings"
 	"time"
 
@@ -16,6 +17,14 @@ type RenderContext struct {
 	ColW       int // gutter column width
 	RenderBody func(body string, width int, bg string) string
 	AnimFrame  int // animation frame (0-3) for running tool spinners
+
+	// Highlight state — passed through so DiffLineItem can apply highlights
+	// natively during rendering, eliminating post-hoc overlay string surgery.
+	CursorLine     int            // diff line index of cursor (-1 = none)
+	SelectionStart int            // diff line index of selection start (-1 = none)
+	SelectionEnd   int            // diff line index of selection end (-1 = none)
+	SearchPattern  *regexp.Regexp // compiled search pattern (nil = no search)
+	SearchMatches  map[int]int    // diffLineIdx -> 1-based match number
 }
 
 // RenderComment is the view-model for rendering a single comment in a thread.
@@ -77,6 +86,7 @@ type DiffLineItem struct {
 	content   string
 	lineCount int
 	width     int
+	dirty     bool // set by ReconcileHighlights when this item needs re-render
 }
 
 func NewDiffLineItem(idx int, dl *DiffLine) *DiffLineItem {
@@ -84,7 +94,7 @@ func NewDiffLineItem(idx int, dl *DiffLine) *DiffLineItem {
 }
 
 func (d *DiffLineItem) Render(rc RenderContext) string {
-	if d.width == rc.Width && d.content != "" {
+	if d.width == rc.Width && d.content != "" && !d.dirty {
 		return d.content
 	}
 	d.render(rc)
@@ -92,7 +102,7 @@ func (d *DiffLineItem) Render(rc RenderContext) string {
 }
 
 func (d *DiffLineItem) RenderedLineCount(rc RenderContext) int {
-	if d.width == rc.Width && d.content != "" {
+	if d.width == rc.Width && d.content != "" && !d.dirty {
 		return d.lineCount
 	}
 	d.render(rc)
@@ -116,11 +126,65 @@ func (d *DiffLineItem) render(rc RenderContext) {
 		d.width = rc.Width
 		return
 	}
+
+	rendered := d.DiffLine.Rendered
 	gutterW := TotalGutterWidth(rc.ColW)
-	segments := wrapRenderedLine(d.DiffLine.Rendered, rc.Width, d.DiffLine.Type, rc.Colors, gutterW)
+	colors := rc.Colors
+	idx := d.diffLineIdx
+
+	// Determine the effective bg for this line (used as restoreBg for search).
+	isCursor := rc.CursorLine >= 0 && idx == rc.CursorLine && rc.SelectionStart < 0
+	isSelected := rc.SelectionStart >= 0 && idx >= rc.SelectionStart && idx <= rc.SelectionEnd
+
+	// Skip hunk headers from cursor/selection highlighting.
+	if d.DiffLine.Type == LineHunk {
+		isCursor = false
+		isSelected = false
+	}
+
+	var effectiveBg string // for search restoreBg
+	var wrapBg string      // override for wrapRenderedLine (empty = derive from LineType)
+	if isCursor || isSelected {
+		// Apply cursor/selection bg: swap sign char, replace all bg codes.
+		rendered = ReplaceCursorSign(rendered)
+		var selBg string
+		switch d.DiffLine.Type {
+		case LineAdd:
+			selBg = colors.SelectedAddBg
+		case LineDel:
+			selBg = colors.SelectedDelBg
+		default:
+			selBg = colors.SelectedCtxBg
+		}
+		if selBg != "" {
+			rendered = ReplaceBackground(rendered, colors.AddBg, colors.DelBg, selBg)
+			effectiveBg = selBg
+			wrapBg = selBg
+		}
+	} else {
+		switch d.DiffLine.Type {
+		case LineAdd:
+			effectiveBg = colors.AddBg
+		case LineDel:
+			effectiveBg = colors.DelBg
+		default:
+			effectiveBg = "\033[49m"
+		}
+	}
+
+	// Apply search highlights.
+	if rc.SearchPattern != nil {
+		if _, ok := rc.SearchMatches[idx]; ok {
+			rendered = HighlightSearchSpans(rendered, d.DiffLine.Content, rc.SearchPattern, gutterW, colors.SearchMatchBg, colors.SearchMatchFg, effectiveBg)
+		}
+	}
+
+	segments := wrapRenderedLine(rendered, rc.Width, d.DiffLine.Type, rc.Colors, gutterW, wrapBg)
+
 	d.content = strings.Join(segments, "\n") + "\n"
 	d.lineCount = len(segments)
 	d.width = rc.Width
+	d.dirty = false
 }
 
 // ---------------------------------------------------------------------------
@@ -226,20 +290,185 @@ func (c *CommentThreadItem) render(rc RenderContext) {
 type FileRenderList struct {
 	Items []Renderable
 
-	// Cached full output — invalidated on any mutation.
-	cachedStr string
-	dirty     bool
+	// Fast lookup: diffLineIdx → *DiffLineItem.
+	diffLineMap map[int]*DiffLineItem
+
+	// Cached full output — invalidated when any item is dirty.
+	cachedStr     string
+	dirty         bool // structural change (items added/removed)
+	hasDirtyItems bool // at least one item needs re-render
+
+	// Last-rendered highlight state — used by ReconcileHighlights to diff
+	// current state against what was last rendered and dirty only the minimum
+	// set of items. Initialised to sentinel values so first reconcile dirties
+	// the correct initial set.
+	lastCursorLine  int
+	lastSelStart    int
+	lastSelEnd        int
+	lastSearchMatch   map[int]int // diffLineIdx -> match number
+	lastSearchPattern string // .String() of last search pattern (for regex change detection)
+	reconciled        bool   // false until first ReconcileHighlights call
+}
+
+// BuildDiffLineMap populates the fast diffLineIdx → *DiffLineItem index.
+// Must be called after Items is populated or modified.
+func (f *FileRenderList) BuildDiffLineMap() {
+	f.diffLineMap = make(map[int]*DiffLineItem, len(f.Items))
+	for _, item := range f.Items {
+		if dli, ok := item.(*DiffLineItem); ok {
+			f.diffLineMap[dli.diffLineIdx] = dli
+		}
+	}
+}
+
+// InvalidateLines marks specific diff lines as dirty so they re-render
+// on the next String() call. O(len(indices)) with map lookup.
+func (f *FileRenderList) InvalidateLines(indices ...int) {
+	for _, idx := range indices {
+		if dli, ok := f.diffLineMap[idx]; ok {
+			dli.dirty = true
+			f.hasDirtyItems = true
+		}
+	}
+}
+
+// ReconcileHighlights diffs the current RenderContext against the last-rendered
+// state and marks only the changed items dirty. Returns true if any items were
+// dirtied.
+func (f *FileRenderList) ReconcileHighlights(rc RenderContext) bool {
+	dirtied := false
+
+	// Derive the pattern key for comparison.
+	var patternKey string
+	if rc.SearchPattern != nil {
+		patternKey = rc.SearchPattern.String()
+	}
+
+	if !f.reconciled {
+		// First reconciliation — dirty everything that has highlights.
+		f.reconciled = true
+		if rc.CursorLine >= 0 {
+			f.InvalidateLines(rc.CursorLine)
+			dirtied = true
+		}
+		if rc.SelectionStart >= 0 {
+			for i := rc.SelectionStart; i <= rc.SelectionEnd; i++ {
+				f.InvalidateLines(i)
+			}
+			dirtied = true
+		}
+		for idx := range rc.SearchMatches {
+			f.InvalidateLines(idx)
+			dirtied = true
+		}
+		f.lastCursorLine = rc.CursorLine
+		f.lastSelStart = rc.SelectionStart
+		f.lastSelEnd = rc.SelectionEnd
+		f.lastSearchMatch = copyMatchMap(rc.SearchMatches)
+		f.lastSearchPattern = patternKey
+		return dirtied
+	}
+
+	// Cursor moved?
+	if rc.CursorLine != f.lastCursorLine {
+		if f.lastCursorLine >= 0 {
+			f.InvalidateLines(f.lastCursorLine)
+			dirtied = true
+		}
+		if rc.CursorLine >= 0 {
+			f.InvalidateLines(rc.CursorLine)
+			dirtied = true
+		}
+		f.lastCursorLine = rc.CursorLine
+	}
+
+	// Selection changed?
+	if rc.SelectionStart != f.lastSelStart || rc.SelectionEnd != f.lastSelEnd {
+		// Invalidate old range.
+		if f.lastSelStart >= 0 {
+			for i := f.lastSelStart; i <= f.lastSelEnd; i++ {
+				f.InvalidateLines(i)
+			}
+			dirtied = true
+		}
+		// Invalidate new range.
+		if rc.SelectionStart >= 0 {
+			for i := rc.SelectionStart; i <= rc.SelectionEnd; i++ {
+				f.InvalidateLines(i)
+			}
+			dirtied = true
+		}
+		f.lastSelStart = rc.SelectionStart
+		f.lastSelEnd = rc.SelectionEnd
+	}
+
+	// Search pattern changed? Even if match lines are the same, the inline
+	// highlights depend on the regex itself, so re-render all matched lines.
+	if patternKey != f.lastSearchPattern {
+		for idx := range f.lastSearchMatch {
+			f.InvalidateLines(idx)
+			dirtied = true
+		}
+		for idx := range rc.SearchMatches {
+			f.InvalidateLines(idx)
+			dirtied = true
+		}
+		f.lastSearchMatch = copyMatchMap(rc.SearchMatches)
+		f.lastSearchPattern = patternKey
+	} else if !matchMapsEqual(rc.SearchMatches, f.lastSearchMatch) {
+		// Same pattern but match set changed (e.g. file content updated).
+		for idx := range f.lastSearchMatch {
+			f.InvalidateLines(idx)
+			dirtied = true
+		}
+		for idx := range rc.SearchMatches {
+			f.InvalidateLines(idx)
+			dirtied = true
+		}
+		f.lastSearchMatch = copyMatchMap(rc.SearchMatches)
+	}
+
+	return dirtied
+}
+
+func copyMatchMap(m map[int]int) map[int]int {
+	if m == nil {
+		return nil
+	}
+	out := make(map[int]int, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func matchMapsEqual(a, b map[int]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // MarkDirty forces the next String() call to re-render all items.
 func (f *FileRenderList) MarkDirty() {
 	f.dirty = true
+	f.hasDirtyItems = true
 	f.cachedStr = ""
+}
+
+// IsDirty returns true if any item needs re-rendering.
+func (f *FileRenderList) IsDirty() bool {
+	return f.dirty || f.hasDirtyItems
 }
 
 // String returns the full rendered content for this file.
 func (f *FileRenderList) String(rc RenderContext) string {
-	if !f.dirty && f.cachedStr != "" {
+	if !f.dirty && !f.hasDirtyItems && f.cachedStr != "" {
 		return f.cachedStr
 	}
 	var b strings.Builder
@@ -248,6 +477,7 @@ func (f *FileRenderList) String(rc RenderContext) string {
 	}
 	f.cachedStr = strings.TrimRight(b.String(), "\n")
 	f.dirty = false
+	f.hasDirtyItems = false
 	return f.cachedStr
 }
 
@@ -312,7 +542,9 @@ func (f *FileRenderList) InsertAfterDiffLine(diffLineIdx int, items ...Renderabl
 	newItems = append(newItems, f.Items[insertAt:]...)
 	f.Items = newItems
 	f.dirty = true
+	f.hasDirtyItems = true
 	f.cachedStr = ""
+	f.BuildDiffLineMap()
 }
 
 // ReplaceThread finds an existing comment thread for the given side+line and
@@ -323,6 +555,7 @@ func (f *FileRenderList) ReplaceThread(side string, line int, replacement Render
 		if s == side && l == line {
 			f.Items[i] = replacement
 			f.dirty = true
+			f.hasDirtyItems = true
 			f.cachedStr = ""
 			return true
 		}
@@ -337,6 +570,7 @@ func (f *FileRenderList) RemoveThread(side string, line int) bool {
 		if s == side && l == line {
 			f.Items = append(f.Items[:i], f.Items[i+1:]...)
 			f.dirty = true
+			f.hasDirtyItems = true
 			f.cachedStr = ""
 			return true
 		}
@@ -350,7 +584,10 @@ func (f *FileRenderList) InvalidateAll() {
 		item.Invalidate()
 	}
 	f.dirty = true
+	f.hasDirtyItems = true
 	f.cachedStr = ""
+	// Reset reconciliation state so next reconcile re-evaluates everything.
+	f.reconciled = false
 }
 
 // ItemAtLine returns the item containing the given visual line and the
