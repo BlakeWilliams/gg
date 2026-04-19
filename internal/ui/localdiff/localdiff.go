@@ -711,20 +711,18 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		var cmd tea.Cmd
 		m.dv.VP, cmd = m.dv.VP.Update(msg)
 		if m.dv.VP.YOffset() != prevOffset && m.dv.CurrentFileIdx >= 0 {
-			hadThread := m.dv.ThreadCursor > 0
-			if hadThread {
+			oldTC := m.dv.ThreadCursor
+			if oldTC > 0 {
 				m.dv.ClearThreadHighlight()
 			}
-			prevCursor := m.dv.DiffCursor
 			m.dv.SyncDiffCursorToViewport()
-			if m.dv.DiffCursor != prevCursor && !m.dv.Tree.Focused && m.dv.HasDiffLines() && m.diffLineHasThread(m.dv.DiffCursor) {
-				scrollDown := m.dv.VP.YOffset() > prevOffset
-				if scrollDown {
-					m.autoEnterThread(1)
-				} else {
-					m.autoEnterThread(m.threadCommentCountAt(m.dv.DiffCursor))
-				}
-			} else if hadThread {
+			tc := m.dv.SnapThreadComment
+			if tc > 0 && !m.dv.Tree.Focused && m.dv.HasDiffLines() {
+				m.dv.ThreadCursor = tc
+				m.dv.SelectionAnchor = -1
+				m.updateThreadHighlight()
+			}
+			if oldTC > 0 || m.dv.ThreadCursor > 0 {
 				m.rebuildContent()
 			}
 		}
@@ -785,82 +783,52 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			}
 			return m, nil, true
 		case "ctrl+d":
-			count := m.threadCommentCount()
-			if m.dv.ThreadCursor < count {
-				m.dv.ThreadCursor = count
+			// Exit thread, scroll half page down, re-enter if new position has a thread.
+			m.dv.ClearThreadHighlight()
+			m.dv.ScrollAndSyncCursor(m.dv.Height / 2)
+			tc := m.dv.SnapThreadComment
+			if tc > 0 {
+				m.dv.ThreadCursor = tc
+				m.dv.SelectionAnchor = -1
 				m.updateThreadHighlight()
-				m.rebuildContent()
-				m.scrollToShowComment()
-			} else {
-				// Already at last comment → exit thread, scroll half page.
-				prevCursor := m.dv.DiffCursor
-				m.dv.ThreadCursor = 0
-				m.updateThreadHighlight()
-				m.dv.ScrollAndSyncCursor(m.dv.Height / 2)
-				if m.dv.DiffCursor != prevCursor && m.diffLineHasThread(m.dv.DiffCursor) {
-					m.autoEnterThread(1)
-				} else {
-					m.rebuildContent()
-				}
 			}
+			m.rebuildContent()
 			return m, nil, true
 		case "ctrl+u":
-			if m.dv.ThreadCursor > 1 {
-				m.dv.ThreadCursor = 1
+			// Exit thread, scroll half page up, re-enter if new position has a thread.
+			m.dv.ClearThreadHighlight()
+			m.dv.ScrollAndSyncCursor(-m.dv.Height / 2)
+			tc := m.dv.SnapThreadComment
+			if tc > 0 {
+				m.dv.ThreadCursor = tc
+				m.dv.SelectionAnchor = -1
 				m.updateThreadHighlight()
-				m.rebuildContent()
-				m.scrollToShowComment()
-			} else {
-				// Already at first comment → exit thread, scroll half page up.
-				prevCursor := m.dv.DiffCursor
-				m.dv.ThreadCursor = 0
-				m.updateThreadHighlight()
-				m.dv.ScrollAndSyncCursor(-m.dv.Height / 2)
-				if m.dv.DiffCursor != prevCursor && m.diffLineHasThread(m.dv.DiffCursor) {
-					m.autoEnterThread(m.threadCommentCountAt(m.dv.DiffCursor))
-				} else {
-					m.rebuildContent()
-				}
 			}
+			m.rebuildContent()
 			return m, nil, true
 		case "ctrl+f":
-			count := m.threadCommentCount()
-			if m.dv.ThreadCursor < count {
-				m.dv.ThreadCursor = count
+			// Exit thread, scroll full page down, re-enter if new position has a thread.
+			m.dv.ClearThreadHighlight()
+			m.dv.ScrollAndSyncCursor(m.dv.Height)
+			tc := m.dv.SnapThreadComment
+			if tc > 0 {
+				m.dv.ThreadCursor = tc
+				m.dv.SelectionAnchor = -1
 				m.updateThreadHighlight()
-				m.rebuildContent()
-				m.scrollToShowComment()
-			} else {
-				// Already at last comment → exit thread, scroll full page.
-				prevCursor := m.dv.DiffCursor
-				m.dv.ThreadCursor = 0
-				m.updateThreadHighlight()
-				m.dv.ScrollAndSyncCursor(m.dv.Height)
-				if m.dv.DiffCursor != prevCursor && m.diffLineHasThread(m.dv.DiffCursor) {
-					m.autoEnterThread(1)
-				} else {
-					m.rebuildContent()
-				}
 			}
+			m.rebuildContent()
 			return m, nil, true
 		case "ctrl+b":
-			if m.dv.ThreadCursor > 1 {
-				m.dv.ThreadCursor = 1
+			// Exit thread, scroll full page up, re-enter if new position has a thread.
+			m.dv.ClearThreadHighlight()
+			m.dv.ScrollAndSyncCursor(-m.dv.Height)
+			tc := m.dv.SnapThreadComment
+			if tc > 0 {
+				m.dv.ThreadCursor = tc
+				m.dv.SelectionAnchor = -1
 				m.updateThreadHighlight()
-				m.rebuildContent()
-				m.scrollToShowComment()
-			} else {
-				// Already at first comment → exit thread, scroll full page up.
-				prevCursor := m.dv.DiffCursor
-				m.dv.ThreadCursor = 0
-				m.updateThreadHighlight()
-				m.dv.ScrollAndSyncCursor(-m.dv.Height)
-				if m.dv.DiffCursor != prevCursor && m.diffLineHasThread(m.dv.DiffCursor) {
-					m.autoEnterThread(m.threadCommentCountAt(m.dv.DiffCursor))
-				} else {
-					m.rebuildContent()
-				}
 			}
+			m.rebuildContent()
 			return m, nil, true
 		case "G":
 			count := m.threadCommentCount()
@@ -907,6 +875,18 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			m.rebuildContent()
 			m.dv.ScrollToDiffCursor()
 			return m, nil, true
+		case "ctrl+k":
+			m.dv.ThreadCursor = 0
+			m.updateThreadHighlight()
+			m.dv.Tree.MoveSelection(-1)
+			cmd := m.selectTreeEntry()
+			return m, cmd, true
+		case "ctrl+j":
+			m.dv.ThreadCursor = 0
+			m.updateThreadHighlight()
+			m.dv.Tree.MoveSelection(1)
+			cmd := m.selectTreeEntry()
+			return m, cmd, true
 		}
 		// Let unrecognized keys (ctrl+p, :, ?, etc.) fall through to global shortcuts.
 		return m, nil, false
@@ -1072,15 +1052,19 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			}
 		}
 	case "ctrl+d", "ctrl+u", "ctrl+f", "ctrl+b", "G", "g":
-		prevCursor := m.dv.DiffCursor
+		oldTC := m.dv.ThreadCursor
+		if oldTC > 0 {
+			m.dv.ClearThreadHighlight()
+		}
 		if m.dv.HandleNavKey(msg.String()) == diffviewer.KeyHandled {
-			if m.dv.DiffCursor != prevCursor && !m.dv.Tree.Focused && m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() && m.diffLineHasThread(m.dv.DiffCursor) {
-				scrollDown := msg.String() == "ctrl+d" || msg.String() == "ctrl+f" || msg.String() == "G"
-				if scrollDown {
-					m.autoEnterThread(1)
-				} else {
-					m.autoEnterThread(m.threadCommentCountAt(m.dv.DiffCursor))
-				}
+			tc := m.dv.SnapThreadComment
+			if tc > 0 && !m.dv.Tree.Focused && m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
+				m.dv.ThreadCursor = tc
+				m.dv.SelectionAnchor = -1
+				m.updateThreadHighlight()
+			}
+			if oldTC > 0 || m.dv.ThreadCursor > 0 {
+				m.rebuildContent()
 			}
 			return m, nil, true
 		}
@@ -1773,16 +1757,6 @@ func (m *Model) enterThread(commentIdx int) {
 	m.markCurrentThreadRead()
 }
 
-// autoEnterThread enters thread mode from a scroll operation. Unlike enterThread,
-// it does NOT adjust the viewport scroll (to avoid fighting mouse/trackpad scroll)
-// and does NOT mark the thread as read (passive scroll shouldn't clear unread state).
-func (m *Model) autoEnterThread(commentIdx int) {
-	m.dv.SelectionAnchor = -1
-	m.dv.ThreadCursor = commentIdx
-	m.updateThreadHighlight()
-	m.rebuildContent()
-}
-
 // focusedOnCopilotPending returns true if the user's thread cursor is on a
 // comment thread that has an active copilot pending reply.
 func (m Model) focusedOnCopilotPending() bool {
@@ -1815,9 +1789,10 @@ func (m *Model) cancelFocusedCopilotReply() {
 
 const scrollMargin = 5
 
-// scrollToShowComment ensures the selected comment is maximally visible.
-// If it fits in the viewport, positions it fully visible (prefers top-aligned).
-// If too tall, shows from the top.
+// scrollToShowComment scrolls the viewport to keep the selected comment visible.
+// For comments that fit in the viewport, ensures it's fully visible within
+// scroll margins. For tall comments, only scrolls if the start is off-screen
+// (no aggressive snap-to-top).
 func (m *Model) scrollToShowComment() {
 	start, end := m.currentCommentRange()
 	if start < 0 {
@@ -1834,7 +1809,7 @@ func (m *Model) scrollToShowComment() {
 	}
 
 	if commentH <= usable {
-		// Comment fits — ensure it's fully visible.
+		// Comment fits — ensure it's fully visible within margins.
 		if start < top+scrollMargin {
 			target := start - scrollMargin
 			if target < 0 {
@@ -1845,12 +1820,16 @@ func (m *Model) scrollToShowComment() {
 			m.dv.VP.SetYOffset(end - vpH + scrollMargin + 1)
 		}
 	} else {
-		// Comment taller than viewport — show from the top.
-		target := start - scrollMargin
-		if target < 0 {
-			target = 0
+		// Comment taller than viewport — only scroll if start is off-screen.
+		if start < top+scrollMargin {
+			target := start - scrollMargin
+			if target < 0 {
+				target = 0
+			}
+			m.dv.VP.SetYOffset(target)
+		} else if start > bottom-scrollMargin {
+			m.dv.VP.SetYOffset(start - scrollMargin)
 		}
-		m.dv.VP.SetYOffset(target)
 	}
 }
 
