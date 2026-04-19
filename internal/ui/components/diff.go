@@ -68,13 +68,11 @@ var (
 	borderStyle   = lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
 )
 
-// CommentPosition records the rendered line offset for a comment in a thread.
+// CommentPosition records the location of a comment in a thread.
 type CommentPosition struct {
 	Line      int    // diff line number (source)
 	Side      string // "LEFT" or "RIGHT"
 	Idx       int    // 0-based index within the thread
-	Offset    int    // rendered line index where this comment's header starts
-	Height    int    // rendered line count for this comment
 	CommentID int    // comment ID for read/unread tracking
 }
 

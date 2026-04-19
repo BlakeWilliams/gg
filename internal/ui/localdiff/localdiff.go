@@ -366,7 +366,6 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		m.dv.RenderedFiles = make([]string, len(msg.files))
 		m.dv.FileDiffs = make([][]components.DiffLine, len(msg.files))
 		m.dv.FileDiffOffsets = make([][]int, len(msg.files))
-		m.dv.FileCommentPositions = make([][]components.CommentPosition, len(msg.files))
 		m.dv.FileRenderLists = make([]*components.FileRenderList, len(msg.files))
 		m.rebuildFilePathIndex()
 		m.dv.FilesListLoaded = true
@@ -693,8 +692,6 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		m.dv.VP, cmd = m.dv.VP.Update(msg)
 		if m.dv.VP.YOffset() != prevOffset && m.dv.CurrentFileIdx >= 0 {
 			m.dv.SyncDiffCursorToViewport()
-			m.markVisibleCommentsRead()
-			m.updateCommentCounts()
 		}
 		return m, cmd
 	}
@@ -822,8 +819,6 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		return m, cmd, true
 	case "j", "down", "k", "up", "J", "shift+down", "K", "shift+up":
 		if m.dv.HandleNavKey(msg.String()) == diffviewer.KeyHandled {
-			m.markVisibleCommentsRead()
-			m.updateCommentCounts()
 			return m, nil, true
 		}
 	case "enter":
@@ -846,6 +841,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			m.updateThreadHighlight() // add highlight
 			m.rebuildContent()
 			m.scrollToThreadCursor()
+			m.markCurrentThreadRead()
 			return m, nil, true
 		}
 		// Otherwise open comment input.
@@ -1125,44 +1121,22 @@ func (m *Model) updateCommentCounts() {
 	m.dv.Tree.FileUnreadCounts = unread
 }
 
-// markVisibleCommentsRead checks which comment threads are visible in the viewport
-// and marks them as read in the read state (keyed by thread root ID).
-func (m *Model) markVisibleCommentsRead() {
-	if m.readState == nil || !m.dv.VPReady {
+// markCurrentThreadRead marks the thread at the cursor as read.
+func (m *Model) markCurrentThreadRead() {
+	if m.readState == nil {
 		return
 	}
-	idx := m.dv.CurrentFileIdx
-	if idx < 0 || idx >= len(m.dv.FileCommentPositions) {
+	path, line, side, ok := m.cursorThreadInfo()
+	if !ok {
 		return
 	}
-	vpTop := m.dv.VP.YOffset()
-	vpBot := vpTop + m.dv.ViewportHeight()
-
-	// Collect visible thread roots. CommentPositions are grouped by thread;
-	// the first entry (Idx==0) in each thread is the root.
-	visibleRoots := map[int]bool{}
-	var currentRoot int
-	for _, cp := range m.dv.FileCommentPositions[idx] {
-		if cp.CommentID == 0 {
-			continue
-		}
-		if cp.Idx == 0 {
-			currentRoot = cp.CommentID
-		}
-		cpBot := cp.Offset + cp.Height
-		if cpBot > vpTop && cp.Offset < vpBot {
-			visibleRoots[currentRoot] = true
-		}
+	rootID := m.commentStore.FindThreadRoot(path, line, side)
+	if rootID == "" {
+		return
 	}
-
-	dirty := false
-	for rootID := range visibleRoots {
-		m.readState.MarkReadInt(rootID)
-		dirty = true
-	}
-	if dirty {
-		m.readState.Save()
-	}
+	m.readState.MarkReadInt(comments.IDToInt(rootID))
+	m.readState.Save()
+	m.updateCommentCounts()
 }
 
 func (m Model) buildOverviewContent(w int) string {
@@ -1491,8 +1465,7 @@ func (m *Model) selectTreeEntry() tea.Cmd {
 	}
 	m.rebuildContent()
 	m.dv.ScrollToDiffCursor()
-	m.markVisibleCommentsRead()
-	m.updateCommentCounts()
+	m.markCurrentThreadRead()
 	m.saveViewState()
 	return nil
 }
@@ -1541,50 +1514,34 @@ func (m *Model) goToSourceLine(lineNo int) {
 // threadCommentCount returns the number of comments in the thread on the
 // current cursor line, consistent with what's actually rendered.
 func (m Model) threadCommentCount() int {
-	path, line, side, ok := m.cursorThreadInfo()
+	_, line, side, ok := m.cursorThreadInfo()
 	if !ok {
 		return 0
 	}
 	idx := m.dv.CurrentFileIdx
-	if idx < 0 || idx >= len(m.dv.FileCommentPositions) {
+	if idx < 0 || idx >= len(m.dv.FileRenderLists) || m.dv.FileRenderLists[idx] == nil {
 		return 0
 	}
-	// Count from the rendered comment positions — this is the source of truth.
-	count := 0
-	for _, cp := range m.dv.FileCommentPositions[idx] {
-		if cp.Line == line && cp.Side == side {
-			count++
-		}
-	}
-	_ = path
-	return count
+	return m.dv.FileRenderLists[idx].ThreadCommentCount(side, line)
 }
 
 const scrollMargin = 5
 
-// scrollToThreadCursor scrolls the viewport to show the selected comment
-// using the exact rendered positions tracked by CommentPositions.
+// scrollToThreadCursor scrolls the viewport to show the selected comment.
 func (m *Model) scrollToThreadCursor() {
 	idx := m.dv.CurrentFileIdx
-	if idx < 0 || idx >= len(m.dv.FileCommentPositions) {
+	if idx < 0 || idx >= len(m.dv.FileRenderLists) || m.dv.FileRenderLists[idx] == nil {
 		return
 	}
 
-	// Find the comment position matching the current cursor line and threadCursor.
-	path, line, side, ok := m.cursorThreadInfo()
+	_, line, side, ok := m.cursorThreadInfo()
 	if !ok {
 		return
 	}
 
-	targetLine := -1
-	for _, cp := range m.dv.FileCommentPositions[idx] {
-		if cp.Line == line && cp.Side == side && cp.Idx == m.dv.ThreadCursor-1 {
-			targetLine = cp.Offset
-			break
-		}
-	}
+	rc := m.dv.RenderContextForFile(idx)
+	targetLine, _ := m.dv.FileRenderLists[idx].ThreadCommentOffset(side, line, m.dv.ThreadCursor-1, rc)
 	if targetLine < 0 {
-		_ = path // suppress unused
 		return
 	}
 
@@ -1607,7 +1564,7 @@ func (m *Model) scrollToThreadCursor() {
 // the currently selected comment (threadCursor). Returns (-1,-1) if unknown.
 func (m Model) currentCommentRange() (start, end int) {
 	idx := m.dv.CurrentFileIdx
-	if idx < 0 || idx >= len(m.dv.FileCommentPositions) {
+	if idx < 0 || idx >= len(m.dv.FileRenderLists) || m.dv.FileRenderLists[idx] == nil {
 		return -1, -1
 	}
 	_, line, side, ok := m.cursorThreadInfo()
@@ -1615,34 +1572,14 @@ func (m Model) currentCommentRange() (start, end int) {
 		return -1, -1
 	}
 
-	// Find all positions for this thread.
-	var threadPositions []components.CommentPosition
-	for _, cp := range m.dv.FileCommentPositions[idx] {
-		if cp.Line == line && cp.Side == side {
-			threadPositions = append(threadPositions, cp)
-		}
-	}
-
 	ci := m.dv.ThreadCursor - 1
-	if ci < 0 || ci >= len(threadPositions) {
+	rc := m.dv.RenderContextForFile(idx)
+	list := m.dv.FileRenderLists[idx]
+	offset, height := list.ThreadCommentOffset(side, line, ci, rc)
+	if offset < 0 {
 		return -1, -1
 	}
-
-	start = threadPositions[ci].Offset
-	// End is the next comment's start, or estimate from the next diff line.
-	if ci+1 < len(threadPositions) {
-		end = threadPositions[ci+1].Offset - 1
-	} else {
-		// Last comment in thread — find where the thread ends.
-		// Use the next diff line's offset as the boundary.
-		if m.dv.DiffCursor+1 < len(m.dv.FileDiffOffsets[idx]) {
-			end = m.dv.FileDiffOffsets[idx][m.dv.DiffCursor+1] - 1
-		} else {
-			// Last diff line — estimate generously.
-			end = start + 50
-		}
-	}
-	return start, end
+	return offset, offset + height - 1
 }
 
 // commentExtendsBelow returns true if the selected comment's body extends
@@ -2485,7 +2422,7 @@ func (m *Model) removeDiffLines(fileIdx, start, end int) {
 		m.dv.HighlightedFiles = append(m.dv.HighlightedFiles[:fileIdx], m.dv.HighlightedFiles[fileIdx+1:]...)
 		m.dv.RenderedFiles = append(m.dv.RenderedFiles[:fileIdx], m.dv.RenderedFiles[fileIdx+1:]...)
 		m.dv.FileDiffOffsets = append(m.dv.FileDiffOffsets[:fileIdx], m.dv.FileDiffOffsets[fileIdx+1:]...)
-		m.dv.FileCommentPositions = append(m.dv.FileCommentPositions[:fileIdx], m.dv.FileCommentPositions[fileIdx+1:]...)
+		m.dv.FileRenderLists = append(m.dv.FileRenderLists[:fileIdx], m.dv.FileRenderLists[fileIdx+1:]...)
 		m.dv.Tree.Files = m.dv.Files
 		m.dv.Tree.Entries = components.BuildFileTree(m.dv.Files)
 		m.dv.SelectionAnchor = -1

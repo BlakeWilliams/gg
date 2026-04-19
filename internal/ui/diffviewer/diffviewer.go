@@ -54,7 +54,6 @@ type DiffViewer struct {
 	RenderedFiles        []string
 	FileDiffs            [][]components.DiffLine
 	FileDiffOffsets      [][]int
-	FileCommentPositions [][]components.CommentPosition
 	FilesHighlighted     int
 	FilesLoading         bool
 	FilesListLoaded      bool
@@ -830,6 +829,11 @@ func (d *DiffViewer) renderContext(diffLines []components.DiffLine) components.R
 	}
 }
 
+// RenderContextForFile returns a RenderContext for the given file index.
+func (d *DiffViewer) RenderContextForFile(index int) components.RenderContext {
+	return d.renderContext(d.FileDiffs[index])
+}
+
 // CommentsForFile gathers base comments for a file from the CommentSource.
 // Does not include pending copilot comments — use CopilotState.PendingRenderComments
 // for those (they carry block data that can't be expressed as ReviewComment).
@@ -850,7 +854,7 @@ func (d DiffViewer) blocksForFile(filename string) map[int][]comments.ContentBlo
 	return nil
 }
 
-// syncFromRenderList derives RenderedFiles, FileDiffOffsets, and FileCommentPositions
+// syncFromRenderList derives RenderedFiles and FileDiffOffsets
 // from the render list for the given file index.
 func (d *DiffViewer) syncFromRenderList(index int, rc components.RenderContext) {
 	list := d.FileRenderLists[index]
@@ -860,9 +864,6 @@ func (d *DiffViewer) syncFromRenderList(index int, rc components.RenderContext) 
 	if index < len(d.FileDiffOffsets) {
 		numDiffLines := len(d.FileDiffs[index])
 		d.FileDiffOffsets[index] = list.DiffLineOffsets(numDiffLines, rc)
-	}
-	if index < len(d.FileCommentPositions) {
-		d.FileCommentPositions[index] = list.CommentPositions(rc)
 	}
 }
 
@@ -1162,7 +1163,6 @@ func (d *DiffViewer) InitFileSlices(n int) {
 	d.RenderedFiles = make([]string, n)
 	d.FileDiffs = make([][]components.DiffLine, n)
 	d.FileDiffOffsets = make([][]int, n)
-	d.FileCommentPositions = make([][]components.CommentPosition, n)
 	d.FileRenderLists = make([]*components.FileRenderList, n)
 }
 

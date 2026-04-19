@@ -363,9 +363,6 @@ func TestBuildRenderList_OutputStructure(t *testing.T) {
 	if positions[0].Line != 2 || positions[0].Side != "RIGHT" {
 		t.Errorf("unexpected position: line=%d side=%s", positions[0].Line, positions[0].Side)
 	}
-	if positions[0].Offset <= 0 || positions[0].Offset >= len(resultLines) {
-		t.Errorf("comment offset %d out of range (content has %d lines)", positions[0].Offset, len(resultLines))
-	}
 }
 
 func TestToolGroupRendering(t *testing.T) {

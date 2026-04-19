@@ -240,7 +240,7 @@ func RenderFileTree(entries []FileTreeEntry, files []github.PullRequestFile, cur
 				badgeW := lipgloss.Width(badgeRendered)
 				lineW := lipgloss.Width(line)
 				gap := width - lineW - badgeW - 1 // 1 col right margin
-				if gap > 0 {
+				if gap >= 0 {
 					line = line + strings.Repeat(" ", gap) + badgeRendered
 				}
 			}
