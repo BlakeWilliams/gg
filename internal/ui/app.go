@@ -662,7 +662,7 @@ func (m Model) openCommitFlow(action string) (tea.Model, tea.Cmd) {
 		modalH = 12
 	}
 
-	m.commitModel = commit.New(m.chatClient, commitAction, m.repoRoot, branch, m.ctx.Config.CommitPrompt, modalW, modalH)
+	m.commitModel = commit.New(m.chatClient, commitAction, m.repoRoot, branch, "", modalW, modalH)
 	m.mode = modeCommit
 	return m, m.commitModel.Init()
 }
@@ -695,7 +695,7 @@ func (m Model) renderCommitOverlay(bg string, bgHeight int) string {
 	}
 
 	bc := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
-	titleStr := " " + lipgloss.NewStyle().Bold(true).Render("Commit") + " "
+	titleStr := " " + lipgloss.NewStyle().Bold(true).Render(m.commitModel.Title()) + " "
 	titleW := lipgloss.Width(titleStr)
 	fillW := modalW - 3 - titleW
 	if fillW < 0 {

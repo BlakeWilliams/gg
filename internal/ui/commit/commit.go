@@ -2,14 +2,16 @@ package commit
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 	"time"
 
-	"github.com/blakewilliams/gg/internal/git"
-	"github.com/blakewilliams/gg/internal/review/agents"
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/blakewilliams/gg/internal/git"
+	"github.com/blakewilliams/gg/internal/review/agents"
 )
 
 // Action describes what to do after the commit.
@@ -42,11 +44,26 @@ type CancelMsg struct{}
 // ErrorMsg is sent when a git operation fails.
 type ErrorMsg struct{ Err error }
 
+// editorDoneMsg is sent when the external editor finishes.
+type editorDoneMsg struct {
+	content string
+	err     error
+}
+
 type tickMsg struct{}
 
 type execResultMsg struct {
 	err error
 }
+
+// phase tracks where we are in the commit flow.
+type phase int
+
+const (
+	phaseGenerating phase = iota
+	phaseEditing
+	phaseExecuting
+)
 
 // Model is the commit flow overlay.
 type Model struct {
@@ -59,17 +76,12 @@ type Model struct {
 	width        int
 	height       int
 
-	// Streaming state.
-	streaming  bool
-	message    strings.Builder
+	// Flow state.
+	phase      phase
+	message    *strings.Builder
 	spinnerIdx int
-	done       bool
 	genErr     error
-
-	// Execution state.
-	executing    bool
-	execStep     string
-	execErr      error
+	execErr    error
 }
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -77,9 +89,11 @@ var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 // New creates a new commit flow model.
 func New(client *agents.Client, action Action, repoRoot, branch string, commitPrompt string, width, height int) Model {
 	ta := textarea.New()
-	ta.SetWidth(width - 4)
-	ta.SetHeight(height/2 - 2)
+	ta.SetWidth(width - 6)
+	ta.SetHeight(3)
 	ta.CharLimit = 0
+	ta.ShowLineNumbers = false
+	ta.Prompt = ""
 	ta.Placeholder = "Commit message..."
 
 	return Model{
@@ -91,12 +105,41 @@ func New(client *agents.Client, action Action, repoRoot, branch string, commitPr
 		input:        ta,
 		width:        width,
 		height:       height,
+		message:      &strings.Builder{},
+		phase:        phaseGenerating,
 	}
+}
+
+// maxTextareaHeight returns the max textarea rows that keep the modal
+// within 4 rows of vertical padding on each side.
+// Chrome = border top + blank line above textarea + blank line below + help line + border bottom = 5
+func (m Model) maxTextareaHeight() int {
+	h := m.height - 8 - 5
+	if h < 3 {
+		h = 3
+	}
+	return h
+}
+
+func (m *Model) resizeTextarea() {
+	lines := strings.Count(m.input.Value(), "\n") + 1
+	if lines < 3 {
+		lines = 3
+	}
+	max := m.maxTextareaHeight()
+	if lines > max {
+		lines = max
+	}
+	m.input.SetHeight(lines)
+}
+
+// Title returns the overlay title based on the action.
+func (m Model) Title() string {
+	return m.action.String()
 }
 
 // Init starts the commit message generation.
 func (m Model) Init() tea.Cmd {
-	m.streaming = true
 	return tea.Batch(
 		m.generateMessage(),
 		tea.Tick(150*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} }),
@@ -106,7 +149,10 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
-		if m.executing {
+		if m.phase == phaseExecuting || m.phase == phaseGenerating {
+			if msg.String() == "esc" {
+				return m, func() tea.Msg { return CancelMsg{} }
+			}
 			return m, nil
 		}
 
@@ -114,56 +160,67 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		case "esc":
 			return m, func() tea.Msg { return CancelMsg{} }
 		case "ctrl+s":
-			if m.streaming || m.executing {
-				return m, nil
-			}
 			body := strings.TrimSpace(m.input.Value())
 			if body == "" {
 				return m, nil
 			}
-			m.executing = true
-			return m, m.executeAction(body)
+			m.phase = phaseExecuting
+			m.execErr = nil
+			return m, tea.Batch(
+				m.executeAction(body),
+				tea.Tick(150*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} }),
+			)
+		case "ctrl+e":
+			return m, m.openEditor()
 		}
 
-		if !m.streaming {
-			var cmd tea.Cmd
-			m.input, cmd = m.input.Update(msg)
-			return m, cmd
-		}
-		return m, nil
+		var cmd tea.Cmd
+		m.input, cmd = m.input.Update(msg)
+		m.resizeTextarea()
+		return m, cmd
 
 	case tickMsg:
-		if m.streaming {
-			m.spinnerIdx = (m.spinnerIdx + 1) % len(spinnerFrames)
+		m.spinnerIdx = (m.spinnerIdx + 1) % len(spinnerFrames)
 
+		if m.phase == phaseGenerating {
 			if m.client != nil {
 				for _, ev := range m.client.Drain() {
 					m.handleEvent(ev)
 				}
 			}
 
-			if m.streaming {
+			if m.phase == phaseGenerating {
 				return m, tea.Tick(150*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
 			}
 			// Generation finished — populate the textarea.
-			m.input.SetValue(m.message.String())
-			m.input.Focus()
+			m.input.SetValue(strings.TrimSpace(m.message.String()))
+			m.resizeTextarea()
 			return m, m.input.Focus()
+		}
+		if m.phase == phaseExecuting {
+			return m, tea.Tick(150*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
 		}
 		return m, nil
 
+	case editorDoneMsg:
+		if msg.err == nil && msg.content != "" {
+			m.input.SetValue(msg.content)
+		}
+		m.resizeTextarea()
+		return m, m.input.Focus()
+
 	case execResultMsg:
 		if msg.err != nil {
-			m.executing = false
+			m.phase = phaseEditing
 			m.execErr = msg.err
-			return m, nil
+			return m, m.input.Focus()
 		}
 		return m, func() tea.Msg {
 			return DoneMsg{Summary: m.action.String() + " complete"}
 		}
 	}
 
-	if !m.streaming && !m.executing {
+	if m.phase == phaseEditing {
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
 		return m, cmd
@@ -178,10 +235,9 @@ func (m *Model) handleEvent(ev agents.AgentEvent) {
 			m.message.WriteString(p.Delta)
 		}
 	case agents.EventDone:
-		m.streaming = false
-		m.done = true
+		m.phase = phaseEditing
 	case agents.EventError:
-		m.streaming = false
+		m.phase = phaseEditing
 		if p, ok := ev.Payload.(agents.ErrorPayload); ok {
 			m.genErr = p.Err
 		}
@@ -196,17 +252,15 @@ func (m Model) generateMessage() tea.Cmd {
 		}
 	}
 
-	// Truncate very large diffs to avoid overwhelming the model.
 	if len(diff) > 30000 {
 		diff = diff[:30000] + "\n... (truncated)"
 	}
 
 	var prompt strings.Builder
-	prompt.WriteString("Generate a git commit message for the following staged changes. ")
-	prompt.WriteString("Use imperative mood. Write a concise title (max 72 chars) on the first line. ")
-	prompt.WriteString("If the changes warrant it, add a blank line followed by a brief body. ")
-	prompt.WriteString("Focus on the high-level why and how of the change, not file-by-file summaries. ")
-	prompt.WriteString("Output ONLY the commit message, no explanation.\n\n")
+	prompt.WriteString("Generate a git commit message for the following staged changes.\n")
+	prompt.WriteString("Format: a concise title (max 72 chars) on the first line, then a blank line, then a description.\n")
+	prompt.WriteString("Use imperative mood. Do not wrap the description. Focus on why, not what.\n")
+	prompt.WriteString("Output ONLY the commit message, no explanation or markdown fences.\n\n")
 	if m.commitPrompt != "" {
 		prompt.WriteString("Additional instructions: " + m.commitPrompt + "\n\n")
 	}
@@ -218,9 +272,41 @@ func (m Model) generateMessage() tea.Cmd {
 	return m.client.SendPrompt("commit-msg", prompt.String())
 }
 
+func (m Model) openEditor() tea.Cmd {
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "vim"
+	}
+
+	tmpFile, err := os.CreateTemp("", "gg-commit-*.md")
+	if err != nil {
+		return func() tea.Msg { return editorDoneMsg{err: err} }
+	}
+
+	if _, err := tmpFile.WriteString(m.input.Value()); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return func() tea.Msg { return editorDoneMsg{err: err} }
+	}
+	tmpFile.Close()
+
+	tmpPath := tmpFile.Name()
+	c := exec.Command(editor, tmpPath)
+	return tea.ExecProcess(c, func(err error) tea.Msg {
+		defer os.Remove(tmpPath)
+		if err != nil {
+			return editorDoneMsg{err: err}
+		}
+		content, readErr := os.ReadFile(tmpPath)
+		if readErr != nil {
+			return editorDoneMsg{err: readErr}
+		}
+		return editorDoneMsg{content: strings.TrimSpace(string(content))}
+	})
+}
+
 func (m Model) executeAction(message string) tea.Cmd {
 	return func() tea.Msg {
-		// Split message into title and body for PR creation.
 		title := message
 		body := ""
 		if idx := strings.Index(message, "\n"); idx >= 0 {
@@ -228,7 +314,6 @@ func (m Model) executeAction(message string) tea.Cmd {
 			body = strings.TrimSpace(message[idx+1:])
 		}
 
-		// Step 1: Commit
 		if err := git.Commit(m.repoRoot, message); err != nil {
 			return execResultMsg{err: fmt.Errorf("commit failed: %w", err)}
 		}
@@ -237,7 +322,6 @@ func (m Model) executeAction(message string) tea.Cmd {
 			return execResultMsg{}
 		}
 
-		// Step 2: Push
 		if err := git.Push(m.repoRoot); err != nil {
 			return execResultMsg{err: fmt.Errorf("push failed: %w", err)}
 		}
@@ -246,7 +330,6 @@ func (m Model) executeAction(message string) tea.Cmd {
 			return execResultMsg{}
 		}
 
-		// Step 3: Open PR
 		if err := git.CreatePR(m.repoRoot, title, body); err != nil {
 			return execResultMsg{err: fmt.Errorf("PR creation failed: %w", err)}
 		}
@@ -255,38 +338,41 @@ func (m Model) executeAction(message string) tea.Cmd {
 	}
 }
 
-// View renders the commit overlay.
+// View renders the commit overlay content.
 func (m Model) View() string {
 	var b strings.Builder
 
-	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.BrightWhite)
 	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack)
 	errStyle := lipgloss.NewStyle().Foreground(lipgloss.Red)
 
-	b.WriteString(titleStyle.Render("  "+m.action.String()) + "\n")
-	b.WriteString(dimStyle.Render("  "+m.branch) + "\n\n")
-
-	if m.streaming {
+	switch m.phase {
+	case phaseGenerating:
 		spinner := spinnerFrames[m.spinnerIdx]
-		b.WriteString(dimStyle.Render("  "+spinner+" Generating commit message...") + "\n\n")
-		// Show what's been generated so far.
+		b.WriteString("\n")
+		b.WriteString(dimStyle.Render("  "+spinner+" Generating commit message...") + "\n")
 		if m.message.Len() > 0 {
+			b.WriteString("\n")
 			for _, line := range strings.Split(m.message.String(), "\n") {
 				b.WriteString("  " + dimStyle.Render(line) + "\n")
 			}
 		}
-	} else if m.genErr != nil {
-		b.WriteString(errStyle.Render("  Error: "+m.genErr.Error()) + "\n")
-	} else if m.executing {
+
+	case phaseExecuting:
 		spinner := spinnerFrames[m.spinnerIdx]
-		b.WriteString(dimStyle.Render("  "+spinner+" Executing...") + "\n")
-	} else if m.execErr != nil {
+		b.WriteString("\n")
 		b.WriteString(m.input.View() + "\n\n")
-		b.WriteString(errStyle.Render("  Error: "+m.execErr.Error()) + "\n")
-		b.WriteString(dimStyle.Render("  ctrl+s to retry • esc to cancel") + "\n")
-	} else {
+		b.WriteString(dimStyle.Render("  "+spinner+" "+m.action.String()+"...") + "\n")
+
+	case phaseEditing:
+		b.WriteString("\n")
 		b.WriteString(m.input.View() + "\n\n")
-		b.WriteString(dimStyle.Render("  ctrl+s to confirm • esc to cancel") + "\n")
+		if m.execErr != nil {
+			b.WriteString(errStyle.Render("  "+m.execErr.Error()) + "\n")
+		}
+		if m.genErr != nil {
+			b.WriteString(errStyle.Render("  "+m.genErr.Error()) + "\n")
+		}
+		b.WriteString(dimStyle.Render("  ctrl+s confirm • ctrl+e $EDITOR • esc cancel") + "\n")
 	}
 
 	return b.String()
