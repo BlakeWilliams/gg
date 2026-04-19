@@ -86,13 +86,15 @@ type DiffViewer struct {
 	ThreadCursor    int
 
 	// Comment composing
-	Composing        bool
-	CommentInput     textarea.Model
-	CommentFile      string
-	CommentLine      int
-	CommentSide      string
-	CommentStartLine int
-	CommentStartSide string
+	Composing           bool
+	CommentInput        textarea.Model
+	CommentFile         string
+	CommentLine         int
+	CommentSide         string
+	CommentStartLine    int
+	CommentStartSide    string
+	CommentBoxInsertPos int // rendered line after which the comment box was inserted
+	CommentBoxLines     int // number of lines the comment box occupies
 
 	// Copilot state
 	Agent        *agents.Client
@@ -515,6 +517,10 @@ func (d DiffViewer) OverlaySearchMatches(view string) string {
 			continue
 		}
 		absLine := offsets[diffIdx]
+		// Adjust for comment box insertion (not tracked in offsets).
+		if d.CommentBoxInsertPos >= 0 && d.CommentBoxLines > 0 && absLine > d.CommentBoxInsertPos {
+			absLine += d.CommentBoxLines
+		}
 		rel := absLine - vpTop
 		if rel < 0 || rel >= len(lines) {
 			continue

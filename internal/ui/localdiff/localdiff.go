@@ -1201,9 +1201,7 @@ func (m Model) View() string {
 	}
 	rightView := m.dv.VP.View()
 	if m.dv.CurrentFileIdx >= 0 {
-		if !m.dv.Composing {
-			rightView = m.dv.OverlaySearchMatches(rightView)
-		}
+		rightView = m.dv.OverlaySearchMatches(rightView)
 		rightView = m.dv.OverlayDiffCursor(rightView)
 	}
 	view := m.renderLayout(rightView)
@@ -1498,6 +1496,9 @@ func (m *Model) buildVirtualFileContent(idx, w int) string {
 
 	if m.dv.Composing && m.dv.HasDiffLines() {
 		rendered = m.insertCommentBox(rendered, idx)
+	} else {
+		m.dv.CommentBoxInsertPos = -1
+		m.dv.CommentBoxLines = 0
 	}
 
 	return rendered + "\n" + strings.Repeat("\n", m.dv.Height/2)
@@ -2280,13 +2281,15 @@ func (m Model) openCommentInput() (Model, tea.Cmd, bool) {
 	return m, ta.Focus(), true
 }
 
-func (m Model) insertCommentBox(rendered string, fileIdx int) string {
+func (m *Model) insertCommentBox(rendered string, fileIdx int) string {
 	lines := strings.Split(rendered, "\n")
 	cursorRenderedLine := -1
 	if fileIdx < len(m.dv.FileDiffOffsets) && m.dv.DiffCursor < len(m.dv.FileDiffOffsets[fileIdx]) {
 		cursorRenderedLine = m.dv.FileDiffOffsets[fileIdx][m.dv.DiffCursor]
 	}
 	if cursorRenderedLine < 0 || cursorRenderedLine >= len(lines) {
+		m.dv.CommentBoxInsertPos = -1
+		m.dv.CommentBoxLines = 0
 		return rendered
 	}
 
@@ -2303,6 +2306,11 @@ func (m Model) insertCommentBox(rendered string, fileIdx int) string {
 
 	inputBox := m.renderCommentBox()
 	inputLines := strings.Split(inputBox, "\n")
+
+	// Record insertion info so search overlay can adjust offsets.
+	m.dv.CommentBoxInsertPos = insertAt
+	m.dv.CommentBoxLines = len(inputLines)
+
 	after := make([]string, len(lines)-insertAt-1)
 	copy(after, lines[insertAt+1:])
 	lines = append(lines[:insertAt+1], inputLines...)
