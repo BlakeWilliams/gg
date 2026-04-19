@@ -972,12 +972,21 @@ func renderCommentThread(rcComments []RenderComment, width int, lt LineType, col
 		commentStart := lineCount
 
 		// Per-comment border color: highlight only the selected comment.
-		borderFg := threadBorderFg
+		// topFg controls the ╭/├ header line, bodyFg controls │ body lines.
+		topFg := threadBorderFg
+		bodyFg := threadBorderFg
 		if highlighted && hlIdx > 0 {
 			if i+1 == hlIdx {
-				borderFg = hlBorderFg
+				// Selected comment: all borders bright.
+				topFg = hlBorderFg
+				bodyFg = hlBorderFg
+			} else if i+1 == hlIdx+1 && hlIdx < len(rcComments) {
+				// Comment right after selected: its top ├ serves as selected's bottom.
+				topFg = hlBorderFg
+				bodyFg = defaultBorderFg
 			} else {
-				borderFg = defaultBorderFg
+				topFg = defaultBorderFg
+				bodyFg = defaultBorderFg
 			}
 		}
 
@@ -1002,9 +1011,9 @@ func renderCommentThread(rcComments []RenderComment, width int, lt LineType, col
 		if fillW < 0 {
 			fillW = 0
 		}
-		topLine := gutterStr + borderFg + left + "\033[0m" + bg +
+		topLine := gutterStr + topFg + left + "\033[0m" + bg +
 			author + age +
-			borderFg + strings.Repeat("─", fillW) + right + "\033[0m"
+			topFg + strings.Repeat("─", fillW) + right + "\033[0m"
 		b.WriteString(padWithBg(topLine, width, bg))
 		b.WriteString("\n")
 		lineCount++
@@ -1027,10 +1036,10 @@ func renderCommentThread(rcComments []RenderComment, width int, lt LineType, col
 				if renderBody != nil && body != "" {
 					body = renderBody(body, innerW, bg)
 				}
-				lineCount += renderBodyLines(&b, body, gutterStr, borderFg, bg, innerW, width)
+				lineCount += renderBodyLines(&b, body, gutterStr, bodyFg, bg, innerW, width)
 
 			case comments.ToolGroupBlock:
-				lineCount += renderToolGroup(&b, blk, gutterStr, borderFg, bg, innerW, width, colors, animFrame)
+				lineCount += renderToolGroup(&b, blk, gutterStr, bodyFg, bg, innerW, width, colors, animFrame)
 			}
 		}
 

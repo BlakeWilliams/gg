@@ -723,7 +723,9 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 				m.updateThreadHighlight()
 			}
 			if oldTC > 0 || m.dv.ThreadCursor > 0 {
+				savedOffset := m.dv.VP.YOffset()
 				m.rebuildContent()
+				m.dv.VP.SetYOffset(savedOffset)
 			}
 		}
 		return m, cmd
@@ -755,7 +757,6 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 				m.dv.ThreadCursor++
 				m.updateThreadHighlight()
 				m.rebuildContent()
-				m.scrollToShowComment()
 			} else {
 				// Past last comment → exit thread, advance to next diff line.
 				m.dv.ThreadCursor = 0
@@ -774,12 +775,10 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 				m.dv.ThreadCursor--
 				m.updateThreadHighlight()
 				m.rebuildContent()
-				m.scrollToShowComment()
 			} else {
 				m.dv.ThreadCursor = 0
 				m.updateThreadHighlight()
 				m.rebuildContent()
-				m.dv.ScrollToDiffCursor()
 			}
 			return m, nil, true
 		case "ctrl+d":
@@ -792,7 +791,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 				m.dv.SelectionAnchor = -1
 				m.updateThreadHighlight()
 			}
+			savedOffset := m.dv.VP.YOffset()
 			m.rebuildContent()
+			m.dv.VP.SetYOffset(savedOffset)
 			return m, nil, true
 		case "ctrl+u":
 			// Exit thread, scroll half page up, re-enter if new position has a thread.
@@ -804,7 +805,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 				m.dv.SelectionAnchor = -1
 				m.updateThreadHighlight()
 			}
+			savedOffset := m.dv.VP.YOffset()
 			m.rebuildContent()
+			m.dv.VP.SetYOffset(savedOffset)
 			return m, nil, true
 		case "ctrl+f":
 			// Exit thread, scroll full page down, re-enter if new position has a thread.
@@ -816,7 +819,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 				m.dv.SelectionAnchor = -1
 				m.updateThreadHighlight()
 			}
+			savedOffset := m.dv.VP.YOffset()
 			m.rebuildContent()
+			m.dv.VP.SetYOffset(savedOffset)
 			return m, nil, true
 		case "ctrl+b":
 			// Exit thread, scroll full page up, re-enter if new position has a thread.
@@ -828,7 +833,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 				m.dv.SelectionAnchor = -1
 				m.updateThreadHighlight()
 			}
+			savedOffset := m.dv.VP.YOffset()
 			m.rebuildContent()
+			m.dv.VP.SetYOffset(savedOffset)
 			return m, nil, true
 		case "G":
 			count := m.threadCommentCount()
@@ -949,7 +956,11 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 				if prevIdx >= 0 && m.diffLineHasThread(prevIdx) {
 					m.dv.DiffCursor = prevIdx
 					count := m.threadCommentCountAt(prevIdx)
-					m.enterThread(count)
+					m.dv.SelectionAnchor = -1
+					m.dv.ThreadCursor = count
+					m.updateThreadHighlight()
+					m.rebuildContent()
+					m.markCurrentThreadRead()
 					return m, nil, true
 				}
 			}
@@ -1064,7 +1075,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 				m.updateThreadHighlight()
 			}
 			if oldTC > 0 || m.dv.ThreadCursor > 0 {
+				savedOffset := m.dv.VP.YOffset()
 				m.rebuildContent()
+				m.dv.VP.SetYOffset(savedOffset)
 			}
 			return m, nil, true
 		}
@@ -1747,13 +1760,13 @@ func (m Model) prevNonHunkLine(fromIdx int) int {
 }
 
 // enterThread sets up thread navigation at the given comment index (1-based).
-// Handles highlighting, rebuilding content, scrolling, and marking read.
+// Handles highlighting, rebuilding content, and marking read. Does not jump
+// the viewport — the caller's scroll position is preserved.
 func (m *Model) enterThread(commentIdx int) {
 	m.dv.SelectionAnchor = -1
 	m.dv.ThreadCursor = commentIdx
 	m.updateThreadHighlight()
 	m.rebuildContent()
-	m.scrollToShowComment()
 	m.markCurrentThreadRead()
 }
 

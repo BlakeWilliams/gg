@@ -171,9 +171,24 @@ func (c *CommentThreadItem) RenderedLineCount(rc RenderContext) int {
 	return c.lineCount
 }
 
-func (c *CommentThreadItem) DiffIdx() int        { return c.diffLineIdx }
-func (c *CommentThreadItem) IsDiffLine() bool     { return false }
-func (c *CommentThreadItem) ThreadKey() (string, int) { return c.Side, c.Line }
+func (c *CommentThreadItem) DiffIdx() int              { return c.diffLineIdx }
+func (c *CommentThreadItem) IsDiffLine() bool           { return false }
+func (c *CommentThreadItem) ThreadKey() (string, int)   { return c.Side, c.Line }
+
+// CommentIndexAtOffset maps a visual line offset within this thread's rendered
+// body to a 1-based comment index. Returns 0 if the offset falls in the
+// thread's blank leader line or is out of range.
+func (c *CommentThreadItem) CommentIndexAtOffset(offset int, rc RenderContext) int {
+	c.Render(rc) // ensure commentLines populated
+	running := 1 // skip blank line above comments
+	for i, cl := range c.commentLines {
+		if offset < running+cl {
+			return i + 1 // 1-based
+		}
+		running += cl
+	}
+	return 0
+}
 
 func (c *CommentThreadItem) Invalidate() {
 	c.width = 0
@@ -194,7 +209,7 @@ func (c *CommentThreadItem) render(rc RenderContext) {
 	gutterW := TotalGutterWidth(rc.ColW)
 	result := renderCommentThread(
 		c.Comments, rc.Width, c.ParentLineType, rc.Colors,
-		c.Highlighted, c.HlIdx, rc.Colors.HighlightBorderFg,
+		c.Highlighted, c.HlIdx, rc.Colors.SelectedBorderFg,
 		rc.RenderBody, gutterW, rc.AnimFrame, c.OpenBottom,
 	)
 	c.content = result.content

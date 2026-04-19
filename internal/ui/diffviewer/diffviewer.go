@@ -97,6 +97,12 @@ type DiffViewer struct {
 	// Internal
 	WaitingG    bool // true after first "g" keypress, waiting for second "g" to trigger gg (go to top)
 	LastContent string
+
+	// SnapThreadComment is set by snap functions (SyncDiffCursorToViewport,
+	// ScrollAndSyncCursor, DiffCursorFromScreenY) when the target position
+	// falls inside a comment thread. 1-based comment index, or 0 if not in a thread.
+	// Callers read this to decide whether to enter/update thread highlighting.
+	SnapThreadComment int
 }
 
 // CommentSource provides comments for a file. Each view implements this
@@ -150,12 +156,33 @@ func (d DiffViewer) HasDiffLines() bool {
 	return idx >= 0 && idx < len(d.FileDiffs) && len(d.FileDiffs[idx]) > 0
 }
 
+// ClearThreadHighlight un-highlights the thread at the current cursor and
+// resets ThreadCursor to 0. Safe to call when ThreadCursor is already 0.
+func (d *DiffViewer) ClearThreadHighlight() {
+	if d.ThreadCursor == 0 {
+		return
+	}
+	idx := d.CurrentFileIdx
+	if idx >= 0 && idx < len(d.FileDiffs) && d.DiffCursor < len(d.FileDiffs[idx]) {
+		dl := d.FileDiffs[idx][d.DiffCursor]
+		var side string
+		var line int
+		if dl.Type == components.LineDel {
+			side, line = "LEFT", dl.OldLineNo
+		} else {
+			side, line = "RIGHT", dl.NewLineNo
+		}
+		d.SpliceThreadWithHighlight(idx, side, line, false, 0)
+	}
+	d.ThreadCursor = 0
+}
+
 // MoveDiffCursor moves the cursor by delta, skipping hunk lines.
 func (d *DiffViewer) MoveDiffCursor(delta int) {
 	if d.CurrentFileIdx < 0 || d.CurrentFileIdx >= len(d.FileDiffs) {
 		return
 	}
-	d.ThreadCursor = 0
+	d.ClearThreadHighlight()
 	lines := d.FileDiffs[d.CurrentFileIdx]
 	newPos := d.DiffCursor + delta
 
@@ -175,7 +202,7 @@ func (d *DiffViewer) MoveDiffCursorBy(delta int) {
 	if d.CurrentFileIdx < 0 || d.CurrentFileIdx >= len(d.FileDiffs) {
 		return
 	}
-	d.ThreadCursor = 0
+	d.ClearThreadHighlight()
 	lines := d.FileDiffs[d.CurrentFileIdx]
 	newPos := d.DiffCursor + delta
 
@@ -286,72 +313,29 @@ func (d *DiffViewer) ScrollToDiffCursor() {
 
 // ScrollAndSyncCursor scrolls the viewport by delta, keeping the cursor
 // at the same screen-relative position (vim ctrl+d/u behavior).
+// Sets SnapThreadComment if the target position falls inside a comment thread.
 func (d *DiffViewer) ScrollAndSyncCursor(delta int) {
-	d.ThreadCursor = 0
 	idx := d.CurrentFileIdx
 	if idx < 0 || idx >= len(d.FileDiffOffsets) {
 		return
 	}
 
-	cursorAbs := 0
-	if d.DiffCursor < len(d.FileDiffOffsets[idx]) {
-		cursorAbs = d.FileDiffOffsets[idx][d.DiffCursor]
-	}
-	relPos := cursorAbs - d.VP.YOffset()
-
 	d.VP.SetYOffset(d.VP.YOffset() + delta)
 
-	targetAbs := d.VP.YOffset() + relPos
-	offsets := d.FileDiffOffsets[idx]
-	diffs := d.FileDiffs[idx]
-	best := -1
-	bestDist := 0
-	for i := 0; i < len(offsets); i++ {
-		if i < len(diffs) && diffs[i].Type == components.LineHunk {
-			continue
-		}
-		dist := offsets[i] - targetAbs
-		if dist < 0 {
-			dist = -dist
-		}
-		if best == -1 || dist < bestDist {
-			best = i
-			bestDist = dist
-		}
-	}
-	if best >= 0 {
-		d.DiffCursor = best
-	}
+	center := d.VP.YOffset() + d.ViewportHeight()/2
+	d.DiffCursor, d.SnapThreadComment = d.snapTarget(idx, center)
 }
 
 // SyncDiffCursorToViewport moves the diff cursor to the line closest to
 // the center of the viewport. Used after viewport-only scrolling.
+// Sets SnapThreadComment if the center falls inside a comment thread.
 func (d *DiffViewer) SyncDiffCursorToViewport() {
 	idx := d.CurrentFileIdx
 	if idx < 0 || idx >= len(d.FileDiffOffsets) || len(d.FileDiffOffsets[idx]) == 0 {
 		return
 	}
 	center := d.VP.YOffset() + d.ViewportHeight()/2
-	offsets := d.FileDiffOffsets[idx]
-	diffs := d.FileDiffs[idx]
-	best := -1
-	bestDist := 0
-	for i := 0; i < len(offsets); i++ {
-		if i < len(diffs) && diffs[i].Type == components.LineHunk {
-			continue
-		}
-		dist := offsets[i] - center
-		if dist < 0 {
-			dist = -dist
-		}
-		if best == -1 || dist < bestDist {
-			best = i
-			bestDist = dist
-		}
-	}
-	if best >= 0 {
-		d.DiffCursor = best
-	}
+	d.DiffCursor, d.SnapThreadComment = d.snapTarget(idx, center)
 }
 
 // CursorViewportLine returns the cursor's Y position in the viewport, or -1 if not visible.
@@ -373,7 +357,8 @@ func (d DiffViewer) CursorViewportLine() int {
 
 // DiffCursorFromScreenY maps a screen Y coordinate to the nearest diff line
 // index, accounting for chrome rows and viewport scroll. Returns -1 if no
-// valid diff line is found.
+// valid diff line is found. Sets SnapThreadComment if the position falls
+// inside a comment thread.
 func (d *DiffViewer) DiffCursorFromScreenY(y int) int {
 	chromeRows := 2
 	row := y - chromeRows
@@ -386,16 +371,46 @@ func (d *DiffViewer) DiffCursorFromScreenY(y int) int {
 	if idx < 0 || idx >= len(d.FileDiffOffsets) {
 		return -1
 	}
-	offsets := d.FileDiffOffsets[idx]
-	diffs := d.FileDiffs[idx]
 
+	diffIdx, tc := d.snapTarget(idx, absLine)
+	d.SnapThreadComment = tc
+	return diffIdx
+}
+
+// --- Cursor overlay rendering ---
+
+// snapTarget resolves a target absolute line to the best diff cursor position.
+// If the target falls inside a comment thread, returns the thread's parent
+// diff line index and the 1-based comment index. Otherwise returns the
+// closest non-hunk diff line and 0 for threadComment.
+func (d *DiffViewer) snapTarget(fileIdx int, targetAbs int) (diffIdx int, threadComment int) {
+	if fileIdx < 0 || fileIdx >= len(d.FileDiffOffsets) || len(d.FileDiffOffsets[fileIdx]) == 0 {
+		return -1, 0
+	}
+
+	// Check if target falls inside a comment thread.
+	if fileIdx < len(d.FileRenderLists) && d.FileRenderLists[fileIdx] != nil {
+		rc := d.RenderContextForFile(fileIdx)
+		if item, offset := d.FileRenderLists[fileIdx].ItemAtLine(targetAbs, rc); item != nil {
+			if ct, ok := item.(*components.CommentThreadItem); ok {
+				ci := ct.CommentIndexAtOffset(offset, rc)
+				if ci > 0 {
+					return ct.DiffIdx(), ci
+				}
+			}
+		}
+	}
+
+	// Fallback: closest non-hunk diff line by distance.
+	offsets := d.FileDiffOffsets[fileIdx]
+	diffs := d.FileDiffs[fileIdx]
 	best := -1
 	bestDist := 0
-	for i, off := range offsets {
+	for i := 0; i < len(offsets); i++ {
 		if i < len(diffs) && diffs[i].Type == components.LineHunk {
 			continue
 		}
-		dist := off - absLine
+		dist := offsets[i] - targetAbs
 		if dist < 0 {
 			dist = -dist
 		}
@@ -404,10 +419,8 @@ func (d *DiffViewer) DiffCursorFromScreenY(y int) int {
 			bestDist = dist
 		}
 	}
-	return best
+	return best, 0
 }
-
-// --- Cursor overlay rendering ---
 
 // OverlayDiffCursor applies cursor or selection highlighting to the viewport content.
 func (d DiffViewer) OverlayDiffCursor(view string) string {
@@ -417,12 +430,6 @@ func (d DiffViewer) OverlayDiffCursor(view string) string {
 
 	if d.SelectionAnchor >= 0 && d.SelectionAnchor != d.DiffCursor {
 		return d.overlaySelectionRange(view)
-	}
-
-	// When navigating within a thread, highlight the selected comment instead
-	// of the diff cursor line.
-	if d.ThreadCursor > 0 {
-		return d.overlayCommentHighlight(view)
 	}
 
 	vLine := d.CursorViewportLine()
@@ -532,66 +539,6 @@ func (d DiffViewer) ApplySelectionHighlight(line string, dl components.DiffLine)
 	}
 
 	return prefix + inner + suffix
-}
-
-// overlayCommentHighlight applies cursor-style background highlighting to the
-// selected comment when in thread navigation mode (ThreadCursor > 0).
-func (d DiffViewer) overlayCommentHighlight(view string) string {
-	idx := d.CurrentFileIdx
-	if idx < 0 || idx >= len(d.FileDiffs) || d.DiffCursor >= len(d.FileDiffs[idx]) {
-		return view
-	}
-	if idx >= len(d.FileRenderLists) || d.FileRenderLists[idx] == nil {
-		return view
-	}
-
-	// Determine thread side/line from the diff cursor.
-	dl := d.FileDiffs[idx][d.DiffCursor]
-	var side string
-	var line int
-	if dl.Type == components.LineDel {
-		side, line = "LEFT", dl.OldLineNo
-	} else {
-		side, line = "RIGHT", dl.NewLineNo
-	}
-
-	// Get the selected comment's rendered offset and height.
-	rc := d.renderContext(d.FileDiffs[idx])
-	commentIdx := d.ThreadCursor - 1 // ThreadCursor is 1-based
-	absOffset, height := d.FileRenderLists[idx].ThreadCommentOffset(side, line, commentIdx, rc)
-	if absOffset < 0 || height <= 0 {
-		return view
-	}
-
-	// Pick the cursor bg based on the parent line type.
-	colors := d.Ctx.DiffColors
-	lt := d.ThreadParentLineType(idx, side, line)
-	var selBg string
-	switch lt {
-	case components.LineAdd:
-		selBg = colors.SelectedAddBg
-	case components.LineDel:
-		selBg = colors.SelectedDelBg
-	default:
-		selBg = colors.SelectedCtxBg
-	}
-	if selBg == "" {
-		return view
-	}
-
-	vpTop := d.VP.YOffset()
-	lines := strings.Split(view, "\n")
-
-	for i := 0; i < height; i++ {
-		abs := absOffset + i
-		rel := abs - vpTop
-		if rel < 0 || rel >= len(lines) {
-			continue
-		}
-		lines[rel] = replaceBackground(lines[rel], colors, selBg)
-	}
-
-	return strings.Join(lines, "\n")
 }
 
 // replaceBackground swaps diff bg colors for selected bg in an ANSI string.
