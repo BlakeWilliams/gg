@@ -635,6 +635,10 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 
 		m.dv.CopilotState.AdvanceDots()
 
+		// Snapshot cursor offset before mutations so we can compensate for
+		// content added above the cursor (viewport stability).
+		cursorOffsetBefore := m.cursorRenderedOffset()
+
 		// Re-render files that had completed/error events.
 		for fileIdx := range dirtyFiles {
 			m.formatFile(fileIdx)
@@ -656,6 +660,23 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 
 		m.rebuildContentIfChanged()
 
+		// Compensate viewport for content shifts above the cursor.
+		// Skip when following a copilot comment — that has its own scroll.
+		followingCopilot := m.dv.ThreadCursor > 0 && m.focusedOnCopilotPending()
+		if !followingCopilot && cursorOffsetBefore >= 0 {
+			cursorOffsetAfter := m.cursorRenderedOffset()
+			if cursorOffsetAfter >= 0 {
+				delta := cursorOffsetAfter - cursorOffsetBefore
+				if delta != 0 {
+					newOffset := m.dv.VP.YOffset() + delta
+					if newOffset < 0 {
+						newOffset = 0
+					}
+					m.dv.VP.SetYOffset(newOffset)
+				}
+			}
+		}
+
 		// Clamp ThreadCursor if the thread shrank (e.g. copilot reply completed/errored).
 		if m.dv.ThreadCursor > 0 {
 			count := m.threadCommentCount()
@@ -672,7 +693,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 
 		// Auto-scroll if the user is focused on a streaming copilot comment.
 		// Use extra padding so there's breathing room below the growing thread.
-		if m.dv.ThreadCursor > 0 && m.focusedOnCopilotPending() {
+		if followingCopilot {
 			m.scrollCopilotFollow()
 		}
 
@@ -2484,6 +2505,21 @@ func stripTrailingSpaces(s string) string {
 		s = strings.TrimRight(s, " ")
 	}
 	return s
+}
+
+// cursorRenderedOffset returns the rendered line offset of the current
+// DiffCursor, or -1 if unavailable. Used to detect viewport shifts caused
+// by content changes above the cursor.
+func (m Model) cursorRenderedOffset() int {
+	idx := m.dv.CurrentFileIdx
+	if idx < 0 || idx >= len(m.dv.FileDiffOffsets) {
+		return -1
+	}
+	offsets := m.dv.FileDiffOffsets[idx]
+	if m.dv.DiffCursor < 0 || m.dv.DiffCursor >= len(offsets) {
+		return -1
+	}
+	return offsets[m.dv.DiffCursor]
 }
 
 // cursorThreadInfo returns the path/line/side for the comment thread at the cursor.
