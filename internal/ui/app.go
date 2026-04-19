@@ -21,6 +21,7 @@ import (
 	"github.com/blakewilliams/ghq/internal/ui/styles"
 	"github.com/blakewilliams/ghq/internal/ui/uictx"
 	tea "charm.land/bubbletea/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 	xansi "github.com/charmbracelet/x/ansi"
 	"charm.land/lipgloss/v2"
 )
@@ -134,7 +135,19 @@ func (m Model) Init() tea.Cmd {
 		gcTickCmd(m.ctx.Client),
 		queryPaletteCmd(),
 		tea.RequestBackgroundColor,
+		// Enable mode 2031 so terminals that support it proactively notify us
+		// when the OS color scheme changes (dark ↔ light).
+		tea.Raw(xansi.SetModeLightDark),
+		tea.Raw(xansi.RequestLightDarkReport),
 	)
+}
+
+// reQueryPalette resets the cached palette and re-queries all 16 ANSI colors
+// plus the background color. Call this when the terminal's colorscheme may
+// have changed (mode 2031 notification, focus regained, resume from suspend).
+func (m *Model) reQueryPalette() tea.Cmd {
+	m.palette = terminal.Palette{}
+	return tea.Batch(queryPaletteCmd(), tea.RequestBackgroundColor)
 }
 
 // queryPaletteCmd sends OSC 4 queries through Bubble Tea's output buffer.
@@ -164,9 +177,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
+	case terminal.PaletteCompleteMsg:
+		// All 16 ANSI colors re-resolved — recompute diff colors and
+		// forward to the active view so it can re-highlight files.
+		m.ctx.DiffColors = styles.ComputeDiffColors(msg.Palette)
+		var cmd tea.Cmd
+		m.activeView, cmd = m.activeView.Update(msg)
+		return m, cmd
+
 	case gcTickMsg:
 		m.ctx.Client.GC()
 		return m, gcTickCmd(m.ctx.Client)
+
+	case uv.DarkColorSchemeEvent, uv.LightColorSchemeEvent:
+		// Mode 2031: terminal is notifying us the OS color scheme changed.
+		return m, m.reQueryPalette()
+
+	case tea.FocusMsg:
+		// Terminal regained focus — colorscheme may have changed while backgrounded.
+		return m, m.reQueryPalette()
+
+	case tea.ResumeMsg:
+		// Resumed from ctrl+z suspend — same concern.
+		return m, m.reQueryPalette()
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -199,7 +232,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Hard globals — always handled regardless of view/mode.
 		if msg.String() == "ctrl+c" {
 			if m.quitPending {
-				return m, tea.Quit
+				return m, tea.Sequence(tea.Raw(xansi.ResetModeLightDark), tea.Quit)
 			}
 			m.quitPending = true
 			return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
@@ -258,7 +291,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pickerKind = "help"
 			m.picker = picker.New("Help", m.helpPickerItems(), m.pickerInnerWidth(), m.height-chromeHeight)
 			return m, nil
-		case "C":
+		case "`":
 			return m.openCopilotChat()
 		}
 
@@ -298,9 +331,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.activeView.Init()
 	}
 
-	// Forward non-key messages to active view.
+	// Forward non-key messages to active view (and copilot chat if open).
 	var cmd tea.Cmd
 	m.activeView, cmd = m.activeView.Update(msg)
+	if m.mode == modeCopilotChat {
+		var chatCmd tea.Cmd
+		m.copilotChat, chatCmd = m.copilotChat.Update(msg)
+		return m, tea.Batch(cmd, chatCmd)
+	}
 	return m, cmd
 }
 
@@ -314,7 +352,7 @@ func (m Model) handleCommand(msg commandbar.CommandMsg) (tea.Model, tea.Cmd) {
 
 	switch msg.Command {
 	case "q", "quit":
-		return m, tea.Quit
+		return m, tea.Sequence(tea.Raw(xansi.ResetModeLightDark), tea.Quit)
 	case "refresh":
 		m.activeView = localdiff.New(m.ctx, m.repoRoot, m.width, m.height-chromeHeight)
 		return m, m.activeView.Init()
@@ -382,6 +420,7 @@ func (m Model) View() tea.View {
 	v := tea.NewView(output)
 	v.AltScreen = true
 	v.MouseMode = tea.MouseModeCellMotion
+	v.ReportFocus = true
 	v.WindowTitle = m.windowTitle
 	// OSC 0 for iTerm2 compatibility (OSC 2 alone doesn't override job name).
 	fmt.Fprintf(os.Stderr, "\033]0;%s\007", m.windowTitle)
@@ -594,7 +633,7 @@ func (m Model) helpPickerItems() []picker.Item {
 		{Label: ":", Description: "Open command picker", Keywords: []string{"command", "menu"}},
 		{Label: "?", Description: "Open help", Keywords: []string{"keybindings", "shortcuts"}},
 		{Label: "^p", Description: "Fuzzy find a file in the sidebar", Keywords: []string{"file", "find", "fuzzy", "open"}},
-		{Label: "C", Description: "Copilot chat", Keywords: []string{"ai", "copilot"}},
+		{Label: "`", Description: "Copilot chat", Keywords: []string{"ai", "copilot"}},
 		{Label: "^c", Description: "Quit"},
 	}
 

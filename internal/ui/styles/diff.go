@@ -84,7 +84,7 @@ func ComputeDiffColors(p terminal.Palette) DiffColors {
 	} else {
 		selectTint = color.RGBA{R: 0, G: 0, B: 0, A: 255}
 	}
-	selectBg := blendColor(selectTint, bg, 0.20)
+	selectBg := blendColor(selectTint, bg, 0.12)
 
 	borderColor := brightBlack
 	if borderColor == nil {

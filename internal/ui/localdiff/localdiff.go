@@ -14,6 +14,7 @@ import (
 	"github.com/blakewilliams/ghq/internal/git"
 	"github.com/blakewilliams/ghq/internal/git/watcher"
 	"github.com/blakewilliams/ghq/internal/github"
+	"github.com/blakewilliams/ghq/internal/terminal"
 	"github.com/blakewilliams/ghq/internal/review/agents"
 	"github.com/blakewilliams/ghq/internal/review/agents/copilot"
 	"github.com/blakewilliams/ghq/internal/review/comments"
@@ -135,6 +136,7 @@ type Model struct {
 
 	// Render cache.
 	lastFormattedStreamLen int // length of copilot reply buffer at last formatFile
+	copilotTickActive      bool // true while a copilot tick chain is running
 
 	// Staging ops counter.
 	stagingInFlight int // number of staging ops in progress
@@ -334,6 +336,19 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 			}
 		}
 		m.rebuildContent()
+		return m, nil
+
+	case terminal.PaletteCompleteMsg:
+		// Terminal colorscheme changed — clear all cached highlights and
+		// re-run Chroma with the new ChromaStyle so fg colors update.
+		if len(m.dv.Files) > 0 {
+			m.dv.HighlightedFiles = make([]components.HighlightedDiff, len(m.dv.Files))
+			m.dv.FilesHighlighted = 0
+			m.branchData.chromaHighlighted = make(map[int]bool)
+			m.dv.ReformatAllFiles()
+			m.rebuildContent()
+			return m, m.highlightFileCmd(0)
+		}
 		return m, nil
 
 	case diffLoadedMsg:
@@ -614,6 +629,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 
 	case copilotTickMsg:
 		if !m.dv.CopilotState.HasPending() {
+			m.copilotTickActive = false
 			return m, nil
 		}
 
@@ -702,6 +718,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 				return copilotTickMsg{}
 			})
 		}
+		m.copilotTickActive = false
 		return m, nil
 
 	case GoToLineMsg:
@@ -2229,10 +2246,12 @@ func (m Model) handleCommentKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 
 			diffHunk := m.getDiffHunkForComment(comment)
 			threadHistory := m.getThreadHistory(comment)
-			return m, tea.Batch(
-				m.dv.Agent.SendComment(comment.ID, body, comment.Path, m.mode.String(), diffHunk, threadHistory),
-				tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg { return copilotTickMsg{} }),
-			), true
+			cmds := []tea.Cmd{m.dv.Agent.SendComment(comment.ID, body, comment.Path, m.mode.String(), diffHunk, threadHistory)}
+			if !m.copilotTickActive {
+				m.copilotTickActive = true
+				cmds = append(cmds, tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg { return copilotTickMsg{} }))
+			}
+			return m, tea.Batch(cmds...), true
 		}
 		return m, nil, true
 	}

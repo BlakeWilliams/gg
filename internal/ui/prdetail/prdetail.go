@@ -12,6 +12,7 @@ import (
 	"github.com/blakewilliams/ghq/internal/review/comments"
 	"github.com/blakewilliams/ghq/internal/github"
 	"github.com/blakewilliams/ghq/internal/git/watcher"
+	"github.com/blakewilliams/ghq/internal/terminal"
 	"github.com/blakewilliams/ghq/internal/ui/components"
 	"github.com/blakewilliams/ghq/internal/ui/diffviewer"
 	"github.com/blakewilliams/ghq/internal/ui/styles"
@@ -194,10 +195,11 @@ type Model struct {
 	replyToID *int
 
 	// Local comments
-	localComments *comments.CommentStore
-	repoRoot      string // non-empty if branch is checked out locally
-	localBranch   bool   // true if PR branch == local branch
-	refWatcher    *watcher.RefWatcher
+	localComments     *comments.CommentStore
+	repoRoot          string // non-empty if branch is checked out locally
+	localBranch       bool   // true if PR branch == local branch
+	refWatcher        *watcher.RefWatcher
+	copilotTickActive bool   // true while a copilot tick chain is running
 }
 
 func New(pr github.PullRequest, ctx *uictx.Context, width, height int) Model {
@@ -377,6 +379,17 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 			return m, cmd
 		}
 
+	case terminal.PaletteCompleteMsg:
+		// Terminal colorscheme changed — re-highlight all files with the new ChromaStyle.
+		if len(m.dv.Files) > 0 {
+			m.dv.HighlightedFiles = make([]components.HighlightedDiff, len(m.dv.Files))
+			m.dv.FilesHighlighted = 0
+			m.reformatAllFiles()
+			m.rebuildContent()
+			return m, m.highlightFileCmd(0)
+		}
+		return m, nil
+
 	case uictx.SelectFileMsg:
 		for i, f := range m.dv.Files {
 			if f.Filename == msg.Filename {
@@ -504,6 +517,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 
 	case copilotTickMsg:
 		if !m.dv.CopilotState.HasPending() {
+			m.copilotTickActive = false
 			return m, nil
 		}
 
@@ -539,6 +553,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 				return copilotTickMsg{}
 			})
 		}
+		m.copilotTickActive = false
 		return m, nil
 
 	case watcher.RefChangedMsg:
@@ -930,10 +945,12 @@ func (m Model) handleCommentKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 
 		if m.dv.Agent != nil {
 			m.dv.CopilotState.SetPending(comment.ID, comment.Path, comment.Line, comment.Side)
-			return m, tea.Batch(
-				m.dv.Agent.SendComment(comment.ID, body, comment.Path, "Branch", "", nil),
-				tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg { return copilotTickMsg{} }),
-			), true
+			cmds := []tea.Cmd{m.dv.Agent.SendComment(comment.ID, body, comment.Path, "Branch", "", nil)}
+			if !m.copilotTickActive {
+				m.copilotTickActive = true
+				cmds = append(cmds, tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg { return copilotTickMsg{} }))
+			}
+			return m, tea.Batch(cmds...), true
 		}
 		return m, nil, true
 	case "alt+enter":
