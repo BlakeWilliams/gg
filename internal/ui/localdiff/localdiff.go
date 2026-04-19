@@ -599,6 +599,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		if msg.index == m.dv.CurrentFileIdx {
 			m.dv.RenderedFiles[msg.index] = "" // invalidate to force re-render with highlights
 			m.formatFile(msg.index)
+			m.dv.RunSearch() // re-apply search after highlighting
 			m.rebuildContent()
 		} else {
 			m.dv.RenderedFiles[msg.index] = "" // invalidate so next access uses highlights
@@ -742,6 +743,12 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 	// When composing a comment, handle textarea keys.
 	if m.dv.Composing {
 		return m.handleCommentKey(msg)
+	}
+
+	// When searching, route all keys to the search handler.
+	if m.dv.Searching {
+		m.dv.HandleSearchKey(msg.String(), msg.Text)
+		return m, nil, true
 	}
 
 	// Thread navigation mode.
@@ -983,12 +990,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			m.dv.ScrollToDiffCursor()
 			return m, nil, true
 		}
-		// If on a line with comments, enter thread navigation.
-		if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() && m.diffLineHasThread(m.dv.DiffCursor) {
-			m.enterThread(1)
-			return m, nil, true
-		}
-		// Otherwise open comment input.
+		// Open comment input (new thread even if comments already exist).
 		if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
 			return m.openCommentInput()
 		}
@@ -1063,6 +1065,27 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 				return m.stageHunk(true)
 			}
 		}
+	case "/":
+		if !m.dv.Tree.Focused && m.dv.CurrentFileIdx >= 0 {
+			m.dv.StartSearch()
+			return m, nil, true
+		}
+	case "n":
+		if !m.dv.Tree.Focused && m.dv.SearchPattern != nil && len(m.dv.SearchMatches) > 0 {
+			m.dv.SearchNext()
+			return m, nil, true
+		}
+	case "N":
+		if !m.dv.Tree.Focused && m.dv.SearchPattern != nil && len(m.dv.SearchMatches) > 0 {
+			m.dv.SearchPrev()
+			return m, nil, true
+		}
+	case "esc":
+		if m.dv.SearchPattern != nil {
+			m.dv.ClearSearch()
+			m.rebuildContent()
+			return m, nil, true
+		}
 	case "ctrl+d", "ctrl+u", "ctrl+f", "ctrl+b", "G", "g":
 		oldTC := m.dv.ThreadCursor
 		if oldTC > 0 {
@@ -1110,6 +1133,8 @@ func (m Model) KeyBindings() []uictx.KeyBinding {
 		{Key: "S", Description: "Stage entire hunk"},
 		{Key: "U", Description: "Unstage entire hunk"},
 		{Key: ":N", Description: "Jump to line number N"},
+		{Key: "/", Description: "Search in file (regex)", Keywords: []string{"find"}},
+		{Key: "n / N", Description: "Next / previous match"},
 		{Key: "esc", Description: "Cancel / exit thread"},
 	}
 }
@@ -1164,9 +1189,14 @@ func (m Model) View() string {
 	}
 	rightView := m.dv.VP.View()
 	if m.dv.CurrentFileIdx >= 0 {
+		rightView = m.dv.OverlaySearchMatches(rightView)
 		rightView = m.dv.OverlayDiffCursor(rightView)
 	}
-	return m.renderLayout(rightView)
+	view := m.renderLayout(rightView)
+	if m.dv.Searching {
+		view = m.dv.RenderSearchPopup(view, m.dv.Height)
+	}
+	return view
 }
 
 func (m Model) renderLayout(rightView string) string {
@@ -1453,25 +1483,6 @@ func (m *Model) buildVirtualFileContent(idx, w int) string {
 	return rendered + "\n" + strings.Repeat("\n", m.dv.Height/2)
 }
 
-func stripAnsi(s string) string {
-	// Simple ANSI stripper
-	result := make([]byte, 0, len(s))
-	inEscape := false
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\033' {
-			inEscape = true
-			continue
-		}
-		if inEscape {
-			if (s[i] >= 'a' && s[i] <= 'z') || (s[i] >= 'A' && s[i] <= 'Z') {
-				inEscape = false
-			}
-			continue
-		}
-		result = append(result, s[i])
-	}
-	return string(result)
-}
 
 // persistCopilotReply saves a completed copilot reply to the comment store.
 func (m *Model) persistCopilotReply(reply *diffviewer.CompletedReply) {
@@ -1680,6 +1691,7 @@ func (m Model) reviewCommentsTimer() tea.Cmd {
 
 func (m *Model) selectTreeEntry() tea.Cmd {
 	m.dv.SelectionAnchor = -1
+	// Don't clear search — re-run after switching files.
 	// Save cursor position for the file we're leaving.
 	if m.dv.CurrentFileIdx >= 0 && m.dv.CurrentFileIdx < len(m.dv.Files) {
 		m.branchData.fileCursors[m.dv.Files[m.dv.CurrentFileIdx].Filename] = m.dv.DiffCursor
@@ -1714,6 +1726,7 @@ func (m *Model) selectTreeEntry() tea.Cmd {
 	if m.dv.RenderedFiles[fileIdx] == "" {
 		m.formatFile(fileIdx)
 	}
+	m.dv.RunSearch() // re-apply search to new file
 	m.rebuildContent()
 	m.dv.ScrollToDiffCursor()
 	m.markCurrentThreadRead()

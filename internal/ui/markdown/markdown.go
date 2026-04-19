@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"charm.land/glamour/v2"
+	xansi "github.com/charmbracelet/x/ansi"
 	"charm.land/glamour/v2/ansi"
 	"github.com/alecthomas/chroma/v2"
 	"github.com/alecthomas/chroma/v2/formatters"
@@ -147,7 +148,7 @@ func (r *Renderer) RenderBody(body string, width int, bg string) string {
 
 	// Strip trailing empty lines — glamour adds margin after code blocks
 	// which creates a blank row before the closing border.
-	for len(lines) > 0 && strings.TrimSpace(stripANSI(lines[len(lines)-1])) == "" {
+	for len(lines) > 0 && strings.TrimSpace(xansi.Strip(lines[len(lines)-1])) == "" {
 		lines = lines[:len(lines)-1]
 	}
 
@@ -227,7 +228,7 @@ func (r *Renderer) injectCodeBlocks(rendered string, blocks []codeBlock, bg stri
 	lines := strings.Split(rendered, "\n")
 	var out []string
 	for _, line := range lines {
-		plain := stripANSI(strings.TrimSpace(line))
+		plain := xansi.Strip(strings.TrimSpace(line))
 		if plain == placeholder && blockIdx < len(blocks) {
 			block := blocks[blockIdx]
 			blockIdx++
@@ -274,28 +275,7 @@ func (r *Renderer) highlightCode(code, lang, bg string) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// stripANSI removes all ANSI escape sequences from a string.
-func stripANSI(s string) string {
-	var out strings.Builder
-	for i := 0; i < len(s); {
-		if s[i] == '\033' {
-			i++
-			if i < len(s) && (s[i] == '[' || s[i] == ']') {
-				i++
-				for i < len(s) && !((s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z')) {
-					i++
-				}
-				if i < len(s) {
-					i++
-				}
-			}
-			continue
-		}
-		out.WriteByte(s[i])
-		i++
-	}
-	return out.String()
-}
+
 
 // expandTabs replaces tab characters with spaces. Each tab advances to the
 // next multiple of tabWidth columns, matching terminal tab-stop behavior.

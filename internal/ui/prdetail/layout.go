@@ -10,6 +10,7 @@ func (m Model) View() string {
 	// Right panel content with cursor overlay.
 	rightView := m.dv.VP.View()
 	if m.dv.CurrentFileIdx >= 0 {
+		rightView = m.dv.OverlaySearchMatches(rightView)
 		rightView = m.dv.OverlayDiffCursor(rightView)
 	}
 
@@ -26,6 +27,11 @@ func (m Model) View() string {
 		HelpMode: m.ctx.Config.HelpMode,
 		HelpLine: m.helpLine(),
 	})
+
+	// Search popup overlay.
+	if m.dv.Searching {
+		view = m.dv.RenderSearchPopup(view, m.dv.Height)
+	}
 
 	// Modal overlay on top.
 	if m.showSidebar {

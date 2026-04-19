@@ -23,6 +23,11 @@ type DiffColors struct {
 	SelectedDelBg string // bg for selected del lines
 	SelectedCtxBg string // bg for selected context lines
 
+	// SearchMatchBg is the background code for search-matching diff lines.
+	SearchMatchBg string
+	// SearchMatchFg is the foreground code for search-matching text (high contrast).
+	SearchMatchFg string
+
 	// SelectColor is the computed selection bg as a color.Color for use with lipgloss.
 	SelectColor color.Color
 
@@ -149,6 +154,25 @@ func ComputeDiffColors(p terminal.Palette) DiffColors {
 
 	// Build chroma style from palette colors.
 	colors.ChromaStyle = buildChromaStyle(p, bg, white, red, green, blue, yellow, cyan, magenta, brightBlack)
+
+	// Search match bg: direct base16 yellow.
+	if yellow != nil {
+		colors.SearchMatchBg = colorToBgCode(yellow)
+	} else {
+		colors.SearchMatchBg = "\033[48;5;3m" // ANSI yellow fallback
+	}
+	// Search match fg: pick black or white for best contrast against the match bg.
+	matchBgColor := yellow
+	if matchBgColor == nil {
+		matchBgColor = color.RGBA{R: 180, G: 150, B: 0, A: 255}
+	}
+	if relativeLuminance(matchBgColor) > 0.4 {
+		// Bright bg → use black text.
+		colors.SearchMatchFg = "\033[38;2;0;0;0m"
+	} else {
+		// Dark bg → use white text.
+		colors.SearchMatchFg = "\033[38;2;255;255;255m"
+	}
 
 	return colors
 }
