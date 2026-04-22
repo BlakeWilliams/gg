@@ -48,6 +48,9 @@ type copilotTickMsg struct{}
 type reviewCommentsRefreshMsg struct {
 	Comments []github.ReviewComment
 }
+
+// ResetExpansionsMsg clears remembered hunk expansions and reloads the diff.
+type ResetExpansionsMsg struct{}
 type reviewCommentsTimerMsg struct{}
 
 // GoToLineMsg is sent from the command bar to jump to a source line number.
@@ -397,6 +400,9 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 				if old, ok := oldPatches[f.Filename]; ok && old == f.Patch {
 					if hl, ok := oldHighlights[f.Filename]; ok {
 						m.dv.HighlightedFiles[i] = hl
+						// Sync FileDiffs from (possibly expanded) highlighted DiffLines.
+						m.dv.FileDiffs[i] = make([]components.DiffLine, len(hl.DiffLines))
+						copy(m.dv.FileDiffs[i], hl.DiffLines)
 						m.dv.RenderedFiles[i] = oldRendered[f.Filename]
 						m.dv.FileDiffOffsets[i] = oldOffsets[f.Filename]
 						continue
@@ -497,11 +503,16 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 		m.dv.FilesLoading = true
 		m.dv.CurrentFileIdx = -1
 		m.dv.Tree.Cursor = 0
+		m.dv.ResetExpansions()
 		m.branchData.fileCursors = make(map[string]int)
 		vs := comments.LoadViewState(m.repoRoot, m.branchData.branch, m.mode)
 		m.savedFilename = vs.Filename
 		m.savedLineNo = vs.LineNo
 		m.savedSide = vs.Side
+		return m, m.loadDiff()
+
+	case ResetExpansionsMsg:
+		m.dv.ResetExpansions()
 		return m, m.loadDiff()
 
 	case prDetectedMsg:
@@ -604,6 +615,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 			return m, nil
 		}
 		m.dv.HighlightedFiles[msg.index] = msg.highlight
+		m.dv.ReapplyExpansions(msg.index)
 		m.dv.FilesHighlighted++
 		m.branchData.chromaHighlighted[msg.index] = true
 		// Stop spinner if this is the file we were waiting on.
@@ -1054,6 +1066,14 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
 			return m.openCommentInput()
 		}
+	case "e":
+		// Expand hunk context when cursor is on a hunk header.
+		if !m.dv.Tree.Focused && m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() && m.dv.CursorOnHunk() {
+			if m.dv.ExpandHunk(m.dv.CurrentFileIdx, m.dv.DiffCursor, 20) {
+				m.rebuildContent()
+				return m, nil, true
+			}
+		}
 	case "a":
 		if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
 			return m.openCommentInput()
@@ -1062,6 +1082,13 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		// Reply to comment thread on current line.
 		if !m.dv.Tree.Focused && m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
 			if cmd := m.replyToThreadAtCursor(); cmd != nil {
+				return m, cmd, true
+			}
+		}
+	case "c":
+		// Ask Copilot about the hunk under the cursor.
+		if !m.dv.Tree.Focused && m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() && m.dv.CursorOnHunk() {
+			if cmd := m.askCopilotAboutHunk(); cmd != nil {
 				return m, cmd, true
 			}
 		}
@@ -1177,9 +1204,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 
 // StatusHints returns left and right hint groups for the status bar.
 func (m Model) KeyBindings() []uictx.KeyBinding {
-	return []uictx.KeyBinding{
+	onHunk := m.dv.CursorOnHunk()
+	bindings := []uictx.KeyBinding{
 		{Key: "j / k", Description: "Move cursor down / up", Keywords: []string{"navigate"}},
-		{Key: "J / K", Description: "Extend selection range"},
 		{Key: "h / l", Description: "Focus left / right pane"},
 		{Key: "f", Description: "Toggle tree focus"},
 		{Key: "^j / ^k", Description: "Previous / next file"},
@@ -1188,19 +1215,32 @@ func (m Model) KeyBindings() []uictx.KeyBinding {
 		{Key: "g g", Description: "Go to top"},
 		{Key: "G", Description: "Go to bottom"},
 		{Key: "m", Description: "Cycle diff mode (working/staged/branch)", Keywords: []string{"toggle"}},
-		{Key: "a", Description: "Add comment on current line"},
-		{Key: "enter", Description: "Select file / enter comment thread"},
-		{Key: "r", Description: "Reply to comment thread"},
-		{Key: "x", Description: "Resolve / unresolve thread"},
-		{Key: "s", Description: "Stage line/selection (Working mode)"},
-		{Key: "u", Description: "Unstage line/selection (Staged mode)"},
-		{Key: "S", Description: "Stage entire hunk"},
-		{Key: "U", Description: "Unstage entire hunk"},
-		{Key: ":N", Description: "Jump to line number N"},
-		{Key: "/", Description: "Search in file (regex)", Keywords: []string{"find"}},
-		{Key: "n / N", Description: "Next / previous match"},
-		{Key: "esc", Description: "Cancel / exit thread"},
 	}
+	if onHunk {
+		bindings = append(bindings,
+			uictx.KeyBinding{Key: "e", Description: "Expand hunk context"},
+			uictx.KeyBinding{Key: "c", Description: "Copilot summarize hunk"},
+		)
+	} else {
+		bindings = append(bindings,
+			uictx.KeyBinding{Key: "J / K", Description: "Extend selection range"},
+			uictx.KeyBinding{Key: "a", Description: "Add comment on current line"},
+			uictx.KeyBinding{Key: "enter", Description: "Select file / enter comment thread"},
+			uictx.KeyBinding{Key: "r", Description: "Reply to comment thread"},
+			uictx.KeyBinding{Key: "x", Description: "Resolve / unresolve thread"},
+			uictx.KeyBinding{Key: "s", Description: "Stage line/selection (Working mode)"},
+			uictx.KeyBinding{Key: "u", Description: "Unstage line/selection (Staged mode)"},
+			uictx.KeyBinding{Key: "S", Description: "Stage entire hunk"},
+			uictx.KeyBinding{Key: "U", Description: "Unstage entire hunk"},
+		)
+	}
+	bindings = append(bindings,
+		uictx.KeyBinding{Key: ":N", Description: "Jump to line number N"},
+		uictx.KeyBinding{Key: "/", Description: "Search in file (regex)", Keywords: []string{"find"}},
+		uictx.KeyBinding{Key: "n / N", Description: "Next / previous match"},
+		uictx.KeyBinding{Key: "esc", Description: "Cancel / exit thread"},
+	)
+	return bindings
 }
 
 func (m Model) StatusHints() (left, right []string) {
@@ -1217,15 +1257,20 @@ func (m Model) StatusHints() (left, right []string) {
 	left = append(left, styles.StatusBarKey.Render("h/l")+" "+styles.StatusBarHint.Render("panes"))
 	left = append(left, styles.StatusBarKey.Render("^j/^k")+" "+styles.StatusBarHint.Render("files"))
 	if !m.dv.Tree.Focused && m.dv.CurrentFileIdx >= 0 {
-		left = append(left, styles.StatusBarKey.Render("J/K")+" "+styles.StatusBarHint.Render("select range"))
-		if m.dv.ThreadCursor > 0 {
-			count := m.threadCommentCount()
-			left = append(left, styles.StatusBarHint.Render(fmt.Sprintf("comment %d/%d", m.dv.ThreadCursor, count)))
-			left = append(left, styles.StatusBarKey.Render("r")+" "+styles.StatusBarHint.Render("reply"))
-			left = append(left, styles.StatusBarKey.Render("x")+" "+styles.StatusBarHint.Render("resolve"))
-		} else if m.cursorHasThread() {
-			left = append(left, styles.StatusBarKey.Render("r")+" "+styles.StatusBarHint.Render("reply"))
-			left = append(left, styles.StatusBarKey.Render("x")+" "+styles.StatusBarHint.Render("resolve"))
+		if m.dv.CursorOnHunk() {
+			left = append(left, styles.StatusBarKey.Render("e")+" "+styles.StatusBarHint.Render("expand"))
+			left = append(left, styles.StatusBarKey.Render("c")+" "+styles.StatusBarHint.Render("summarize"))
+		} else {
+			left = append(left, styles.StatusBarKey.Render("J/K")+" "+styles.StatusBarHint.Render("select range"))
+			if m.dv.ThreadCursor > 0 {
+				count := m.threadCommentCount()
+				left = append(left, styles.StatusBarHint.Render(fmt.Sprintf("comment %d/%d", m.dv.ThreadCursor, count)))
+				left = append(left, styles.StatusBarKey.Render("r")+" "+styles.StatusBarHint.Render("reply"))
+				left = append(left, styles.StatusBarKey.Render("x")+" "+styles.StatusBarHint.Render("resolve"))
+			} else if m.cursorHasThread() {
+				left = append(left, styles.StatusBarKey.Render("r")+" "+styles.StatusBarHint.Render("reply"))
+				left = append(left, styles.StatusBarKey.Render("x")+" "+styles.StatusBarHint.Render("resolve"))
+			}
 		}
 	}
 	modeStr := m.mode.String()
@@ -1450,18 +1495,22 @@ func (m Model) helpLine() string {
 	} else if m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
 		parts = append(parts,
 			hint("j/k", "navigate"),
-			hint("J/K", "select range"),
 			hint("^j/^k", "next/prev file"),
 		)
-		switch m.mode {
-		case git.DiffWorking:
-			parts = append(parts, hint("s", "stage line"), hint("S", "stage hunk"))
-		case git.DiffStaged:
-			parts = append(parts, hint("u", "unstage line"), hint("U", "unstage hunk"))
-		}
-		parts = append(parts, hint("↵", "comment"))
-		if m.cursorHasThread() {
-			parts = append(parts, hint("r", "reply"), hint("x", "resolve"))
+		if m.dv.CursorOnHunk() {
+			parts = append(parts, hint("e", "expand hunk"), hint("c", "summarize"))
+		} else {
+			parts = append(parts, hint("J/K", "select range"))
+			switch m.mode {
+			case git.DiffWorking:
+				parts = append(parts, hint("s", "stage line"), hint("S", "stage hunk"))
+			case git.DiffStaged:
+				parts = append(parts, hint("u", "unstage line"), hint("U", "unstage hunk"))
+			}
+			parts = append(parts, hint("↵", "comment"))
+			if m.cursorHasThread() {
+				parts = append(parts, hint("r", "reply"), hint("x", "resolve"))
+			}
 		}
 	} else {
 		parts = append(parts,
@@ -1551,6 +1600,55 @@ func (m *Model) buildVirtualFileContent(idx, w int) string {
 	return rendered + "\n" + strings.Repeat("\n", m.dv.Height/2)
 }
 
+
+// askCopilotAboutHunk sends a "summarize this hunk" prompt to Copilot.
+func (m *Model) askCopilotAboutHunk() tea.Cmd {
+	if m.dv.Agent == nil {
+		return nil
+	}
+	fileIdx := m.dv.CurrentFileIdx
+	diffLineIdx := m.dv.DiffCursor
+	filename := m.dv.Files[fileIdx].Filename
+
+	hunkText := m.dv.HunkDiffText(fileIdx, diffLineIdx)
+	if hunkText == "" {
+		return nil
+	}
+	lineNo := m.dv.HunkLineNo(fileIdx, diffLineIdx)
+	if lineNo == 0 {
+		return nil
+	}
+
+	commentID := diffviewer.HunkSummaryCommentID(filename, lineNo)
+	prompt := "Summarize the following code change concisely. Focus on what changed and why it matters.\n\n"
+	prompt += "File: " + filename + "\n\n"
+	prompt += "```diff\n" + hunkText + "```\n"
+
+	// Create a root comment so persistCopilotReply can attach the reply.
+	root := comments.LocalComment{
+		ID:        commentID,
+		Body:      "Summarize this hunk",
+		Path:      filename,
+		Line:      lineNo,
+		Side:      "RIGHT",
+		Author:    m.dv.AuthorName(),
+		CreatedAt: time.Now(),
+	}
+	m.commentStore.Add(root)
+
+	m.dv.CopilotState.SetPending(commentID, filename, lineNo, "RIGHT")
+	m.dv.CopilotState.Dots = 0
+
+	m.dv.FormatFile(fileIdx)
+	m.rebuildContent()
+
+	cmds := []tea.Cmd{m.dv.Agent.SendPrompt(commentID, prompt)}
+	if !m.copilotTickActive {
+		m.copilotTickActive = true
+		cmds = append(cmds, tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg { return copilotTickMsg{} }))
+	}
+	return tea.Batch(cmds...)
+}
 
 // persistCopilotReply saves a completed copilot reply to the comment store.
 func (m *Model) persistCopilotReply(reply *diffviewer.CompletedReply) {

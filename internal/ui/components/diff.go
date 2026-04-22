@@ -195,6 +195,11 @@ func BuildRenderList(diffLines []DiffLine, comments []github.ReviewComment, opts
 		items = append(items, NewDiffLineItem(i, dl))
 
 		switch dl.Type {
+		case LineHunk:
+			// Allow comments to attach to hunk headers (e.g. copilot summaries).
+			if h, ok := ParseHunkHeader(dl.Content); ok && h.NewStart > 0 {
+				items = tryPlace(items, i, commentKey{Side: "RIGHT", Line: h.NewStart}, dl.Type)
+			}
 		case LineDel:
 			items = tryPlace(items, i, commentKey{Side: "LEFT", Line: dl.OldLineNo}, dl.Type)
 		case LineContext:
@@ -275,8 +280,8 @@ func ParsePatchLines(patch string) []DiffLine {
 		case strings.HasPrefix(line, "@@"):
 			dl := DiffLine{Type: LineHunk, Content: line}
 			if h, ok := parseHunkHeader(line); ok {
-				oldNum = h.oldStart
-				newNum = h.newStart
+				oldNum = h.OldStart
+				newNum = h.NewStart
 			}
 			result = append(result, dl)
 		case strings.HasPrefix(line, "+"):
@@ -562,29 +567,35 @@ func padWithBg(s string, targetWidth int, bgCode string) string {
 
 // --- Helpers ---
 
-type hunk struct {
-	oldStart int
-	newStart int
+// HunkInfo holds line number info parsed from a hunk header.
+type HunkInfo struct {
+	OldStart int
+	NewStart int
 }
 
-func parseHunkHeader(line string) (hunk, bool) {
+// ParseHunkHeader extracts line number info from a hunk header.
+func ParseHunkHeader(line string) (HunkInfo, bool) {
+	return parseHunkHeader(line)
+}
+
+func parseHunkHeader(line string) (HunkInfo, bool) {
 	parts := strings.SplitN(line, "@@", 3)
 	if len(parts) < 3 {
-		return hunk{}, false
+		return HunkInfo{}, false
 	}
 	ranges := strings.TrimSpace(parts[1])
 	fields := strings.Fields(ranges)
 	if len(fields) < 2 {
-		return hunk{}, false
+		return HunkInfo{}, false
 	}
 
-	h := hunk{}
+	h := HunkInfo{}
 	old := strings.TrimPrefix(fields[0], "-")
 	if comma := strings.IndexByte(old, ','); comma >= 0 {
 		old = old[:comma]
 	}
 	if n, err := strconv.Atoi(old); err == nil {
-		h.oldStart = n
+		h.OldStart = n
 	}
 
 	new_ := strings.TrimPrefix(fields[1], "+")
@@ -592,7 +603,7 @@ func parseHunkHeader(line string) (hunk, bool) {
 		new_ = new_[:comma]
 	}
 	if n, err := strconv.Atoi(new_); err == nil {
-		h.newStart = n
+		h.NewStart = n
 	}
 
 	return h, true

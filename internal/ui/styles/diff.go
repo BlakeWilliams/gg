@@ -22,6 +22,7 @@ type DiffColors struct {
 	SelectedAddBg string // bg for selected add lines
 	SelectedDelBg string // bg for selected del lines
 	SelectedCtxBg string // bg for selected context lines
+	SelectedHunkBg string // bg for selected hunk header lines
 
 	// SearchMatchBg is the background code for search-matching diff lines.
 	SearchMatchBg string
@@ -147,9 +148,13 @@ func ComputeDiffColors(p terminal.Palette) DiffColors {
 		hunkBg := blendColor(blue, bg, 0.10)
 		colors.HunkBg = colorToBgCode(hunkBg)
 		colors.HunkFg = colorToFgCode(ensureContrast(white, hunkBg))
+		// Selected hunk: stronger blue tint.
+		selectedHunkBg := blendColor(blue, bg, 0.25)
+		colors.SelectedHunkBg = colorToBgCode(selectedHunkBg)
 	} else {
 		colors.HunkBg = "\033[48;5;17m"
 		colors.HunkFg = "\033[97;1m"
+		colors.SelectedHunkBg = "\033[48;5;19m"
 	}
 
 	// Build chroma style from palette colors.

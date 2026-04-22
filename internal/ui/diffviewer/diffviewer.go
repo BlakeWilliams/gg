@@ -5,6 +5,7 @@ import (
 	"image/color"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"charm.land/bubbles/v2/spinner"
@@ -132,6 +133,10 @@ type DiffViewer struct {
 	SearchPattern  *regexp.Regexp // compiled regex from last confirmed search
 	SearchMatches  []int          // diffLine indices in current file that match
 	SearchMatchIdx int            // current position in SearchMatches (-1 = none)
+
+	// Hunk expansion state — persists across reloads.
+	// Key: filename → original HunkInfo → total lines revealed.
+	ExpandedHunks map[string]map[components.HunkInfo]int
 }
 
 // CommentSource provides comments for a file. Each view implements this
@@ -215,6 +220,15 @@ func (d DiffViewer) HasDiffLines() bool {
 	return idx >= 0 && idx < len(d.FileDiffs) && len(d.FileDiffs[idx]) > 0
 }
 
+// CursorOnHunk returns true if the diff cursor is on a hunk header line.
+func (d DiffViewer) CursorOnHunk() bool {
+	idx := d.CurrentFileIdx
+	if idx < 0 || idx >= len(d.FileDiffs) || d.DiffCursor < 0 || d.DiffCursor >= len(d.FileDiffs[idx]) {
+		return false
+	}
+	return d.FileDiffs[idx][d.DiffCursor].Type == components.LineHunk
+}
+
 // ClearThreadHighlight un-highlights the thread at the current cursor and
 // resets ThreadCursor to 0. Safe to call when ThreadCursor is already 0.
 func (d *DiffViewer) ClearThreadHighlight() {
@@ -236,7 +250,7 @@ func (d *DiffViewer) ClearThreadHighlight() {
 	d.ThreadCursor = 0
 }
 
-// MoveDiffCursor moves the cursor by delta, skipping hunk lines.
+// MoveDiffCursor moves the cursor by delta.
 func (d *DiffViewer) MoveDiffCursor(delta int) {
 	if d.CurrentFileIdx < 0 || d.CurrentFileIdx >= len(d.FileDiffs) {
 		return
@@ -245,10 +259,6 @@ func (d *DiffViewer) MoveDiffCursor(delta int) {
 	lines := d.FileDiffs[d.CurrentFileIdx]
 	newPos := d.DiffCursor + delta
 
-	for newPos >= 0 && newPos < len(lines) && lines[newPos].Type == components.LineHunk {
-		newPos += delta
-	}
-
 	if newPos < 0 || newPos >= len(lines) {
 		return
 	}
@@ -256,7 +266,7 @@ func (d *DiffViewer) MoveDiffCursor(delta int) {
 	d.ScrollToDiffCursor()
 }
 
-// MoveDiffCursorBy jumps the cursor by delta lines, clamped, skipping hunks.
+// MoveDiffCursorBy jumps the cursor by delta lines, clamped.
 func (d *DiffViewer) MoveDiffCursorBy(delta int) {
 	if d.CurrentFileIdx < 0 || d.CurrentFileIdx >= len(d.FileDiffs) {
 		return
@@ -270,33 +280,6 @@ func (d *DiffViewer) MoveDiffCursorBy(delta int) {
 	}
 	if newPos >= len(lines) {
 		newPos = len(lines) - 1
-	}
-
-	if newPos >= 0 && newPos < len(lines) && lines[newPos].Type == components.LineHunk {
-		dir := 1
-		if delta < 0 {
-			dir = -1
-		}
-		found := false
-		for p := newPos + dir; p >= 0 && p < len(lines); p += dir {
-			if lines[p].Type != components.LineHunk {
-				newPos = p
-				found = true
-				break
-			}
-		}
-		if !found {
-			for p := newPos - dir; p >= 0 && p < len(lines); p -= dir {
-				if lines[p].Type != components.LineHunk {
-					newPos = p
-					found = true
-					break
-				}
-			}
-		}
-		if !found {
-			return
-		}
 	}
 
 	d.DiffCursor = newPos
@@ -443,13 +426,13 @@ func (d *DiffViewer) snapTarget(fileIdx int, targetAbs int) (diffIdx int, thread
 		}
 	}
 
-	// Fallback: closest non-hunk diff line by distance.
+	// Fallback: closest diff line by distance.
 	offsets := d.FileDiffOffsets[fileIdx]
 	diffs := d.FileDiffs[fileIdx]
 	best := -1
 	bestDist := 0
 	for i := 0; i < len(offsets); i++ {
-		if i < len(diffs) && diffs[i].Type == components.LineHunk {
+		if i >= len(diffs) {
 			continue
 		}
 		dist := offsets[i] - targetAbs
@@ -1143,6 +1126,275 @@ func (d *DiffViewer) RebuildContentIfChanged(buildOverview func(w int) string, b
 	}
 }
 
+// ExpandHunk expands context around the hunk at diffLineIdx in the given file.
+// It reveals up to n hidden lines above the hunk from the full file content.
+// Returns true if expansion happened (caller should re-format).
+func (d *DiffViewer) ExpandHunk(fileIdx, diffLineIdx, n int) bool {
+	if !d.expandHunkInner(fileIdx, diffLineIdx, n) {
+		return false
+	}
+	d.FormatFile(fileIdx)
+	return true
+}
+
+// expandHunkInner performs the expansion splice and tracks it, but does NOT
+// call FormatFile. Used by ExpandHunk (single) and ReapplyExpansions (batch).
+func (d *DiffViewer) expandHunkInner(fileIdx, diffLineIdx, n int) bool {
+	if fileIdx < 0 || fileIdx >= len(d.HighlightedFiles) {
+		return false
+	}
+	hl := &d.HighlightedFiles[fileIdx]
+	if diffLineIdx < 0 || diffLineIdx >= len(hl.DiffLines) {
+		return false
+	}
+	if hl.DiffLines[diffLineIdx].Type != components.LineHunk {
+		return false
+	}
+	if len(hl.HlLines) == 0 && len(hl.HlLinesOld) == 0 {
+		return false
+	}
+
+	// Parse the hunk header to get where this hunk starts in the file.
+	hunkInfo, ok := components.ParseHunkHeader(hl.DiffLines[diffLineIdx].Content)
+	if !ok {
+		return false
+	}
+
+	// Resolve the original hunk info for tracking. If this hunk was already
+	// partially expanded, the current header has shifted start lines. We find
+	// the original by checking: origStart - totalRevealed == currentStart.
+	filename := d.Files[fileIdx].Filename
+	origInfo := hunkInfo
+	isNewExpansion := true
+	if recs, ok := d.ExpandedHunks[filename]; ok {
+		for key, revealed := range recs {
+			if key == hunkInfo {
+				origInfo = key
+				isNewExpansion = true
+				break
+			}
+			if key.NewStart-revealed == hunkInfo.NewStart && key.OldStart-revealed == hunkInfo.OldStart {
+				origInfo = key
+				isNewExpansion = false
+				break
+			}
+		}
+	}
+
+	// Find where the previous content ends by walking backward.
+	// Only keep the first (highest) value found for each side since we're
+	// iterating from highest to lowest line numbers.
+	prevOldEnd := 0 // 0 means start of file
+	prevNewEnd := 0
+	for i := diffLineIdx - 1; i >= 0; i-- {
+		dl := hl.DiffLines[i]
+		switch dl.Type {
+		case components.LineContext:
+			if prevOldEnd == 0 {
+				prevOldEnd = dl.OldLineNo
+			}
+			if prevNewEnd == 0 {
+				prevNewEnd = dl.NewLineNo
+			}
+		case components.LineAdd:
+			if prevNewEnd == 0 {
+				prevNewEnd = dl.NewLineNo
+			}
+			if prevOldEnd == 0 {
+				continue
+			}
+		case components.LineDel:
+			if prevOldEnd == 0 {
+				prevOldEnd = dl.OldLineNo
+			}
+			if prevNewEnd == 0 {
+				continue
+			}
+		default:
+			continue
+		}
+		break
+	}
+
+	// Compute the gap: hidden lines between previous content and this hunk.
+	gapNewStart := prevNewEnd + 1
+	gapNewEnd := hunkInfo.NewStart - 1
+	gapOldStart := prevOldEnd + 1
+	gapOldEnd := hunkInfo.OldStart - 1
+
+	totalGap := gapNewEnd - gapNewStart + 1
+	if totalGap <= 0 {
+		return false
+	}
+
+	// Reveal up to n lines from the bottom of the gap (closest to the hunk).
+	revealStart := gapNewEnd - n + 1
+	if revealStart < gapNewStart {
+		revealStart = gapNewStart
+	}
+	revealOldStart := gapOldEnd - (gapNewEnd - revealStart)
+	if revealOldStart < gapOldStart {
+		revealOldStart = gapOldStart
+	}
+
+	revealCount := gapNewEnd - revealStart + 1
+	if revealCount <= 0 {
+		return false
+	}
+
+	// Build new context lines.
+	newLines := make([]components.DiffLine, revealCount)
+	for i := 0; i < revealCount; i++ {
+		newLineNo := revealStart + i
+		oldLineNo := revealOldStart + i
+		newLines[i] = components.DiffLine{
+			Type:      components.LineContext,
+			OldLineNo: oldLineNo,
+			NewLineNo: newLineNo,
+			Content:   getLineContent(hl.HlLines, newLineNo),
+		}
+	}
+
+	// If we revealed all hidden lines, remove the hunk header entirely.
+	removeHunk := revealStart == gapNewStart
+
+	// Splice into DiffLines.
+	var result []components.DiffLine
+	if removeHunk {
+		// Replace the hunk header with the new context lines.
+		result = make([]components.DiffLine, 0, len(hl.DiffLines)-1+revealCount)
+		result = append(result, hl.DiffLines[:diffLineIdx]...)
+		result = append(result, newLines...)
+		result = append(result, hl.DiffLines[diffLineIdx+1:]...)
+	} else {
+		// Update the hunk header to reflect the new start, insert lines after hunk.
+		newOldStart := revealOldStart
+		newNewStart := revealStart
+		hl.DiffLines[diffLineIdx].Content = updateHunkHeader(
+			hl.DiffLines[diffLineIdx].Content, newOldStart, newNewStart, revealCount,
+		)
+		result = make([]components.DiffLine, 0, len(hl.DiffLines)+revealCount)
+		result = append(result, hl.DiffLines[:diffLineIdx+1]...)
+		result = append(result, newLines...)
+		result = append(result, hl.DiffLines[diffLineIdx+1:]...)
+	}
+
+	hl.DiffLines = result
+
+	// Keep FileDiffs in sync so ReconcileAndSync uses the correct data.
+	if fileIdx < len(d.FileDiffs) {
+		cp := make([]components.DiffLine, len(result))
+		copy(cp, result)
+		d.FileDiffs[fileIdx] = cp
+	}
+
+	// Track the expansion so it can be reapplied after reloads.
+	if d.ExpandedHunks == nil {
+		d.ExpandedHunks = make(map[string]map[components.HunkInfo]int)
+	}
+	if d.ExpandedHunks[filename] == nil {
+		d.ExpandedHunks[filename] = make(map[components.HunkInfo]int)
+	}
+	if isNewExpansion {
+		d.ExpandedHunks[filename][origInfo] = revealCount
+	} else {
+		d.ExpandedHunks[filename][origInfo] += revealCount
+	}
+
+	// Keep cursor on the hunk header (which stays at diffLineIdx).
+	// If the hunk was fully removed, cursor lands on the first revealed
+	// context line at the same index — that's fine.
+
+	return true
+}
+
+// ReapplyExpansions re-expands any previously-expanded hunks for the given file.
+// Called after a reload or re-highlight installs fresh DiffLines.
+func (d *DiffViewer) ReapplyExpansions(fileIdx int) {
+	if fileIdx < 0 || fileIdx >= len(d.HighlightedFiles) {
+		return
+	}
+	filename := d.Files[fileIdx].Filename
+	records, ok := d.ExpandedHunks[filename]
+	if !ok || len(records) == 0 {
+		return
+	}
+
+	hl := &d.HighlightedFiles[fileIdx]
+	// Iterate bottom-to-top so splice index shifts don't affect unprocessed hunks.
+	for i := len(hl.DiffLines) - 1; i >= 0; i-- {
+		if hl.DiffLines[i].Type != components.LineHunk {
+			continue
+		}
+		info, ok := components.ParseHunkHeader(hl.DiffLines[i].Content)
+		if !ok {
+			continue
+		}
+		if revealed, ok := records[info]; ok && revealed > 0 {
+			d.expandHunkInner(fileIdx, i, revealed)
+		}
+	}
+}
+
+// ResetExpansions clears all remembered hunk expansions.
+func (d *DiffViewer) ResetExpansions() {
+	d.ExpandedHunks = nil
+}
+
+// getLineContent extracts raw text content for a line number from highlighted lines.
+// Returns empty string if out of range.
+func getLineContent(hlLines []string, lineNo int) string {
+	if lineNo <= 0 || lineNo > len(hlLines) {
+		return ""
+	}
+	// hlLines contains ANSI-highlighted text. We need raw content for DiffLine.Content.
+	// Strip ANSI codes to get the raw text.
+	return stripANSI(hlLines[lineNo-1])
+}
+
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func stripANSI(s string) string {
+	return ansiRe.ReplaceAllString(s, "")
+}
+
+// updateHunkHeader rewrites the @@ line to reflect new starting line numbers
+// and adds extraLines to both old and new counts, preserving the original
+// trailing context (e.g. function name).
+func updateHunkHeader(header string, newOldStart, newNewStart, extraLines int) string {
+	parts := strings.SplitN(header, "@@", 3)
+	if len(parts) < 3 {
+		return header
+	}
+	ranges := strings.TrimSpace(parts[1])
+	fields := strings.Fields(ranges)
+	if len(fields) < 2 {
+		return header
+	}
+
+	oldRange := rewriteRange(fields[0], "-", newOldStart, extraLines)
+	newRange := rewriteRange(fields[1], "+", newNewStart, extraLines)
+
+	// Preserve the original trailing context (e.g. function name) from the header.
+	trailing := parts[2]
+
+	return fmt.Sprintf("@@ %s %s @@%s", oldRange, newRange, trailing)
+}
+
+// rewriteRange rewrites a hunk range like "-10,5" with a new start and added count.
+func rewriteRange(r, prefix string, newStart, extraCount int) string {
+	r = strings.TrimPrefix(r, prefix)
+	if comma := strings.IndexByte(r, ','); comma >= 0 {
+		countStr := r[comma+1:]
+		count := 0
+		if n, err := strconv.Atoi(countStr); err == nil {
+			count = n
+		}
+		return fmt.Sprintf("%s%d,%d", prefix, newStart, count+extraCount)
+	}
+	return fmt.Sprintf("%s%d,%d", prefix, newStart, 1+extraCount)
+}
+
 // InitFileSlices allocates the per-file slices for a new set of files.
 func (d *DiffViewer) InitFileSlices(n int) {
 	d.HighlightedFiles = make([]components.HighlightedDiff, n)
@@ -1150,6 +1402,63 @@ func (d *DiffViewer) InitFileSlices(n int) {
 	d.FileDiffs = make([][]components.DiffLine, n)
 	d.FileDiffOffsets = make([][]int, n)
 	d.FileRenderers = make([]*components.FileRenderList, n)
+}
+
+// HunkDiffText returns the full diff text for the hunk at diffLineIdx
+// (from the @@ line through all its add/del/context lines until the next hunk or EOF).
+func (d *DiffViewer) HunkDiffText(fileIdx, diffLineIdx int) string {
+	if fileIdx < 0 || fileIdx >= len(d.HighlightedFiles) {
+		return ""
+	}
+	hl := d.HighlightedFiles[fileIdx]
+	if diffLineIdx < 0 || diffLineIdx >= len(hl.DiffLines) {
+		return ""
+	}
+	if hl.DiffLines[diffLineIdx].Type != components.LineHunk {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString(hl.DiffLines[diffLineIdx].Content)
+	b.WriteByte('\n')
+	for i := diffLineIdx + 1; i < len(hl.DiffLines); i++ {
+		dl := hl.DiffLines[i]
+		if dl.Type == components.LineHunk {
+			break
+		}
+		switch dl.Type {
+		case components.LineAdd:
+			b.WriteByte('+')
+		case components.LineDel:
+			b.WriteByte('-')
+		default:
+			b.WriteByte(' ')
+		}
+		b.WriteString(dl.Content)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// HunkSummaryCommentID returns a unique comment ID for a hunk summary at the given position.
+func HunkSummaryCommentID(filename string, lineNo int) string {
+	return fmt.Sprintf("hunk-summary:%s:%d", filename, lineNo)
+}
+
+// HunkLineNo returns the new-side start line number for the hunk at diffLineIdx.
+func (d *DiffViewer) HunkLineNo(fileIdx, diffLineIdx int) int {
+	if fileIdx < 0 || fileIdx >= len(d.HighlightedFiles) {
+		return 0
+	}
+	hl := d.HighlightedFiles[fileIdx]
+	if diffLineIdx < 0 || diffLineIdx >= len(hl.DiffLines) {
+		return 0
+	}
+	h, ok := components.ParseHunkHeader(hl.DiffLines[diffLineIdx].Content)
+	if !ok {
+		return 0
+	}
+	return h.NewStart
 }
 
 // --- Spinner helpers ---
@@ -1302,11 +1611,6 @@ func (d *DiffViewer) HandleNavKey(key string) KeyResult {
 				d.VP.GotoTop()
 				if d.CurrentFileIdx >= 0 && d.HasDiffLines() {
 					d.DiffCursor = 0
-					// Skip past hunk header if line 0 is one.
-					lines := d.FileDiffs[d.CurrentFileIdx]
-					for d.DiffCursor < len(lines) && lines[d.DiffCursor].Type == components.LineHunk {
-						d.DiffCursor++
-					}
 				}
 			}
 			return KeyHandled

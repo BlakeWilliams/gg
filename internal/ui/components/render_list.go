@@ -136,10 +136,10 @@ func (d *DiffLineItem) render(rc RenderContext) {
 	isCursor := rc.CursorLine >= 0 && idx == rc.CursorLine && rc.SelectionStart < 0
 	isSelected := rc.SelectionStart >= 0 && idx >= rc.SelectionStart && idx <= rc.SelectionEnd
 
-	// Skip hunk headers from cursor/selection highlighting.
+	// Hunk headers get their own selected style.
 	if d.DiffLine.Type == LineHunk {
-		isCursor = false
 		isSelected = false
+		// isCursor stays true for hunk lines — we apply SelectedHunkBg below.
 	}
 
 	var effectiveBg string // for search restoreBg
@@ -153,11 +153,17 @@ func (d *DiffLineItem) render(rc RenderContext) {
 			selBg = colors.SelectedAddBg
 		case LineDel:
 			selBg = colors.SelectedDelBg
+		case LineHunk:
+			selBg = colors.SelectedHunkBg
 		default:
 			selBg = colors.SelectedCtxBg
 		}
 		if selBg != "" {
 			rendered = ReplaceBackground(rendered, colors.AddBg, colors.DelBg, selBg)
+			// Also replace the hunk bg for selected hunks.
+			if d.DiffLine.Type == LineHunk && colors.HunkBg != "" {
+				rendered = strings.ReplaceAll(rendered, colors.HunkBg, selBg)
+			}
 			effectiveBg = selBg
 			wrapBg = selBg
 		}
@@ -167,6 +173,8 @@ func (d *DiffLineItem) render(rc RenderContext) {
 			effectiveBg = colors.AddBg
 		case LineDel:
 			effectiveBg = colors.DelBg
+		case LineHunk:
+			effectiveBg = colors.HunkBg
 		default:
 			effectiveBg = "\033[49m"
 		}

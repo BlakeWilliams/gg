@@ -420,6 +420,10 @@ func (m Model) handleCommand(msg commandbar.CommandMsg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.activeView, cmd = m.activeView.Update(localdiff.SwitchModeMsg{Mode: git.DiffBranch})
 		return m, cmd
+	case "reset-expansions":
+		var cmd tea.Cmd
+		m.activeView, cmd = m.activeView.Update(localdiff.ResetExpansionsMsg{})
+		return m, cmd
 	}
 	return m, nil
 }

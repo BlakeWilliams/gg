@@ -275,9 +275,9 @@ func (m *Model) activeViewport() *viewport.Model {
 }
 
 func (m Model) KeyBindings() []uictx.KeyBinding {
-	return []uictx.KeyBinding{
+	onHunk := m.dv.CursorOnHunk()
+	bindings := []uictx.KeyBinding{
 		{Key: "j / k", Description: "Move cursor down / up", Keywords: []string{"navigate"}},
-		{Key: "J / K", Description: "Extend selection range"},
 		{Key: "h / l", Description: "Focus left / right pane"},
 		{Key: "f", Description: "Toggle tree focus"},
 		{Key: "^j / ^k", Description: "Previous / next file"},
@@ -285,13 +285,26 @@ func (m Model) KeyBindings() []uictx.KeyBinding {
 		{Key: "^f / ^b", Description: "Scroll full page down / up"},
 		{Key: "g g", Description: "Go to top"},
 		{Key: "G", Description: "Go to bottom"},
-		{Key: "a", Description: "Add review comment"},
-		{Key: "enter", Description: "Select file / open comment"},
-		{Key: "c", Description: "Toggle comments sidebar"},
-		{Key: "r", Description: "Toggle reviews sidebar"},
-		{Key: "s", Description: "Toggle checks sidebar"},
-		{Key: "esc", Description: "Close sidebar / cancel"},
 	}
+	if onHunk {
+		bindings = append(bindings,
+			uictx.KeyBinding{Key: "e", Description: "Expand hunk context"},
+			uictx.KeyBinding{Key: "c", Description: "Copilot summarize hunk / toggle comments"},
+		)
+	} else {
+		bindings = append(bindings,
+			uictx.KeyBinding{Key: "J / K", Description: "Extend selection range"},
+			uictx.KeyBinding{Key: "a", Description: "Add review comment"},
+			uictx.KeyBinding{Key: "enter", Description: "Select file / open comment"},
+			uictx.KeyBinding{Key: "c", Description: "Toggle comments sidebar"},
+		)
+	}
+	bindings = append(bindings,
+		uictx.KeyBinding{Key: "r", Description: "Toggle reviews sidebar"},
+		uictx.KeyBinding{Key: "s", Description: "Toggle checks sidebar"},
+		uictx.KeyBinding{Key: "esc", Description: "Close sidebar / cancel"},
+	)
+	return bindings
 }
 
 // StatusHints returns left and right hint groups for the status bar.
@@ -305,7 +318,12 @@ func (m Model) StatusHints() (left, right []string) {
 	left = append(left, styles.StatusBarKey.Render("h/l")+" "+styles.StatusBarHint.Render("panes"))
 	left = append(left, styles.StatusBarKey.Render("^j/^k")+" "+styles.StatusBarHint.Render("files"))
 	if !m.dv.Tree.Focused && m.dv.CurrentFileIdx >= 0 {
-		left = append(left, styles.StatusBarKey.Render("J/K")+" "+styles.StatusBarHint.Render("select range"))
+		if m.dv.CursorOnHunk() {
+			left = append(left, styles.StatusBarKey.Render("e")+" "+styles.StatusBarHint.Render("expand"))
+			left = append(left, styles.StatusBarKey.Render("c")+" "+styles.StatusBarHint.Render("summarize"))
+		} else {
+			left = append(left, styles.StatusBarKey.Render("J/K")+" "+styles.StatusBarHint.Render("select range"))
+		}
 	}
 	right = append(right, highlightHint("comments", "c"))
 	right = append(right, highlightHint("reviews", "r"))
@@ -480,6 +498,7 @@ func (m Model) Update(msg tea.Msg) (uictx.View, tea.Cmd) {
 			return m, nil
 		}
 		m.dv.HighlightedFiles[msg.index] = msg.highlight
+		m.dv.ReapplyExpansions(msg.index)
 		m.dv.FilesHighlighted = msg.index + 1
 		// Stop spinner if this is the file we were waiting on.
 		if msg.index == m.dv.CurrentFileIdx {
@@ -641,6 +660,12 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 			return m, nil, true
 		}
 	case "c":
+		// Copilot hunk summary when cursor is on a hunk header.
+		if !m.showSidebar && m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() && m.dv.CursorOnHunk() {
+			if cmd := m.askCopilotAboutHunk(); cmd != nil {
+				return m, cmd, true
+			}
+		}
 		m.toggleSidebar(sidebarComments)
 		return m, nil, true
 	case "r":
@@ -675,6 +700,14 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		// Open comment input on diff line.
 		if !m.showSidebar && m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
 			return m.openCommentInput()
+		}
+	case "e":
+		// Expand hunk context when cursor is on a hunk header.
+		if !m.showSidebar && m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() && m.dv.CursorOnHunk() {
+			if m.dv.ExpandHunk(m.dv.CurrentFileIdx, m.dv.DiffCursor, 20) {
+				m.rebuildContent()
+				return m, nil, true
+			}
 		}
 	case "a":
 		if !m.showSidebar && m.dv.CurrentFileIdx >= 0 && m.dv.HasDiffLines() {
@@ -1094,6 +1127,55 @@ func (m Model) openEditorForComment() (Model, tea.Cmd, bool) {
 		os.Remove(path)
 		return editorFinishedMsg{content: string(content), err: readErr}
 	}), true
+}
+
+// askCopilotAboutHunk sends a "summarize this hunk" prompt to Copilot.
+func (m *Model) askCopilotAboutHunk() tea.Cmd {
+	if m.dv.Agent == nil {
+		return nil
+	}
+	fileIdx := m.dv.CurrentFileIdx
+	diffLineIdx := m.dv.DiffCursor
+	filename := m.dv.Files[fileIdx].Filename
+
+	hunkText := m.dv.HunkDiffText(fileIdx, diffLineIdx)
+	if hunkText == "" {
+		return nil
+	}
+	lineNo := m.dv.HunkLineNo(fileIdx, diffLineIdx)
+	if lineNo == 0 {
+		return nil
+	}
+
+	commentID := diffviewer.HunkSummaryCommentID(filename, lineNo)
+	prompt := "Summarize the following code change concisely. Focus on what changed and why it matters.\n\n"
+	prompt += "File: " + filename + "\n\n"
+	prompt += "```diff\n" + hunkText + "```\n"
+
+	// Create a root comment so the completed reply can be persisted.
+	root := comments.LocalComment{
+		ID:        commentID,
+		Body:      "Summarize this hunk",
+		Path:      filename,
+		Line:      lineNo,
+		Side:      "RIGHT",
+		Author:    m.dv.AuthorName(),
+		CreatedAt: time.Now(),
+	}
+	m.localComments.Add(root)
+
+	m.dv.CopilotState.SetPending(commentID, filename, lineNo, "RIGHT")
+	m.dv.CopilotState.Dots = 0
+
+	m.formatFile(fileIdx)
+	m.rebuildContent()
+
+	cmds := []tea.Cmd{m.dv.Agent.SendPrompt(commentID, prompt)}
+	if !m.copilotTickActive {
+		m.copilotTickActive = true
+		cmds = append(cmds, tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg { return copilotTickMsg{} }))
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m Model) openCommentInput() (Model, tea.Cmd, bool) {

@@ -20,6 +20,7 @@ type CancelledMsg struct{}
 var commands = []string{
 	"quit",
 	"refresh",
+	"reset-expansions",
 	"back",
 	"inbox",
 	"local",
