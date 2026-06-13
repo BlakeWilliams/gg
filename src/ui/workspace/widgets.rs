@@ -67,7 +67,11 @@ pub fn wrap_plain(text: &str, width: usize) -> Vec<String> {
                 }
             }
         }
-        out.push(current);
+        // Push the trailing partial line, unless it is empty because the line's
+        // content was fully emitted via hard-splitting (avoids spurious blanks).
+        if !current.is_empty() {
+            out.push(current);
+        }
     }
     out
 }
@@ -160,6 +164,32 @@ pub fn render_text_panel(
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(ch, style))),
             Rect::new(sb_x, content.y + i as u16, 1, 1),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_preserves_blank_lines() {
+        let out = wrap_plain("a\n\nb", 10);
+        assert_eq!(out, vec!["a".to_string(), String::new(), "b".to_string()]);
+    }
+
+    #[test]
+    fn wrap_breaks_on_word_boundary() {
+        let out = wrap_plain("hello world foo", 11);
+        assert_eq!(out, vec!["hello world".to_string(), "foo".to_string()]);
+    }
+
+    #[test]
+    fn wrap_hard_splits_long_word() {
+        let out = wrap_plain("abcdefghij", 4);
+        assert_eq!(
+            out,
+            vec!["abcd".to_string(), "efgh".to_string(), "ij".to_string()]
         );
     }
 }

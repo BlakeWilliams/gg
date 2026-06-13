@@ -835,3 +835,53 @@ fn build_prompt(mode: AgentMode, plan_path: &str, user_msg: &str) -> String {
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_branch_slugifies_under_namespace() {
+        assert_eq!(sanitize_branch("Fix the bug!"), "agent/fix-the-bug");
+        assert_eq!(sanitize_branch("  Spaced  Name  "), "agent/spaced--name");
+        assert_eq!(sanitize_branch("---"), "agent/agent");
+    }
+
+    #[test]
+    fn plan_prompt_references_plan_path_and_is_readonly() {
+        let p = build_prompt(AgentMode::Plan, ".gg/plan.md", "do a thing");
+        assert!(p.contains("PLAN MODE"));
+        assert!(p.contains(".gg/plan.md"));
+        assert!(p.contains("do a thing"));
+    }
+
+    #[test]
+    fn execute_prompt_allows_edits() {
+        let p = build_prompt(AgentMode::Execute, ".gg/plan.md", "ship it");
+        assert!(p.contains("EXECUTION MODE"));
+        assert!(p.contains("ship it"));
+    }
+
+    #[test]
+    fn input_overlay_edits_text() {
+        let mut o = InputOverlay::new(OverlayKind::NewAgent, "t");
+        for c in "abc".chars() {
+            o.insert(c);
+        }
+        assert_eq!(o.value, "abc");
+        assert_eq!(o.cursor, 3);
+        o.backspace();
+        assert_eq!(o.value, "ab");
+        assert_eq!(o.cursor, 2);
+        o.cursor = 1;
+        o.insert('Z');
+        assert_eq!(o.value, "aZb");
+    }
+
+    #[test]
+    fn stage_view_labels() {
+        assert_eq!(StageView::Plan.label(), "Plan");
+        assert_eq!(StageView::Diff.label(), "Diff");
+        assert_eq!(StageView::Pr.label(), "PR");
+    }
+}

@@ -153,3 +153,40 @@ impl Agent {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_toggles() {
+        assert_eq!(AgentMode::Plan.toggled(), AgentMode::Execute);
+        assert_eq!(AgentMode::Execute.toggled(), AgentMode::Plan);
+    }
+
+    #[test]
+    fn message_append_and_empty() {
+        let mut m = ChatMessage::agent_empty();
+        assert!(m.is_empty());
+        m.append_text("hel");
+        m.append_text("lo");
+        assert!(!m.is_empty());
+        match &m.blocks[0] {
+            ChatBlock::Text(s) => assert_eq!(s, "hello"),
+            _ => panic!("expected text block"),
+        }
+    }
+
+    #[test]
+    fn append_after_tool_starts_new_text_block() {
+        let mut m = ChatMessage::agent_empty();
+        m.blocks.push(ChatBlock::Tool(ToolLine {
+            name: "read".into(),
+            summary: "path: x".into(),
+            status: ToolStatus::Done,
+        }));
+        m.append_text("done");
+        assert_eq!(m.blocks.len(), 2);
+        assert!(matches!(m.blocks[1], ChatBlock::Text(_)));
+    }
+}

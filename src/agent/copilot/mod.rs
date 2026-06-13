@@ -383,3 +383,61 @@ fn relativize_path(path: &str, repo_root: &std::path::Path) -> String {
         .unwrap_or_else(|_| path.to_string())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use github_copilot_sdk::types::PermissionRequestData;
+
+    fn data_with(extra: serde_json::Value) -> PermissionRequestData {
+        PermissionRequestData {
+            kind: Some(PermissionRequestKind::Write),
+            tool_call_id: None,
+            extra,
+        }
+    }
+
+    #[test]
+    fn references_plan_path_matches_exact_and_basename() {
+        let plan = ".gg/plan.md";
+        assert!(references_plan_path(
+            &data_with(serde_json::json!({ "path": ".gg/plan.md" })),
+            plan
+        ));
+        assert!(references_plan_path(
+            &data_with(serde_json::json!({ "path": "/abs/repo/.gg/plan.md" })),
+            plan
+        ));
+        // Nested in arguments object.
+        assert!(references_plan_path(
+            &data_with(serde_json::json!({ "input": { "file_path": "/x/plan.md" } })),
+            plan
+        ));
+    }
+
+    #[test]
+    fn references_plan_path_rejects_other_files() {
+        let plan = ".gg/plan.md";
+        assert!(!references_plan_path(
+            &data_with(serde_json::json!({ "path": "src/main.rs" })),
+            plan
+        ));
+        assert!(!references_plan_path(
+            &data_with(serde_json::json!({})),
+            plan
+        ));
+    }
+
+    #[test]
+    fn collect_strings_is_recursive() {
+        let mut out = Vec::new();
+        collect_strings(
+            &serde_json::json!({ "a": "one", "b": ["two", { "c": "three" }], "n": 4 }),
+            &mut out,
+        );
+        assert!(out.contains(&"one".to_string()));
+        assert!(out.contains(&"two".to_string()));
+        assert!(out.contains(&"three".to_string()));
+        assert_eq!(out.len(), 3);
+    }
+}
+
