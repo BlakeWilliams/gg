@@ -12,13 +12,48 @@ use github_copilot_sdk::types::{
 };
 use tokio::sync::mpsc;
 
-use super::AgentRunner;
 use super::types::*;
+use super::{AgentFactory, AgentRunner, PermissionPolicy};
+use github_copilot_sdk::types::PermissionRequestKind;
 
 struct GgHandler {
     events_tx: mpsc::Sender<AgentEvent>,
     comment_id: Arc<Mutex<String>>,
     repo_root: PathBuf,
+    policy: Arc<Mutex<PermissionPolicy>>,
+}
+
+/// Recursively collect every string value found in a JSON value.
+fn collect_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                collect_strings(v, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values() {
+                collect_strings(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Returns true if any string in the permission payload references the plan
+/// artifact (matched by suffix or basename so absolute/relative paths both work).
+fn references_plan_path(data: &PermissionRequestData, plan_path: &str) -> bool {
+    let mut strings = Vec::new();
+    collect_strings(&data.extra, &mut strings);
+    let plan_base = std::path::Path::new(plan_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(plan_path);
+    strings.iter().any(|s| {
+        let norm = s.replace('\\', "/");
+        norm.ends_with(plan_path) || norm.ends_with(plan_base)
+    })
 }
 
 #[async_trait]
@@ -27,9 +62,30 @@ impl SessionHandler for GgHandler {
         &self,
         _session_id: SessionId,
         _request_id: RequestId,
-        _data: PermissionRequestData,
+        data: PermissionRequestData,
     ) -> PermissionResult {
-        PermissionResult::Approved
+        let policy = self.policy.lock().unwrap().clone();
+        match policy {
+            PermissionPolicy::Execute => PermissionResult::Approved,
+            PermissionPolicy::Plan { plan_path } => {
+                match data.kind {
+                    // Read-only style operations are always fine in plan mode.
+                    Some(PermissionRequestKind::Read)
+                    | Some(PermissionRequestKind::Url)
+                    | Some(PermissionRequestKind::Memory) => PermissionResult::Approved,
+                    // Writes are only allowed to the plan artifact itself.
+                    Some(PermissionRequestKind::Write) => {
+                        if references_plan_path(&data, &plan_path) {
+                            PermissionResult::Approved
+                        } else {
+                            PermissionResult::Denied
+                        }
+                    }
+                    // Shell, MCP, custom tools, hooks, unknown: deny in plan mode.
+                    _ => PermissionResult::Denied,
+                }
+            }
+        }
     }
 
     async fn on_session_event(&self, _session_id: SessionId, event: SessionEvent) {
@@ -140,6 +196,7 @@ pub struct CopilotAgent {
     events_tx: mpsc::Sender<AgentEvent>,
     repo_root: PathBuf,
     client: Arc<tokio::sync::Mutex<Option<github_copilot_sdk::Client>>>,
+    policy: Arc<Mutex<PermissionPolicy>>,
 }
 
 impl CopilotAgent {
@@ -150,7 +207,17 @@ impl CopilotAgent {
             events_tx: tx,
             repo_root: PathBuf::from(repo_root),
             client: Arc::new(tokio::sync::Mutex::new(None)),
+            policy: Arc::new(Mutex::new(PermissionPolicy::Execute)),
         }
+    }
+}
+
+/// Pluggable factory producing Copilot-backed agents, one per worktree.
+pub struct CopilotFactory;
+
+impl AgentFactory for CopilotFactory {
+    fn create(&self, worktree: &str) -> Arc<dyn AgentRunner> {
+        Arc::new(CopilotAgent::new(worktree.to_string()))
     }
 }
 
@@ -183,6 +250,7 @@ impl AgentRunner for CopilotAgent {
             events_tx: self.events_tx.clone(),
             comment_id: comment_id_shared,
             repo_root: self.repo_root.clone(),
+            policy: self.policy.clone(),
         };
 
         let mut config = SessionConfig::default();
@@ -261,6 +329,10 @@ impl AgentRunner for CopilotAgent {
                 }
             }
         });
+    }
+
+    fn set_policy(&self, policy: PermissionPolicy) {
+        *self.policy.lock().unwrap() = policy;
     }
 }
 
