@@ -81,6 +81,41 @@ pub async fn diff(dir: &str, mode: DiffMode, base_branch: &str) -> Result<String
     Ok(result)
 }
 
+/// Diff representing an agent's full contribution on a branch: everything
+/// from the fork point (merge-base with `base_branch`) up to and including the
+/// current working tree (committed + uncommitted), plus untracked files.
+pub async fn agent_diff(dir: &str, base_branch: &str) -> Result<String> {
+    if !super::has_commits(dir).await {
+        // No commits yet — fall back to the working-tree diff.
+        return diff(dir, DiffMode::Working, base_branch).await;
+    }
+
+    let base = super::resolve_merge_base(dir, base_branch)
+        .await
+        .unwrap_or_default();
+
+    let mut result = String::new();
+    if !base.is_empty() {
+        let output = Command::new("git")
+            .args(["-C", dir, "diff", &base, "--no-color"])
+            .output()
+            .await?;
+        if output.status.success() || output.status.code() == Some(1) {
+            result = String::from_utf8_lossy(&output.stdout).to_string();
+        }
+    } else {
+        result = diff(dir, DiffMode::Working, base_branch).await?;
+    }
+
+    if let Ok(untracked) = super::untracked_files(dir).await {
+        if !untracked.is_empty() {
+            result.push_str(&untracked_diff(dir, &untracked).await);
+        }
+    }
+
+    Ok(result)
+}
+
 async fn untracked_diff(dir: &str, files: &[String]) -> String {
     let mut sb = String::new();
     for f in files {

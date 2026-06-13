@@ -5,6 +5,27 @@ use serde::Deserialize;
 const DEFAULT_COMMENT_PANEL_MIN_WIDTH: u16 = 40;
 const DEFAULT_DIFF_MIN_WIDTH: u16 = 80;
 const DEFAULT_SCROLL_MARGIN: usize = 5;
+const DEFAULT_PLAN_PATH: &str = ".gg/plan.md";
+
+/// How agents are isolated from one another on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentIsolation {
+    /// Each agent works in its own git worktree (default).
+    #[default]
+    Worktree,
+    /// All agents share a single checkout; selecting an agent switches branches.
+    Checkout,
+}
+
+/// Which agent backend powers the workspace agents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentBackend {
+    /// GitHub Copilot SDK (default).
+    #[default]
+    Copilot,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -15,6 +36,15 @@ pub struct Config {
     pub comment_panel_min_width: u16,
     pub diff_min_width: u16,
     pub scroll_margin: usize,
+    /// Agent isolation strategy. Defaults to `worktree`.
+    pub agent_isolation: AgentIsolation,
+    /// Agent backend. Defaults to `copilot`.
+    pub agent_backend: AgentBackend,
+    /// Base directory for per-agent worktrees. When unset, defaults to
+    /// `<repo>/.git/gg-worktrees`.
+    pub worktree_root: Option<String>,
+    /// Repo-relative path the agent writes its plan to. Defaults to `.gg/plan.md`.
+    pub plan_path: String,
 }
 
 impl Default for Config {
@@ -26,6 +56,10 @@ impl Default for Config {
             comment_panel_min_width: DEFAULT_COMMENT_PANEL_MIN_WIDTH,
             diff_min_width: DEFAULT_DIFF_MIN_WIDTH,
             scroll_margin: DEFAULT_SCROLL_MARGIN,
+            agent_isolation: AgentIsolation::default(),
+            agent_backend: AgentBackend::default(),
+            worktree_root: None,
+            plan_path: DEFAULT_PLAN_PATH.to_string(),
         }
     }
 }
@@ -57,6 +91,9 @@ impl Config {
         }
         if self.diff_min_width < DEFAULT_DIFF_MIN_WIDTH {
             self.diff_min_width = DEFAULT_DIFF_MIN_WIDTH;
+        }
+        if self.plan_path.trim().is_empty() {
+            self.plan_path = DEFAULT_PLAN_PATH.to_string();
         }
     }
 

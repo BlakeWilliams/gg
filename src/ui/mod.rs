@@ -12,5 +12,6 @@ pub mod picker;
 pub mod popup;
 pub mod scroll;
 pub mod styles;
+pub mod workspace;
 
 pub use app::App;
