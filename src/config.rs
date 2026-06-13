@@ -8,33 +8,23 @@ const DEFAULT_SCROLL_MARGIN: usize = 5;
 const DEFAULT_PLAN_PATH: &str = ".gg/plan.md";
 
 /// How agents are isolated from one another on disk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentIsolation {
     /// Each agent works in its own git worktree (default).
+    #[default]
     Worktree,
     /// All agents share a single checkout; selecting an agent switches branches.
     Checkout,
 }
 
-impl Default for AgentIsolation {
-    fn default() -> Self {
-        AgentIsolation::Worktree
-    }
-}
-
 /// Which agent backend powers the workspace agents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentBackend {
     /// GitHub Copilot SDK (default).
+    #[default]
     Copilot,
-}
-
-impl Default for AgentBackend {
-    fn default() -> Self {
-        AgentBackend::Copilot
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

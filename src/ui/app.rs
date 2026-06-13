@@ -17,8 +17,8 @@ use tokio::sync::{Notify, mpsc};
 use super::local_diff::keybinds;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep};
 
-use crate::agent::AgentRunner;
-use crate::agent::copilot::CopilotAgent;
+use crate::agent::{AgentFactory, AgentRunner};
+use crate::agent::copilot::{CopilotAgent, CopilotFactory};
 use crate::agent::types::AgentEvent;
 use crate::config::Config;
 use crate::git::diff::DiffMode;
@@ -28,8 +28,12 @@ use crate::github::CachedClient;
 use super::local_diff::{DiffLoaded, LocalDiff, Pane};
 use super::scroll::Scrollable;
 use super::styles::DiffColors;
+use super::workspace::Workspace;
+use super::workspace::keybinds as ws_keybinds;
 
+#[derive(PartialEq, Eq, Clone, Copy)]
 pub enum ActiveView {
+    Workspace,
     LocalDiff,
 }
 
@@ -42,6 +46,7 @@ pub struct App {
     pub username: Option<String>,
     pub active_view: ActiveView,
     pub local_diff: LocalDiff,
+    pub workspace: Workspace,
     pub diff_colors: DiffColors,
     pub should_quit: bool,
     pub size: Rect,
@@ -82,6 +87,18 @@ impl App {
         local_diff.repo_name = repo.clone();
         let agent: Arc<dyn AgentRunner> = Arc::new(CopilotAgent::new(repo_root.clone()));
 
+        let factory: Arc<dyn AgentFactory> = Arc::new(CopilotFactory);
+        let workspace = Workspace::new(
+            repo_root.clone(),
+            owner.clone(),
+            repo.clone(),
+            branch.clone(),
+            &config,
+            github.clone(),
+            factory,
+        )
+        .await;
+
         Self {
             repo_root,
             owner,
@@ -89,8 +106,9 @@ impl App {
             branch,
             github,
             username: None,
-            active_view: ActiveView::LocalDiff,
+            active_view: ActiveView::Workspace,
             local_diff,
+            workspace,
             diff_colors,
             should_quit: false,
             size: Rect::default(),
@@ -123,6 +141,7 @@ impl App {
             self.local_diff.viewer.clear_highlight_cache();
             self.diff_colors = DiffColors::from_palette(&palette);
             self.local_diff.colors = self.diff_colors.clone();
+            self.workspace.colors = self.diff_colors.clone();
             tracing::info!("Using palette-derived colors and theme");
         } else {
             tracing::info!("No palette colors resolved, using defaults");
@@ -182,12 +201,17 @@ impl App {
         // Fetch authenticated user in background
         if let Ok(user) = self.github.authenticated_user().await {
             self.username = Some(user.login.clone());
-            self.local_diff.username = Some(user.login);
+            self.local_diff.username = Some(user.login.clone());
+            self.workspace.username = Some(user.login);
         }
 
         let result = self.event_loop(&mut terminal, agent_events, watch_rx).await;
 
-        // Stop the agent
+        // Persist the workspace registry and stop agents.
+        self.workspace.persist();
+        for agent in &self.workspace.agents {
+            agent.runner.stop();
+        }
         self.agent.stop();
 
         disable_raw_mode()?;
@@ -242,13 +266,18 @@ impl App {
             }
         });
 
+        // Workspace file watcher — repointed when the active agent changes.
+        let (mut ws_watch_rx, mut _ws_watcher) =
+            make_ws_watcher(self.workspace.take_pending_watch());
+
         // Schedule the initial draw.
         redraw.notify_one();
 
         loop {
             let needs_animation = self.local_diff.copilot_state.has_pending()
                 || !self.local_diff.flash.is_empty()
-                || self.local_diff.commit_overlay.is_some();
+                || self.local_diff.commit_overlay.is_some()
+                || self.workspace.needs_animation();
 
             tokio::select! {
                 biased;
@@ -290,6 +319,13 @@ impl App {
                                 }
                             }
 
+                            // Repoint the workspace watcher if the active agent changed.
+                            if let Some(path) = self.workspace.take_pending_watch() {
+                                let (rx, w) = make_ws_watcher(Some(path));
+                                ws_watch_rx = rx;
+                                _ws_watcher = w;
+                            }
+
                             redraw.notify_one();
                         }
                         Some(Err(e)) => {
@@ -314,7 +350,36 @@ impl App {
 
                 _ = anim.tick(), if needs_animation => {
                     self.local_diff.tick();
+                    self.workspace.tick();
                     redraw.notify_one();
+                }
+
+                ws_ev = self.workspace.agent_event_rx.recv() => {
+                    if let Some((id, event)) = ws_ev {
+                        self.workspace.handle_agent_event(id, event);
+                        redraw.notify_one();
+                    }
+                }
+
+                ws_diff = self.workspace.diff_rx.recv() => {
+                    if let Some(loaded) = ws_diff {
+                        self.workspace.apply_diff_loaded(loaded);
+                        redraw.notify_one();
+                    }
+                }
+
+                ws_pr = self.workspace.pr_rx.recv() => {
+                    if let Some(loaded) = ws_pr {
+                        self.workspace.apply_pr_loaded(loaded);
+                        redraw.notify_one();
+                    }
+                }
+
+                ws_watch = ws_watch_rx.recv(), if _ws_watcher.is_some() => {
+                    if ws_watch.is_some() {
+                        self.workspace.reload_active_diff();
+                        redraw.notify_one();
+                    }
                 }
 
                 _ = comment_refresh.tick(), if self.local_diff.pr.is_some() => {
@@ -395,6 +460,7 @@ impl App {
             Event::Resize(w, h) => {
                 self.size = Rect::new(0, 0, w, h);
                 self.local_diff.resize(w, h);
+                self.workspace.resize(w, h);
             }
             Event::FocusGained => {
                 // Drain stale OSC palette responses that terminals may defer
@@ -422,8 +488,9 @@ impl App {
         self.ctrl_c_count = 0;
 
 
-        // Open command palette with `:`
+        // Open command palette with `:` (local diff view only)
         if key.code == KeyCode::Char(':')
+            && self.active_view == ActiveView::LocalDiff
             && !self.local_diff.composing.is_active()
             && self.local_diff.picker.is_none()
             && !self.local_diff.viewer.search.active
@@ -435,6 +502,11 @@ impl App {
 
         // Route to active view
         match self.active_view {
+            ActiveView::Workspace => {
+                if let Some(cmd) = ws_keybinds::handle_key(&mut self.workspace, key).await {
+                    self.handle_command(&cmd, &[]).await;
+                }
+            }
             ActiveView::LocalDiff => {
                 if let Some(cmd) = self.local_diff.handle_key(key, &self.repo_root, &self.agent).await {
                     self.handle_command(&cmd, &[]).await;
@@ -559,9 +631,29 @@ impl App {
         let area = frame.area();
 
         match self.active_view {
+            ActiveView::Workspace => {
+                self.workspace.render(frame, area, &self.diff_colors);
+            }
             ActiveView::LocalDiff => {
                 self.local_diff.render(frame, area, &self.diff_colors);
             }
         }
     }
+}
+
+/// Create a file watcher pointed at `path` (an agent worktree). Returns a
+/// receiver and the watcher handle; the watcher is `None` if `path` is `None`
+/// or creation fails, in which case the receiver should not be polled.
+fn make_ws_watcher(
+    path: Option<String>,
+) -> (mpsc::UnboundedReceiver<WatchEvent>, Option<RepoWatcher>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let watcher = path.and_then(|p| match RepoWatcher::new(&p, tx) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            tracing::warn!("failed to start workspace watcher: {e}");
+            None
+        }
+    });
+    (rx, watcher)
 }

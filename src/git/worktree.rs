@@ -55,6 +55,7 @@ pub async fn branch_exists(dir: &str, branch: &str) -> bool {
 
 /// Create a new local branch off `base` without checking it out.
 /// No-op if the branch already exists.
+#[allow(dead_code)]
 pub async fn create_branch(dir: &str, branch: &str, base: &str) -> Result<()> {
     if branch_exists(dir, branch).await {
         return Ok(());

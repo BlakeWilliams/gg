@@ -23,12 +23,6 @@ pub enum PermissionPolicy {
     Execute,
 }
 
-impl PermissionPolicy {
-    pub fn is_plan(&self) -> bool {
-        matches!(self, PermissionPolicy::Plan { .. })
-    }
-}
-
 #[async_trait]
 pub trait AgentRunner: Send + Sync {
     /// Take the receiver for agent events. Returns `Some` on the first call,
